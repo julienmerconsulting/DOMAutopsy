@@ -41,36 +41,15 @@ DOMAutopsy fait de l'**autopsie intelligente** : un agent IA navigue comme un hu
 
 Le listener JS injecté dans le navigateur applique une **cascade stricte** à chaque clic et chaque input. Il choisit le sélecteur le plus robuste disponible, valide son unicité en temps réel, et remonte si nécessaire.
 
-<table>
-<tr>
-<td width="80" align="center"><img src="https://img.shields.io/badge/Tier_1-data--testid_·_id_·_name-10B981?style=for-the-badge" /></td>
-<td><strong>Attributs stables</strong><br/>Priorité maximale. IDs sémantiques, attributs <code>name</code>, <code>data-testid</code>. Uniques par nature.<br/><code>#loginButton</code> · <code>[name="email"]</code> · <code>[data-testid="submit"]</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Tier_2-aria--label_·_placeholder_·_title-3b82f6?style=for-the-badge" /></td>
-<td><strong>Attributs sémantiques (accessibilité)</strong><br/>aria-label, placeholder, title. Stables car porteurs de sens métier. Doublon accessibilité → automatisation, 1 pierre 2 coups.<br/><code>[aria-label="Rechercher"]</code> · <code>input[placeholder="Email"]</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Tier_3-href-0891b2?style=for-the-badge" /></td>
-<td><strong>Liens par href</strong><br/>Uniquement si href non générique (<code>#</code>, <code>/</code>, <code>javascript:void</code>) et < 100 chars.<br/><code>a[href="/products/catalog"]</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Tier_4-parent_aria--label_·_parent_data--testid-8b5cf6?style=for-the-badge" /></td>
-<td><strong>Remontée au parent (icônes, SVG)</strong><br/>Si l'élément cliqué est une icône ou un SVG sans attribut, remonte au parent interactif porteur de sens.<br/><code>[aria-label="Fermer le menu"]</code> via <code>closest()</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Tier_5-label_XPath-f59e0b?style=for-the-badge" /></td>
-<td><strong>Label associé (inputs)</strong><br/>Pour les inputs sans attribut stable, trouve le <code>&lt;label for&gt;</code> ou <code>&lt;label&gt;</code> wrapping.<br/><code>//label[contains(text(),"Mot de passe")]//input</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Tier_6-CSS_court_·_XPath_texte-ef4444?style=for-the-badge" /></td>
-<td><strong>Dernier recours</strong><br/>CSS court (max 2 classes stables + nth-of-type). Si multi-match, tentative XPath texte.<br/><code>button.btn-primary:nth-of-type(2)</code> · <code>//button[contains(text(),"Valider")]</code></td>
-</tr>
-<tr>
-<td align="center"><img src="https://img.shields.io/badge/Shadow_DOM-chaine_>>>-312e81?style=for-the-badge" /></td>
-<td><strong>Shadow DOM</strong><br/>Détection automatique, construction de la chaîne de sélecteurs avec <code>>>></code> (Playwright) et <code>.shadowRoot.querySelector()</code> (JS).<br/><code>my-component >>> [aria-label="Submit"]</code></td>
-</tr>
-</table>
+| Priorité | Stratégie | Exemples |
+|----------|-----------|---------|
+| 🟢 **Tier 1** — `data-testid` · `id` · `name` | **Attributs stables** — Priorité maximale. IDs sémantiques, attributs `name`, `data-testid`. Uniques par nature. | `#loginButton` · `[name="email"]` · `[data-testid="submit"]` |
+| 🔵 **Tier 2** — `aria-label` · `placeholder` · `title` | **Attributs sémantiques (accessibilité)** — Stables car porteurs de sens métier. Doublon accessibilité → automatisation, **1 pierre 2 coups**. | `[aria-label="Rechercher"]` · `input[placeholder="Email"]` |
+| 🩵 **Tier 3** — `href` | **Liens par href** — Uniquement si href non générique (`#`, `/`, `javascript:void`) et < 100 chars. | `a[href="/products/catalog"]` |
+| 🟣 **Tier 4** — `parent aria-label` · `parent data-testid` | **Remontée au parent (icônes, SVG)** — Si l'élément cliqué est une icône ou un SVG sans attribut, remonte au parent interactif porteur de sens via `closest()`. | `[aria-label="Fermer le menu"]` |
+| 🟡 **Tier 5** — `label XPath` | **Label associé (inputs)** — Pour les inputs sans attribut stable, trouve le `<label for>` ou `<label>` wrapping. | `//label[contains(text(),"Mot de passe")]//input` |
+| 🔴 **Tier 6** — `CSS court` · `XPath texte` | **Dernier recours** — CSS court (max 2 classes stables + nth-of-type). Si multi-match, tentative XPath texte. | `button.btn-primary:nth-of-type(2)` · `//button[contains(text(),"Valider")]` |
+| 🟤 **Shadow DOM** — chaîne `>>>` | **Détection automatique** — Construction de la chaîne avec `>>>` (Playwright) et `.shadowRoot.querySelector()` (JS). | `my-component >>> [aria-label="Submit"]` |
 
 **Validation temps réel** : chaque sélecteur est validé via `querySelectorAll` ou `XPathResult`. Si `matchCount > 1`, le listener tente automatiquement un XPath texte avant de passer en Tier 6.
 
