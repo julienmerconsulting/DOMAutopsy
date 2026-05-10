@@ -118,6 +118,13 @@ PROVIDERS = {
         "default_model": "llama-3.3-70b-versatile",
     },
 }
+
+# Modeles Groq qui acceptent le format multimodal (content list avec images)
+# browser-use envoie un screenshot a chaque step -> sans vision, il faut forcer use_vision=False
+GROQ_VISION_MODELS = {
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+}
 MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut browser-use: 0.5s, trop court pour les SPA)
 MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
 NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
@@ -342,6 +349,14 @@ def resolve_task():
         "--max-steps", type=int, default=MAX_STEPS,
         help=f"Nombre max d'etapes de l'agent (defaut: {MAX_STEPS}, evite les boucles infinies)"
     )
+    parser.add_argument(
+        "--vision", dest="vision", action="store_true", default=None,
+        help="Force l'envoi de screenshots au LLM (defaut: auto - OFF pour Groq non-vision, ON sinon)"
+    )
+    parser.add_argument(
+        "--no-vision", dest="vision", action="store_false",
+        help="Force la desactivation des screenshots (utile pour Groq text-only et reduire le coup token)"
+    )
 
     args = parser.parse_args()
 
@@ -353,7 +368,18 @@ def resolve_task():
         print(f"  Soit la mettre dans .env, soit changer de provider via --provider")
         sys.exit(1)
     model = args.model or provider_cfg["default_model"]
+    # Resoudre use_vision : explicite si --vision/--no-vision, sinon auto selon provider/modele
+    if args.vision is not None:
+        use_vision = args.vision
+        vision_reason = "force par CLI"
+    elif args.provider == "groq" and model not in GROQ_VISION_MODELS:
+        use_vision = False
+        vision_reason = "auto OFF (modele Groq text-only)"
+    else:
+        use_vision = True
+        vision_reason = "auto ON"
     print(f"  Provider : {args.provider} (modele: {model})")
+    print(f"  Vision   : {use_vision} ({vision_reason})")
 
     timing_opts = {
         "min_wait": args.min_wait,
@@ -363,6 +389,7 @@ def resolve_task():
         "provider": args.provider,
         "base_url": provider_cfg["base_url"],
         "api_key": api_key,
+        "use_vision": use_vision,
     }
 
     # Mode 1 : Fichier JSON du Scenario Builder
@@ -705,6 +732,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     provider = timing_opts.get("provider", "openai")
     base_url = timing_opts.get("base_url")
     api_key = timing_opts.get("api_key")
+    use_vision = timing_opts.get("use_vision", True)
 
     # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
     print_header("LANCEMENT CHROMIUM + CDP")
@@ -773,11 +801,18 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             print(f"  [WARN] BrowserSession ne supporte pas les kwargs timing ({e}), fallback defauts")
             browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
 
-        agent = Agent(
-            task=task,
-            llm=llm,
-            browser_session=browser_session,
-        )
+        agent_kwargs = {
+            "task": task,
+            "llm": llm,
+            "browser_session": browser_session,
+            "use_vision": use_vision,
+        }
+        try:
+            agent = Agent(**agent_kwargs)
+        except TypeError:
+            # Version de browser-use sans support use_vision -> fallback
+            agent_kwargs.pop("use_vision", None)
+            agent = Agent(**agent_kwargs)
 
         try:
             result = await agent.run(max_steps=max_steps)
