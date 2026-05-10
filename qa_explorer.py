@@ -1017,9 +1017,11 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             page_cdp.on("Network.requestWillBeSent", on_request)
             page_cdp.on("Network.responseReceived", on_response)
             page_cdp.on("Network.loadingFinished", on_finished)
-            print(f"  Capture observabilite : Runtime + Console + Network (filtre {','.join(NETWORK_KEEP_TYPES)})")
+            await page_cdp.send("Performance.enable")
+            print(f"  Capture observabilite : Runtime + Console + Network + Performance (filtre {','.join(NETWORK_KEEP_TYPES)})")
         except Exception as e:
             print(f"  [WARN] Capture observabilite echouee : {e}")
+            page_cdp = None
 
         # -- ETAPE 3 : Lancer browser-use via CDP --
         print_header("LANCEMENT BROWSER-USE")
@@ -1094,11 +1096,29 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             agent_kwargs.pop("use_vision", None)
             agent = Agent(**agent_kwargs)
 
+        # -- Snapshot Performance AVANT le run (V3 phase 4) --
+        perf_before = {}
+        perf_after = {}
+        if 'page_cdp' in locals() and page_cdp:
+            try:
+                resp = await page_cdp.send("Performance.getMetrics")
+                perf_before = {m["name"]: m["value"] for m in resp.get("metrics", [])}
+            except Exception as e:
+                print(f"  [WARN] Performance.getMetrics avant : {e}")
+
         try:
             result = await agent.run(max_steps=max_steps)
         except TypeError:
             # Fallback : agent.run sans max_steps
             result = await agent.run()
+
+        # -- Snapshot Performance APRES le run --
+        if 'page_cdp' in locals() and page_cdp:
+            try:
+                resp = await page_cdp.send("Performance.getMetrics")
+                perf_after = {m["name"]: m["value"] for m in resp.get("metrics", [])}
+            except Exception as e:
+                print(f"  [WARN] Performance.getMetrics apres : {e}")
 
         # -- ETAPE 4 : Recuperer le log brut --
         print_header("RECUPERATION DES LOCATEURS")
@@ -1219,6 +1239,8 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     js_errors=js_errors if 'js_errors' in locals() else [],
                     console_messages=console_messages if 'console_messages' in locals() else [],
                     network_log=network_log if 'network_log' in locals() else [],
+                    perf_before=perf_before if 'perf_before' in locals() else {},
+                    perf_after=perf_after if 'perf_after' in locals() else {},
                 )
                 print(f"  Rapport HTML -> {report_path}")
                 if should_open_report:
@@ -1255,6 +1277,22 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     api_calls = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
                     fail_calls = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
                     print(f"  Network : {len(network_log)} requetes filtrees ({api_calls} API, {fail_calls} >=400)")
+            if 'perf_before' in locals() and 'perf_after' in locals():
+                # Calcule delta sur les metriques cles
+                perf_delta = {
+                    k: round(perf_after.get(k, 0) - perf_before.get(k, 0), 2)
+                    for k in perf_after.keys()
+                }
+                perf_report = {
+                    "before": perf_before,
+                    "after": perf_after,
+                    "delta": perf_delta,
+                }
+                (output_dir / "performance.json").write_text(
+                    json.dumps(perf_report, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                heap_delta_mb = round(perf_delta.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+                print(f"  Performance : heap delta {heap_delta_mb:+}MB, layouts={int(perf_delta.get('LayoutCount', 0))}, nodes={int(perf_delta.get('Nodes', 0))}")
         except Exception as e:
             print(f"  [WARN] Sauvegarde observabilite echouee : {e}")
 
@@ -1282,6 +1320,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "network_count": len(network_log) if 'network_log' in locals() else 0,
                 "network_api_count": sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR")) if 'network_log' in locals() else 0,
                 "network_fail_count": sum(1 for r in network_log if (r.get("status") or 0) >= 400) if 'network_log' in locals() else 0,
+                "perf_heap_delta_mb": round((perf_after.get("JSHeapUsedSize", 0) - perf_before.get("JSHeapUsedSize", 0)) / 1024 / 1024, 2) if 'perf_after' in locals() and 'perf_before' in locals() else None,
+                "perf_layout_count": int(perf_after.get("LayoutCount", 0)) if 'perf_after' in locals() else None,
+                "perf_nodes": int(perf_after.get("Nodes", 0)) if 'perf_after' in locals() else None,
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")

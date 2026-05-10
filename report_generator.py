@@ -16,7 +16,8 @@ from collections import Counter
 
 def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                     scenario_url="", timestamp=None, output_dir=".",
-                    js_errors=None, console_messages=None, network_log=None):
+                    js_errors=None, console_messages=None, network_log=None,
+                    perf_before=None, perf_after=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
 
@@ -37,6 +38,8 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     js_errors = js_errors or []
     console_messages = console_messages or []
     network_log = network_log or []
+    perf_before = perf_before or {}
+    perf_after = perf_after or {}
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -167,6 +170,64 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <div class="card">
             <h2>Code Katalon Studio (Groovy)</h2>
             <pre class="code-block"><code>{escaped_code}</code></pre>
+        </div>"""
+
+    # --- Performance metrics (V3 phase 4) ---
+    perf_html = ""
+    if perf_after:
+        heap_before_mb = round(perf_before.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+        heap_after_mb = round(perf_after.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+        heap_delta = round(heap_after_mb - heap_before_mb, 2)
+        nodes_before = int(perf_before.get("Nodes", 0))
+        nodes_after = int(perf_after.get("Nodes", 0))
+        layout_count = int(perf_after.get("LayoutCount", 0)) - int(perf_before.get("LayoutCount", 0))
+        recalc_count = int(perf_after.get("RecalcStyleCount", 0)) - int(perf_before.get("RecalcStyleCount", 0))
+        script_duration = round(perf_after.get("ScriptDuration", 0) - perf_before.get("ScriptDuration", 0), 3)
+        layout_duration = round(perf_after.get("LayoutDuration", 0) - perf_before.get("LayoutDuration", 0), 3)
+
+        # Couleur selon seuils
+        heap_color = "#f85149" if heap_delta > 50 else ("#d29922" if heap_delta > 10 else "#3fb950")
+        layout_color = "#f85149" if layout_count > 100 else ("#d29922" if layout_count > 30 else "#3fb950")
+
+        perf_html = f"""
+        <div class="card">
+            <h2>Performance metrics</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Snapshot via CDP <code>Performance.getMetrics</code> avant et apres le parcours.
+                Le delta indique la croissance du runtime pendant l'execution.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{heap_color}">{heap_delta:+} MB</div>
+                    <div class="kpi-label">Heap delta</div>
+                    <div style="font-size:10px;color:#6e7681;margin-top:4px">
+                        {heap_before_mb} MB -&gt; {heap_after_mb} MB
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{nodes_after:,}</div>
+                    <div class="kpi-label">DOM nodes (final)</div>
+                    <div style="font-size:10px;color:#6e7681;margin-top:4px">
+                        {nodes_before:,} -&gt; {nodes_after:,}
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{layout_color}">{layout_count}</div>
+                    <div class="kpi-label">Layouts forces</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{recalc_count}</div>
+                    <div class="kpi-label">Recalc styles</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{script_duration}s</div>
+                    <div class="kpi-label">JS execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{layout_duration}s</div>
+                    <div class="kpi-label">Layout time</div>
+                </div>
+            </div>
         </div>"""
 
     # --- Network audit (V3 phase 2) ---
@@ -722,6 +783,9 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                 </tbody>
             </table>
         </div>
+
+        <!-- Performance metrics (V3 phase 4) -->
+        {perf_html}
 
         <!-- Network audit (V3 phase 2) -->
         {network_html}
