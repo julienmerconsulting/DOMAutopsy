@@ -455,6 +455,10 @@ def resolve_task():
         "--output-format", default="katalon", choices=list(OUTPUT_FORMATS.keys()),
         help="Format du code de test genere (defaut: katalon). Choix: " + ", ".join(OUTPUT_FORMATS.keys())
     )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Lance Chromium en mode headless (defaut: visible). Recommande pour le serveur web et le multi-run."
+    )
 
     args = parser.parse_args()
 
@@ -489,6 +493,7 @@ def resolve_task():
         "api_key": api_key,
         "use_vision": use_vision,
         "output_format": args.output_format,
+        "headless": args.headless,
     }
 
     # Mode 1 : Fichier JSON du Scenario Builder
@@ -810,17 +815,28 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     api_key = timing_opts.get("api_key")
     use_vision = timing_opts.get("use_vision", True)
     output_format = timing_opts.get("output_format", "katalon")
+    headless = timing_opts.get("headless", False)
 
-    # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
-    print_header("LANCEMENT CHROMIUM + CDP")
+    # -- ETAPE 1 : Lancer Chromium avec CDP --
+    # Headless=True : indispensable en multi-run web UI (sinon 12 fenetres se chevauchent)
+    # Le screencast CDP marche aussi bien en headless qu'en headed
+    print_header("LANCEMENT CHROMIUM + CDP" + (" [HEADLESS]" if headless else ""))
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=[
-            f"--remote-debugging-port={cdp_port}",
-            "--start-maximized"
+    chromium_args = [f"--remote-debugging-port={cdp_port}"]
+    if headless:
+        # Optimisations RAM/CPU pour permettre N Chromiums en parallele
+        chromium_args += [
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--window-size=1280,720",
         ]
-    )
+    else:
+        chromium_args.append("--start-maximized")
+    browser = await pw.chromium.launch(headless=headless, args=chromium_args)
     try:
         context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
         page = context.pages[0] if context.pages else await context.new_page()

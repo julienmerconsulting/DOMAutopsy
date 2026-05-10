@@ -3,6 +3,7 @@ const $ = (sel) => document.querySelector(sel);
 
 const form = $("#runForm");
 const submitBtn = $("#submitBtn");
+const stopBtn = $("#stopBtn");
 const reportBtn = $("#reportBtn");
 const clearLogBtn = $("#clearLogBtn");
 const logBox = $("#log");
@@ -12,12 +13,16 @@ const canvasEmpty = $("#canvasEmpty");
 const screenStatus = $("#screenStatus");
 const logStatus = $("#logStatus");
 const formatSelect = $("#output_format");
+const runBadge = $("#runBadge");
+const runIdLabel = $("#runIdLabel");
+const portLabel = $("#portLabel");
+const activeRunsBadge = $("#activeRunsBadge");
 
 let currentRunId = null;
 let logSocket = null;
 let screenSocket = null;
+let activeRunsTimer = null;
 
-// Charge la liste des formats depuis l'API au boot
 async function loadFormats() {
   try {
     const resp = await fetch("/api/formats");
@@ -35,8 +40,19 @@ async function loadFormats() {
   }
 }
 
+async function refreshActiveRuns() {
+  try {
+    const resp = await fetch("/api/runs");
+    const runs = await resp.json();
+    const active = runs.filter(r => r.status === "running").length;
+    const total = runs.length;
+    activeRunsBadge.textContent = `${active} actif${active > 1 ? "s" : ""} / ${total} total`;
+  } catch (e) {
+    activeRunsBadge.textContent = "API offline";
+  }
+}
+
 function appendLog(line, kind) {
-  // Auto-detection du niveau de log si pas precise
   if (!kind) {
     if (/ERROR|❌|FAIL/i.test(line)) kind = "error";
     else if (/WARNING|WARN|\[WARN\]/i.test(line)) kind = "warn";
@@ -72,6 +88,27 @@ function closeSockets() {
   if (screenSocket) { try { screenSocket.close(); } catch(e) {} screenSocket = null; }
 }
 
+async function killCurrentRun() {
+  if (!currentRunId) return;
+  try {
+    await fetch(`/api/run/${currentRunId}`, { method: "DELETE" });
+  } catch (e) { /* best effort */ }
+}
+
+function setRunIdle() {
+  submitBtn.disabled = false;
+  submitBtn.textContent = "Lancer le run";
+  stopBtn.disabled = true;
+}
+function setRunActive(runId, port) {
+  submitBtn.disabled = true;
+  submitBtn.textContent = "Run en cours...";
+  stopBtn.disabled = false;
+  runBadge.hidden = false;
+  runIdLabel.textContent = runId;
+  portLabel.textContent = port;
+}
+
 function openLogSocket(runId) {
   setStatus(logStatus, "running");
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -85,8 +122,7 @@ function openLogSocket(runId) {
       setStatus(logStatus, ok ? "ok" : "error");
       appendLog(`\n--- Run termine (${msg.status}) ---`, ok ? "ok" : "error");
       reportBtn.disabled = !ok;
-      submitBtn.disabled = false;
-      submitBtn.textContent = "Lancer le run";
+      setRunIdle();
     } else if (msg.type === "error") {
       appendLog("ERREUR WS log: " + msg.message, "error");
     }
@@ -126,8 +162,6 @@ form.addEventListener("submit", async (ev) => {
   closeSockets();
   logBox.textContent = "";
   reportBtn.disabled = true;
-  submitBtn.disabled = true;
-  submitBtn.textContent = "Run en cours...";
   canvasEmpty.style.display = "block";
   canvasEmpty.textContent = "Chromium se lance...";
 
@@ -141,6 +175,7 @@ form.addEventListener("submit", async (ev) => {
     max_wait: parseFloat($("#max_wait").value),
     network_idle: parseFloat($("#network_idle").value),
     max_steps: parseInt($("#max_steps").value, 10),
+    headless: $("#headless").checked,
   };
 
   try {
@@ -152,18 +187,26 @@ form.addEventListener("submit", async (ev) => {
     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
     const { run_id, cdp_port } = await resp.json();
     currentRunId = run_id;
-    appendLog(`>> Run lance : ${run_id} (CDP port ${cdp_port})`, "ok");
+    setRunActive(run_id, cdp_port);
+    appendLog(`>> Run ${run_id} sur CDP ${cdp_port} (headless=${payload.headless})`, "ok");
 
     logSocket = openLogSocket(run_id);
-    // Petit delai pour laisser Chromium booter avant de tenter le screencast
     setTimeout(() => {
       screenSocket = openScreenSocket(run_id);
     }, 1500);
+    refreshActiveRuns();
   } catch (e) {
     appendLog("ERREUR au lancement : " + e.message, "error");
-    submitBtn.disabled = false;
-    submitBtn.textContent = "Lancer le run";
+    setRunIdle();
   }
+});
+
+stopBtn.addEventListener("click", async () => {
+  if (!currentRunId) return;
+  appendLog(`>> Stop demande pour ${currentRunId}`, "warn");
+  await killCurrentRun();
+  closeSockets();
+  setRunIdle();
 });
 
 reportBtn.addEventListener("click", () => {
@@ -176,5 +219,21 @@ clearLogBtn.addEventListener("click", () => {
   logBox.textContent = "";
 });
 
+// Cleanup quand l'utilisateur ferme l'onglet : kill le subprocess pour eviter les zombies
+// sendBeacon est synchrone et survit au teardown de la page (fetch normal serait abort)
+window.addEventListener("beforeunload", () => {
+  if (currentRunId) {
+    const url = `/api/run/${currentRunId}`;
+    // Pas de DELETE via sendBeacon (juste POST), donc fallback fetch keepalive
+    try {
+      fetch(url, { method: "DELETE", keepalive: true });
+    } catch (e) {}
+  }
+});
+
+// Refresh badge "runs actifs" toutes les 3s (utile pour voir les runs des AUTRES onglets)
+activeRunsTimer = setInterval(refreshActiveRuns, 3000);
+
 // Boot
 loadFormats();
+refreshActiveRuns();

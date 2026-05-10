@@ -70,6 +70,20 @@ class RunRequest(BaseModel):
     max_wait: float = 15.0
     network_idle: float = 3.0
     max_steps: int = 25
+    headless: bool = True   # defaut headless pour multi-run sans chaos d'ecran
+
+
+# Cache formats au boot (pas besoin de recharger a chaque requete)
+_FORMATS_CACHE: Optional[dict] = None
+def _get_formats_cached() -> dict:
+    global _FORMATS_CACHE
+    if _FORMATS_CACHE is None:
+        from qa_explorer import OUTPUT_FORMATS
+        _FORMATS_CACHE = {
+            k: {"label": v["label"], "extension": v["extension"]}
+            for k, v in OUTPUT_FORMATS.items()
+        }
+    return _FORMATS_CACHE
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -83,13 +97,61 @@ async def index():
 
 @app.get("/api/formats")
 async def list_formats():
-    """Retourne les formats de sortie supportes (alimente le <select> du frontend)"""
-    # Import paresseux pour eviter de charger qa_explorer au boot du serveur
-    from qa_explorer import OUTPUT_FORMATS
+    """Retourne les formats de sortie supportes (cache en memoire)"""
+    return _get_formats_cached()
+
+
+@app.get("/api/providers")
+async def list_providers():
+    """Retourne les providers LLM supportes"""
+    from qa_explorer import PROVIDERS
+    # Ne renvoie pas les cles API, juste les metadonnees utiles au frontend
     return {
-        k: {"label": v["label"], "extension": v["extension"]}
-        for k, v in OUTPUT_FORMATS.items()
+        k: {
+            "default_model": v["default_model"],
+            "env_var": v["env_var"],
+            "key_present": bool(os.getenv(v["env_var"])),
+        }
+        for k, v in PROVIDERS.items()
     }
+
+
+@app.get("/api/runs")
+async def list_runs():
+    """Retourne tous les runs (actifs + termines) - utile pour la sidebar / monitoring"""
+    return [
+        {
+            "run_id": rid,
+            "status": r["status"],
+            "cdp_port": r["cdp_port"],
+            "url": r.get("url"),
+            "task": (r.get("task") or "")[:80],
+            "output_format": r.get("output_format"),
+            "report_path": r.get("report_path"),
+        }
+        for rid, r in RUNS.items()
+    ]
+
+
+@app.delete("/api/run/{run_id}")
+async def kill_run(run_id: str):
+    """Tue le subprocess d'un run (cleanup quand l'utilisateur ferme l'onglet)"""
+    if run_id not in RUNS:
+        raise HTTPException(404, f"run_id inconnu: {run_id}")
+    r = RUNS[run_id]
+    proc = r["proc"]
+    if proc.returncode is None:
+        try:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        except ProcessLookupError:
+            pass
+    r["status"] = "killed"
+    return {"run_id": run_id, "status": "killed"}
 
 
 @app.post("/api/run")
@@ -112,6 +174,8 @@ async def start_run(req: RunRequest):
     ]
     if req.model:
         args.extend(["--model", req.model])
+    if req.headless:
+        args.append("--headless")
 
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -306,6 +370,28 @@ async def run_status(run_id: str):
         "task": r.get("task"),
         "output_format": r.get("output_format"),
     }
+
+
+@app.on_event("shutdown")
+async def cleanup_all_runs():
+    """Kill tous les subprocess en cours quand uvicorn s'arrete (Ctrl+C)"""
+    print(f"[server] Shutdown : kill {sum(1 for r in RUNS.values() if r['proc'].returncode is None)} runs actifs...")
+    for rid, r in RUNS.items():
+        proc = r["proc"]
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+    # Laisse 2s pour terminer proprement, sinon kill
+    await asyncio.sleep(2)
+    for rid, r in RUNS.items():
+        proc = r["proc"]
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
 
 # Static files (CSS / JS) - tout ce qui est dans web/
