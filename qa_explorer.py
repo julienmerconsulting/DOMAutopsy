@@ -587,7 +587,7 @@ def dedup_log(raw_log):
 # NETTOYAGE IA
 # ============================================================
 
-def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None, output_format="katalon"):
+def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None, output_format="katalon", network_log=None):
     """
     Envoie le log deduplique a GPT-4.1-mini pour :
     - Reconstituer le parcours ideal dans l'ordre
@@ -622,12 +622,49 @@ REGLE IMPORTANTE :
 - Le parcours nettoye doit correspondre au scenario attendu, pas au log brut
 """
 
+    # Bloc optionnel : network log pour generation d'API assertions (V3 phase 3)
+    network_block = ""
+    if network_log:
+        # Garde uniquement les API calls (Fetch/XHR) avec status >= 200, max 30 entrees
+        api_calls = [
+            {
+                "method": r.get("method"),
+                "url": r.get("url", "")[:200],
+                "status": r.get("status"),
+                "type": r.get("type"),
+                "duration_ms": r.get("duration_ms"),
+            }
+            for r in network_log
+            if r.get("type") in ("Fetch", "XHR") and r.get("status")
+        ][:30]
+        if api_calls:
+            network_block = f"""
+API CALLS CAPTURES PENDANT LE PARCOURS (Network.* via CDP) :
+{json.dumps(api_calls, indent=2, ensure_ascii=False)}
+
+REGLE POUR ENRICHIR LE CODE GENERE AVEC DES ASSERTIONS API :
+- Apres chaque action 'click' qui declenche probablement un appel API (login, submit form,
+  add to cart, etc.), AJOUTE une assertion qui verifie que l'API a bien repondu en 2xx.
+- Utilise la syntaxe native du framework de sortie pour intercepter ou attendre la reponse :
+    * Playwright : await page.waitForResponse(url => url.includes('/api/...'))
+                   puis expect(response.status()).toBe(200)
+    * Cypress : cy.intercept('POST', '/api/...').as('login') AVANT le click,
+                puis cy.wait('@login').its('response.statusCode').should('eq', 200)
+    * Selenium : pas d'API simple, ajoute un commentaire '# TODO: assert API call here'
+    * Katalon : WS.verifyResponseStatusCode(response, 200) si applicable, sinon commentaire
+- Si une URL d'API call contient un domain tier (analytics, ads), NE PAS generer d'assertion
+  dessus, c'est du tracking pas du contrat metier.
+- Signale dans 'anomalies' si tu vois un status >= 400 dans les API calls : c'est probablement
+  un bug du SUT ou un endpoint deprecie.
+"""
+
     prompt = f"""Tu es un expert QA automation Katalon Studio. Voici le log des actions capturees 
 pendant un parcours automatise par un agent IA (browser-use).
 
 L'agent a potentiellement fait des erreurs : clics dans le desordre, 
 etapes recommencees, clics parasites sur des overlays/modals/conteneurs, etc.
 {scenario_block}
+{network_block}
 ACTIONS CAPTUREES (deja dedupliquees pour les inputs) :
 {json.dumps(deduped_log, indent=2, ensure_ascii=False)}
 
@@ -1152,7 +1189,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         # -- ETAPE 8 : Nettoyage IA --
         if len(deduped) > 0:
-            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format)
+            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format, network_log=network_log if 'network_log' in locals() else None)
 
             clean_file = output_dir / "clean_steps.json"
             clean_file.write_text(json.dumps(clean_data, indent=2, ensure_ascii=False), encoding="utf-8")
