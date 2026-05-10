@@ -26,8 +26,13 @@ Prerequis :
   pip install browser-use playwright openai
   playwright install chromium
   
-Variables d'environnement :
-  OPENAI_API_KEY=sk-...
+Variables d'environnement (selon --provider) :
+  OPENAI_API_KEY=sk-...        # pour --provider openai (defaut)
+  GROQ_API_KEY=gsk_...          # pour --provider groq
+
+Exemples avec Groq :
+  python qa_explorer.py --provider groq --url https://example.com --task "..."
+  python qa_explorer.py --provider groq --model llama-3.3-70b-versatile scenario.json
 """
 
 from browser_use import Agent, BrowserSession, ChatOpenAI
@@ -96,8 +101,23 @@ def _patch_browser_use():
 # CONFIGURATION
 # ============================================================
 
-LLM_MODEL = "gpt-4.1-mini"
+LLM_MODEL = "gpt-4.1-mini"            # defaut historique (provider openai)
 CDP_PORT = 9222
+
+# Providers LLM compatibles API OpenAI (chat.completions)
+# Pour ajouter un provider : meme structure (base_url, env_var, default_model)
+PROVIDERS = {
+    "openai": {
+        "base_url": None,                       # URL par defaut du SDK OpenAI
+        "env_var": "OPENAI_API_KEY",
+        "default_model": "gpt-4.1-mini",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "env_var": "GROQ_API_KEY",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+}
 MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut browser-use: 0.5s, trop court pour les SPA)
 MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
 NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
@@ -295,8 +315,12 @@ def resolve_task():
         help="Description du parcours en texte libre"
     )
     parser.add_argument(
-        "--model", default=LLM_MODEL,
-        help=f"Modele LLM (defaut: {LLM_MODEL})"
+        "--provider", default="openai", choices=list(PROVIDERS.keys()),
+        help="Provider LLM (defaut: openai). Lit la cle dans la variable d'env du provider."
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Modele LLM (defaut: depend du provider, ex gpt-4.1-mini pour openai, llama-3.3-70b-versatile pour groq)"
     )
     parser.add_argument(
         "--port", type=int, default=CDP_PORT,
@@ -320,11 +344,25 @@ def resolve_task():
     )
 
     args = parser.parse_args()
+
+    # Resoudre le provider LLM : base_url + cle API + modele par defaut
+    provider_cfg = PROVIDERS[args.provider]
+    api_key = os.getenv(provider_cfg["env_var"])
+    if not api_key:
+        print(f"  ERREUR : variable d'env {provider_cfg['env_var']} manquante pour --provider {args.provider}")
+        print(f"  Soit la mettre dans .env, soit changer de provider via --provider")
+        sys.exit(1)
+    model = args.model or provider_cfg["default_model"]
+    print(f"  Provider : {args.provider} (modele: {model})")
+
     timing_opts = {
         "min_wait": args.min_wait,
         "max_wait": args.max_wait,
         "network_idle": args.network_idle,
         "max_steps": args.max_steps,
+        "provider": args.provider,
+        "base_url": provider_cfg["base_url"],
+        "api_key": api_key,
     }
 
     # Mode 1 : Fichier JSON du Scenario Builder
@@ -335,7 +373,7 @@ def resolve_task():
         with open(args.scenario_file, "r", encoding="utf-8") as f:
             scenario = json.load(f)
         task = build_task_from_json(args.scenario_file)
-        return task, args.model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", []), timing_opts
+        return task, model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", []), timing_opts
 
     # Mode 2 : --url + --task en ligne de commande
     if args.url and args.task:
@@ -349,13 +387,13 @@ Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."""
         print_header("MODE LIGNE DE COMMANDE")
         print(f"  URL  : {args.url}")
         print(f"  Task : {args.task}")
-        return task, args.model, args.port, "CLI", args.url, [], timing_opts
+        return task, model, args.port, "CLI", args.url, [], timing_opts
 
     # Mode 3 : TASK par defaut (legacy)
     print_header("MODE LEGACY (TASK PAR DEFAUT)")
     print("  Aucun scenario JSON ni --url/--task fourni")
     print("  Utilisation du TASK hardcode")
-    return DEFAULT_TASK, args.model, args.port, "Legacy", "", [], timing_opts
+    return DEFAULT_TASK, model, args.port, "Legacy", "", [], timing_opts
 
 
 # ============================================================
@@ -408,7 +446,7 @@ def dedup_log(raw_log):
 # NETTOYAGE IA
 # ============================================================
 
-def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL):
+def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None):
     """
     Envoie le log deduplique a GPT-4.1-mini pour :
     - Reconstituer le parcours ideal dans l'ordre
@@ -416,7 +454,12 @@ def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL):
     - Comparer avec le scenario attendu si fourni
     - Signaler les anomalies
     """
-    client = OpenAI()
+    client_kwargs = {}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = OpenAI(**client_kwargs)
 
     # Bloc optionnel : scenario attendu pour comparaison
     scenario_block = ""
@@ -659,6 +702,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     max_wait = timing_opts.get("max_wait", MAX_WAIT_PAGE_LOAD)
     network_idle = timing_opts.get("network_idle", NETWORK_IDLE_WAIT)
     max_steps = timing_opts.get("max_steps", MAX_STEPS)
+    provider = timing_opts.get("provider", "openai")
+    base_url = timing_opts.get("base_url")
+    api_key = timing_opts.get("api_key")
 
     # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
     print_header("LANCEMENT CHROMIUM + CDP")
@@ -708,7 +754,13 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         # -- ETAPE 3 : Lancer browser-use via CDP --
         print_header("LANCEMENT BROWSER-USE")
         print(f"  Timing : min_wait={min_wait}s max_wait={max_wait}s network_idle={network_idle}s max_steps={max_steps}")
-        llm = ChatOpenAI(model=model)
+        print(f"  Provider: {provider} -> {model}")
+        llm_kwargs = {"model": model}
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        llm = ChatOpenAI(**llm_kwargs)
         try:
             browser_session = BrowserSession(
                 cdp_url=f"http://localhost:{cdp_port}",
@@ -824,7 +876,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         # -- ETAPE 8 : Nettoyage IA --
         if len(deduped) > 0:
-            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model)
+            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key)
 
             clean_file = f"clean_steps_{timestamp}.json"
             with open(clean_file, "w", encoding="utf-8") as f:
