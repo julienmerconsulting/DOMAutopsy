@@ -22,6 +22,15 @@
 <main>
   <section class="panel form-panel">
     <h2>Nouveau run</h2>
+
+    <div class="import-block">
+      <label class="file-input-row">
+        <span>Importer un test existant <small>(.groovy / .ts / .js / .py)</small></span>
+        <input type="file" id="importFile" accept=".groovy,.ts,.js,.py">
+      </label>
+      <div id="importStatus" class="import-status"></div>
+    </div>
+
     <form id="runForm">
       <label>
         URL de depart

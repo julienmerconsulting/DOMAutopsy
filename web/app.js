@@ -17,6 +17,8 @@ const formatSelect = $("#output_format");
 const historyList = $("#historyList");
 const refreshHistoryBtn = $("#refreshHistoryBtn");
 const runBadge = $("#runBadge");
+const importFile = $("#importFile");
+const importStatus = $("#importStatus");
 const runIdLabel = $("#runIdLabel");
 const portLabel = $("#portLabel");
 const activeRunsBadge = $("#activeRunsBadge");
@@ -294,6 +296,43 @@ codeBtn.addEventListener("click", () => {
 });
 
 refreshHistoryBtn.addEventListener("click", loadHistory);
+
+importFile.addEventListener("change", async (ev) => {
+  const file = ev.target.files[0];
+  if (!file) return;
+  importStatus.className = "import-status";
+  importStatus.textContent = `Parsing ${file.name}...`;
+  const fd = new FormData();
+  fd.append("file", file);
+  try {
+    const resp = await fetch("/api/import", { method: "POST", body: fd });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
+      throw new Error(err.detail || "Erreur");
+    }
+    const r = await resp.json();
+    // Auto-fill du form
+    if (r.detected_url) $("#url").value = r.detected_url;
+    if (r.suggested_task) $("#task").value = r.suggested_task;
+    // Match le format de sortie au format d'entree (drop-in replacement)
+    if (r.format && [...formatSelect.options].some(o => o.value === r.format)) {
+      formatSelect.value = r.format;
+    }
+    // Status
+    let msg = `OK ${r.format} : ${r.actions_count} actions, ${r.selectors_count} selecteurs`;
+    if (r.redacted_count > 0) msg += ` (${r.redacted_count} secret(s) redacte(s))`;
+    if (r.missing_url) {
+      msg += " - URL manquante, renseigne-la avant de lancer";
+      importStatus.className = "import-status warn";
+    } else {
+      importStatus.className = "import-status";
+    }
+    importStatus.textContent = msg;
+  } catch (e) {
+    importStatus.className = "import-status error";
+    importStatus.textContent = "Erreur : " + e.message;
+  }
+});
 
 clearLogBtn.addEventListener("click", () => {
   logBox.textContent = "";

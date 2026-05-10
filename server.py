@@ -35,7 +35,7 @@ class _QuietAccessFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -203,6 +203,61 @@ async def kill_run(run_id: str):
 
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
+
+# Cache des scripts importes : {import_id: {format, original_source, parsed_actions}}
+IMPORTS: dict[str, dict] = {}
+
+
+@app.post("/api/import")
+async def import_script(file: UploadFile = File(...)):
+    """Recoit un script de test existant (Katalon/PW/Cypress/Selenium),
+    le parse, retourne URL detectee + task NL suggeree + format detecte.
+
+    Le source script est conserve en memoire avec un import_id pour le
+    futur stage 'diff' (V2.5) ou pour copier le script tel quel si pas
+    de drift.
+    """
+    from script_parser import parse_script, to_nl_task, detect_format
+
+    content = await file.read()
+    try:
+        source = content.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(400, "Fichier non UTF-8")
+
+    if len(source) > 500_000:
+        raise HTTPException(400, "Script trop volumineux (max 500KB)")
+
+    fmt = detect_format(file.filename or "")
+    if fmt == "unknown":
+        raise HTTPException(400, f"Extension non supportee: {file.filename}. Supporte: .groovy .ts .js .py .cy.js .spec.ts")
+
+    parsed = parse_script(file.filename or "uploaded", source, format_hint=fmt)
+    if parsed.get("error"):
+        raise HTTPException(400, parsed["error"])
+
+    nl_task = to_nl_task(parsed)
+    import_id = uuid4().hex[:12]
+    IMPORTS[import_id] = {
+        "format": parsed["format"],
+        "filename": parsed.get("filename", file.filename),
+        "url": parsed.get("url"),
+        "selectors": parsed.get("selectors", []),
+        "actions": parsed.get("actions", []),
+        "redacted": parsed.get("redacted", 0),
+        "source": source,
+    }
+
+    return {
+        "import_id": import_id,
+        "format": parsed["format"],
+        "detected_url": parsed.get("url"),
+        "missing_url": parsed.get("url") is None,
+        "suggested_task": nl_task,
+        "selectors_count": len(parsed.get("selectors", [])),
+        "actions_count": len(parsed.get("actions", [])),
+        "redacted_count": parsed.get("redacted", 0),
+    }
 
 
 @app.post("/api/run")

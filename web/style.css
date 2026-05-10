@@ -162,6 +162,16 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; padding
   50% { opacity: 0.4; }
 }
 
+/* Import bloc */
+.import-block { background: var(--code-bg); border: 1px dashed var(--panel-border); border-radius: 6px; padding: 12px; margin-bottom: 16px; }
+.file-input-row { display: flex; flex-direction: column; gap: 6px; cursor: pointer; }
+.file-input-row span { color: var(--muted); font-size: 12px; }
+.file-input-row span small { color: var(--muted); opacity: 0.7; font-weight: 400; }
+.file-input-row input[type=file] { color: var(--text); padding: 4px 0; font-size: 12px; }
+.import-status { color: var(--accent-2); font-size: 11px; margin-top: 8px; min-height: 14px; }
+.import-status.error { color: var(--error); }
+.import-status.warn { color: var(--warn); }
+
 /* Historique */
 .history-block { margin-top: 20px; border-top: 1px solid var(--panel-border); padding-top: 16px; }
 .history-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
