@@ -1,8 +1,15 @@
-# Outputs de run - jamais sur le repo
+# Outputs de run - tout est dans runs/<timestamp>_<runid>/ depuis la v0 web
+runs/
+
+# Patterns historiques (anciens runs en racine, garde-fou si on retrouve d'anciens artefacts)
 locator_log_*.json
 locator_dedup_*.json
 clean_steps_*.json
 katalon_test_*.groovy
+test_*.groovy
+test_*.spec.ts
+test_*.cy.js
+test_*.py
 qa_report_*.html
 _temp_scenario.json
 *.bak

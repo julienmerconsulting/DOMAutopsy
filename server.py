@@ -201,11 +201,18 @@ async def kill_run(run_id: str):
     return {"run_id": run_id, "status": "killed"}
 
 
+RUNS_DIR = ROOT / "runs"
+RUNS_DIR.mkdir(exist_ok=True)
+
+
 @app.post("/api/run")
 async def start_run(req: RunRequest):
     """Lance qa_explorer en sous-process et retourne un run_id"""
     run_id = uuid4().hex[:12]
     cdp_port = find_free_cdp_port()
+    # Dossier dedie pour ce run : runs/<timestamp>_<run_id>/
+    timestamp = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = RUNS_DIR / f"{timestamp}_{run_id}"
 
     args = [
         sys.executable, "-u", str(ROOT / "qa_explorer.py"),
@@ -218,6 +225,8 @@ async def start_run(req: RunRequest):
         "--max-wait", str(req.max_wait),
         "--network-idle", str(req.network_idle),
         "--max-steps", str(req.max_steps),
+        "--output-dir", str(run_dir),
+        "--no-open-report",   # serveur web : on n'ouvre pas le navigateur du serveur
     ]
     if req.model:
         args.extend(["--model", req.model])
@@ -244,6 +253,8 @@ async def start_run(req: RunRequest):
         "url": req.url,
         "task": req.task,
         "output_format": req.output_format,
+        "run_dir": str(run_dir),
+        "timestamp": timestamp,
     }
 
     asyncio.create_task(_pump_stdout(run_id, proc, log_queue))
@@ -394,16 +405,122 @@ async def _stream_screencast(client_ws: WebSocket, page_ws_url: str):
 
 @app.get("/api/report/{run_id}")
 async def get_report(run_id: str):
-    """Retourne le rapport HTML genere par qa_explorer pour ce run"""
-    if run_id not in RUNS:
-        raise HTTPException(404, f"run_id inconnu: {run_id}")
-    report_path = RUNS[run_id].get("report_path")
-    if not report_path:
-        raise HTTPException(404, "Rapport pas encore genere")
-    abs_path = (ROOT / report_path).resolve() if not Path(report_path).is_absolute() else Path(report_path)
-    if not abs_path.exists():
-        raise HTTPException(404, f"Fichier rapport introuvable: {abs_path}")
-    return FileResponse(abs_path, media_type="text/html")
+    """Retourne le rapport HTML genere par qa_explorer pour ce run (en cours OU historique)"""
+    # Cas 1 : run en memoire (in-memory)
+    if run_id in RUNS:
+        report_path = RUNS[run_id].get("report_path")
+        if report_path:
+            abs_path = (ROOT / report_path).resolve() if not Path(report_path).is_absolute() else Path(report_path)
+            if abs_path.exists():
+                return FileResponse(abs_path, media_type="text/html")
+    # Cas 2 : run historique (dans runs/ folder, on cherche le dossier qui finit par _{run_id})
+    candidate = _find_run_dir(run_id)
+    if candidate:
+        # Trouve le fichier qa_report_*.html dedans
+        reports = list(candidate.glob("qa_report_*.html"))
+        if reports:
+            return FileResponse(reports[0], media_type="text/html")
+    raise HTTPException(404, f"Rapport introuvable pour run_id={run_id}")
+
+
+def _find_run_dir(run_id: str) -> Optional[Path]:
+    """Localise le dossier d'un run dans runs/ par suffixe _<run_id>"""
+    if not RUNS_DIR.exists():
+        return None
+    for d in RUNS_DIR.iterdir():
+        if d.is_dir() and d.name.endswith(f"_{run_id}"):
+            return d
+    return None
+
+
+@app.get("/api/history")
+async def list_history(limit: int = 50):
+    """Liste les runs persistes sur disque (lit le meta.json de chaque dossier dans runs/)"""
+    if not RUNS_DIR.exists():
+        return []
+    history = []
+    # Tri par date de modif descendant (plus recent d'abord)
+    dirs = sorted(
+        [d for d in RUNS_DIR.iterdir() if d.is_dir()],
+        key=lambda d: d.stat().st_mtime,
+        reverse=True,
+    )
+    for d in dirs[:limit]:
+        meta_file = d / "meta.json"
+        # Extraire le run_id depuis le nom du dossier (format: <timestamp>_<run_id>)
+        # Pour les runs CLI, il n'y a pas de run_id, on prend le timestamp comme id
+        parts = d.name.split("_", 2)  # YYYYMMDD_HHMMSS_<runid>
+        if len(parts) >= 3:
+            dir_run_id = parts[2]
+        else:
+            dir_run_id = d.name   # fallback : nom du dossier complet
+        entry = {
+            "run_id": dir_run_id,
+            "dir_name": d.name,
+            "has_report": any(d.glob("qa_report_*.html")),
+        }
+        if meta_file.exists():
+            try:
+                meta = json.loads(meta_file.read_text(encoding="utf-8"))
+                entry.update({
+                    "timestamp": meta.get("timestamp"),
+                    "started_at": meta.get("started_at"),
+                    "ended_at": meta.get("ended_at"),
+                    "scenario_url": meta.get("scenario_url"),
+                    "scenario_name": meta.get("scenario_name"),
+                    "task": (meta.get("task") or "")[:120],
+                    "output_format": meta.get("output_format"),
+                    "provider": meta.get("provider"),
+                    "model": meta.get("model"),
+                    "agent_result": (meta.get("agent_result") or "")[:200],
+                    "deduped_count": meta.get("deduped_count"),
+                    "status": meta.get("status"),
+                })
+            except Exception:
+                entry["status"] = "meta_corrupted"
+        else:
+            entry["status"] = "no_meta"
+        history.append(entry)
+    return history
+
+
+@app.get("/api/run/{run_id}/files")
+async def list_run_files(run_id: str):
+    """Liste les fichiers d'un run (pour l'UI d'historique)"""
+    d = None
+    if run_id in RUNS and RUNS[run_id].get("run_dir"):
+        d = Path(RUNS[run_id]["run_dir"])
+    if d is None or not d.exists():
+        d = _find_run_dir(run_id)
+    if d is None or not d.exists():
+        raise HTTPException(404, f"Dossier run introuvable: {run_id}")
+    return [
+        {"name": f.name, "size": f.stat().st_size}
+        for f in sorted(d.iterdir()) if f.is_file()
+    ]
+
+
+@app.get("/api/run/{run_id}/file/{filename}")
+async def get_run_file(run_id: str, filename: str):
+    """Sert un fichier specifique d'un run (locator_log.json, test_*.groovy, etc.)"""
+    # Securite : interdire les path traversal
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(400, "Nom de fichier invalide")
+    d = None
+    if run_id in RUNS and RUNS[run_id].get("run_dir"):
+        d = Path(RUNS[run_id]["run_dir"])
+    if d is None or not d.exists():
+        d = _find_run_dir(run_id)
+    if d is None or not d.exists():
+        raise HTTPException(404, f"Dossier run introuvable: {run_id}")
+    target = d / filename
+    if not target.exists() or not target.is_file():
+        raise HTTPException(404, f"Fichier introuvable: {filename}")
+    # Type MIME selon l'extension
+    media_type = "text/html" if target.suffix == ".html" else (
+        "application/json" if target.suffix == ".json" else "text/plain"
+    )
+    return FileResponse(target, media_type=media_type)
 
 
 @app.get("/api/status/{run_id}")

@@ -459,6 +459,14 @@ def resolve_task():
         "--headless", action="store_true",
         help="Lance Chromium en mode headless (defaut: visible). Recommande pour le serveur web et le multi-run."
     )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Dossier de sortie pour les artefacts du run (defaut: runs/<timestamp>/). Cree s'il n'existe pas."
+    )
+    parser.add_argument(
+        "--no-open-report", dest="open_report", action="store_false", default=True,
+        help="Ne pas ouvrir le rapport HTML dans le navigateur a la fin (utile pour le mode serveur)."
+    )
 
     args = parser.parse_args()
 
@@ -494,6 +502,8 @@ def resolve_task():
         "use_vision": use_vision,
         "output_format": args.output_format,
         "headless": args.headless,
+        "output_dir": args.output_dir,
+        "open_report": args.open_report,
     }
 
     # Mode 1 : Fichier JSON du Scenario Builder
@@ -806,6 +816,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     """Fonction principale d'execution du QA Explorer"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     timing_opts = timing_opts or {}
+    started_at = datetime.now().isoformat()
     min_wait = timing_opts.get("min_wait", MIN_WAIT_PAGE_LOAD)
     max_wait = timing_opts.get("max_wait", MAX_WAIT_PAGE_LOAD)
     network_idle = timing_opts.get("network_idle", NETWORK_IDLE_WAIT)
@@ -816,6 +827,11 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     use_vision = timing_opts.get("use_vision", True)
     output_format = timing_opts.get("output_format", "katalon")
     headless = timing_opts.get("headless", False)
+    output_dir_arg = timing_opts.get("output_dir") or os.path.join("runs", timestamp)
+    output_dir = Path(output_dir_arg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    should_open_report = timing_opts.get("open_report", True)
+    print(f"  Output dir : {output_dir}")
 
     # -- ETAPE 1 : Lancer Chromium avec CDP --
     # Headless=True : indispensable en multi-run web UI (sinon 12 fenetres se chevauchent)
@@ -1018,19 +1034,17 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         print(f"  {len(raw_log)} entrees brutes recuperees")
 
-        # Sauvegarder le log brut
-        raw_file = f"locator_log_{timestamp}.json"
-        with open(raw_file, "w", encoding="utf-8") as f:
-            json.dump(raw_log, f, indent=2, ensure_ascii=False)
+        # Sauvegarder le log brut (dans le dossier du run)
+        raw_file = output_dir / "locator_log.json"
+        raw_file.write_text(json.dumps(raw_log, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"  Log brut -> {raw_file}")
 
         # -- ETAPE 5 : Dedupliquer les inputs --
         deduped = dedup_log(raw_log)
         print(f"  {len(raw_log)} -> {len(deduped)} apres deduplication")
 
-        dedup_file = f"locator_dedup_{timestamp}.json"
-        with open(dedup_file, "w", encoding="utf-8") as f:
-            json.dump(deduped, f, indent=2, ensure_ascii=False)
+        dedup_file = output_dir / "locator_dedup.json"
+        dedup_file.write_text(json.dumps(deduped, indent=2, ensure_ascii=False), encoding="utf-8")
         print(f"  Log deduplique -> {dedup_file}")
 
         # -- ETAPE 6 : Afficher le resultat agent --
@@ -1044,20 +1058,18 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         if len(deduped) > 0:
             clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format)
 
-            clean_file = f"clean_steps_{timestamp}.json"
-            with open(clean_file, "w", encoding="utf-8") as f:
-                json.dump(clean_data, f, indent=2, ensure_ascii=False)
+            clean_file = output_dir / "clean_steps.json"
+            clean_file.write_text(json.dumps(clean_data, indent=2, ensure_ascii=False), encoding="utf-8")
             print(f"\n  Parcours nettoye -> {clean_file}")
 
             print_clean_steps(clean_data)
 
-            # -- ETAPE 9 : Sauvegarder le code Katalon --
+            # -- ETAPE 9 : Sauvegarder le code de test (Katalon/Playwright/Cypress/Selenium) --
             generated_code = clean_data.get('katalon_code', '')
             if generated_code:
                 fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
-                code_file = f"test_{output_format}_{timestamp}{fmt_info['extension']}"
-                with open(code_file, "w", encoding="utf-8") as f:
-                    f.write(generated_code)
+                code_file = output_dir / f"test_{output_format}{fmt_info['extension']}"
+                code_file.write_text(generated_code, encoding="utf-8")
                 print(f"\n  Code {fmt_info['label']} -> {code_file}")
 
             # -- ETAPE 10 : Generer le rapport HTML --
@@ -1070,14 +1082,42 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     scenario_name=scenario_name,
                     scenario_url=scenario_url,
                     timestamp=timestamp,
+                    output_dir=str(output_dir),
                 )
                 print(f"  Rapport HTML -> {report_path}")
-                open_report(report_path)
-                print(f"  Rapport ouvert dans le navigateur")
+                if should_open_report:
+                    open_report(report_path)
+                    print(f"  Rapport ouvert dans le navigateur")
+                else:
+                    print(f"  (ouverture auto desactivee, --no-open-report)")
             else:
                 print("\n  report_generator.py absent, pas de rapport HTML")
         else:
             print("\n  Aucune entree capturee, pas de nettoyage IA")
+
+        # -- ETAPE 11 : Ecrire meta.json (alimente l'historique du serveur web) --
+        try:
+            meta = {
+                "timestamp": timestamp,
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "scenario_name": scenario_name,
+                "scenario_url": scenario_url,
+                "task": task,
+                "output_format": output_format,
+                "provider": provider,
+                "model": model,
+                "headless": headless,
+                "use_vision": use_vision,
+                "agent_result": str(result.final_result()) if 'result' in locals() and result else None,
+                "raw_count": len(raw_log),
+                "deduped_count": len(deduped) if 'deduped' in locals() else 0,
+                "report": f"qa_report_{timestamp}.html" if (output_dir / f"qa_report_{timestamp}.html").exists() else None,
+                "status": "success",
+            }
+            (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"  [WARN] Impossible d'ecrire meta.json: {e}")
 
     finally:
         # -- CLEANUP : garantit la fermeture meme en cas d'exception --

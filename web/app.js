@@ -5,6 +5,7 @@ const form = $("#runForm");
 const submitBtn = $("#submitBtn");
 const stopBtn = $("#stopBtn");
 const reportBtn = $("#reportBtn");
+const codeBtn = $("#codeBtn");
 const clearLogBtn = $("#clearLogBtn");
 const logBox = $("#log");
 const canvas = $("#screen");
@@ -13,6 +14,8 @@ const canvasEmpty = $("#canvasEmpty");
 const screenStatus = $("#screenStatus");
 const logStatus = $("#logStatus");
 const formatSelect = $("#output_format");
+const historyList = $("#historyList");
+const refreshHistoryBtn = $("#refreshHistoryBtn");
 const runBadge = $("#runBadge");
 const runIdLabel = $("#runIdLabel");
 const portLabel = $("#portLabel");
@@ -49,6 +52,73 @@ async function refreshActiveRuns() {
     activeRunsBadge.textContent = `${active} actif${active > 1 ? "s" : ""} / ${total} total`;
   } catch (e) {
     activeRunsBadge.textContent = "API offline";
+  }
+}
+
+async function loadHistory() {
+  try {
+    const resp = await fetch("/api/history?limit=30");
+    const items = await resp.json();
+    historyList.innerHTML = "";
+    if (items.length === 0) {
+      const li = document.createElement("li");
+      li.className = "history-empty";
+      li.textContent = "Aucun run pour l'instant";
+      historyList.appendChild(li);
+      return;
+    }
+    for (const r of items) {
+      const li = document.createElement("li");
+      const url = r.scenario_url || "(pas d'url)";
+      const task = r.task || "";
+      const fmt = r.output_format || "?";
+      const count = r.deduped_count != null ? `${r.deduped_count} actions` : "—";
+      const status = r.status || "?";
+      const statusClass = status === "success" ? "success" : (status === "running" ? "" : "error");
+      const dt = r.timestamp || "";
+      li.innerHTML = `
+        <div class="h-url">${escapeHtml(url)}</div>
+        <div class="h-task">${escapeHtml(task)}</div>
+        <div class="h-meta">
+          <span class="h-fmt">${escapeHtml(fmt)}</span>
+          <span class="h-count">${count}</span>
+          <span class="h-status ${statusClass}">${status}</span>
+          <span style="margin-left:auto;">${escapeHtml(dt)}</span>
+        </div>
+      `;
+      li.title = "Clic : ouvre le rapport HTML (Shift+clic : ouvre le code de test)";
+      li.addEventListener("click", async (ev) => {
+        if (ev.shiftKey) {
+          openRunCode(r.run_id);
+        } else if (r.has_report) {
+          window.open(`/api/report/${r.run_id}`, "_blank");
+        } else {
+          alert("Pas de rapport pour ce run.");
+        }
+      });
+      historyList.appendChild(li);
+    }
+  } catch (e) {
+    historyList.innerHTML = `<li class="history-empty">Erreur chargement: ${escapeHtml(e.message)}</li>`;
+  }
+}
+
+function escapeHtml(s) {
+  return String(s || "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+
+async function openRunCode(runId) {
+  try {
+    const resp = await fetch(`/api/run/${runId}/files`);
+    const files = await resp.json();
+    const codeFile = files.find(f => f.name.startsWith("test_"));
+    if (codeFile) {
+      window.open(`/api/run/${runId}/file/${codeFile.name}`, "_blank");
+    } else {
+      alert("Pas de fichier de test pour ce run.");
+    }
+  } catch (e) {
+    alert("Erreur : " + e.message);
   }
 }
 
@@ -122,7 +192,10 @@ function openLogSocket(runId) {
       setStatus(logStatus, ok ? "ok" : "error");
       appendLog(`\n--- Run termine (${msg.status}) ---`, ok ? "ok" : "error");
       reportBtn.disabled = !ok;
+      codeBtn.disabled = !ok;
       setRunIdle();
+      // Rafraichir l'historique au moindre run termine
+      loadHistory();
     } else if (msg.type === "error") {
       appendLog("ERREUR WS log: " + msg.message, "error");
     }
@@ -162,6 +235,7 @@ form.addEventListener("submit", async (ev) => {
   closeSockets();
   logBox.textContent = "";
   reportBtn.disabled = true;
+  codeBtn.disabled = true;
   canvasEmpty.style.display = "block";
   canvasEmpty.textContent = "Chromium se lance...";
 
@@ -215,6 +289,12 @@ reportBtn.addEventListener("click", () => {
   }
 });
 
+codeBtn.addEventListener("click", () => {
+  if (currentRunId) openRunCode(currentRunId);
+});
+
+refreshHistoryBtn.addEventListener("click", loadHistory);
+
 clearLogBtn.addEventListener("click", () => {
   logBox.textContent = "";
 });
@@ -244,3 +324,4 @@ document.addEventListener("visibilitychange", () => {
 // Boot
 loadFormats();
 refreshActiveRuns();
+loadHistory();

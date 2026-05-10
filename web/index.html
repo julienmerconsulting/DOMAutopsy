@@ -77,6 +77,16 @@
         <button type="button" id="stopBtn" disabled>Stopper</button>
       </div>
     </form>
+
+    <div class="history-block">
+      <div class="history-header">
+        <h3>Historique</h3>
+        <button type="button" id="refreshHistoryBtn" class="ghost">Actualiser</button>
+      </div>
+      <ul id="historyList" class="history-list">
+        <li class="history-empty">Aucun run pour l'instant</li>
+      </ul>
+    </div>
   </section>
 
   <section class="panel screen-panel">
@@ -92,6 +102,7 @@
     <pre id="log" class="log-box">En attente...</pre>
     <div class="actions">
       <button id="reportBtn" disabled>Voir le rapport HTML</button>
+      <button id="codeBtn" type="button" disabled>Voir le code de test</button>
       <button id="clearLogBtn" type="button">Effacer log</button>
     </div>
   </section>

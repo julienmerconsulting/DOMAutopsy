@@ -162,6 +162,24 @@ details summary { cursor: pointer; color: var(--muted); font-size: 12px; padding
   50% { opacity: 0.4; }
 }
 
+/* Historique */
+.history-block { margin-top: 20px; border-top: 1px solid var(--panel-border); padding-top: 16px; }
+.history-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+.history-header h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); }
+button.ghost { background: transparent; border: 1px solid var(--panel-border); color: var(--muted); padding: 4px 10px; font-size: 11px; font-weight: 400; }
+button.ghost:hover:not(:disabled) { background: var(--code-bg); color: var(--text); }
+.history-list { list-style: none; padding: 0; margin: 0; max-height: 360px; overflow-y: auto; }
+.history-list li { padding: 8px 10px; border-radius: 6px; cursor: pointer; font-size: 12px; transition: background 0.1s; border: 1px solid transparent; }
+.history-list li:hover { background: var(--code-bg); border-color: var(--panel-border); }
+.history-list .h-url { color: var(--accent); font-family: ui-monospace, monospace; font-size: 11px; word-break: break-all; }
+.history-list .h-task { color: var(--muted); font-size: 11px; margin-top: 2px; line-height: 1.3; max-height: 2.6em; overflow: hidden; }
+.history-list .h-meta { display: flex; gap: 8px; align-items: center; font-size: 10px; color: var(--muted); margin-top: 4px; }
+.history-list .h-meta .h-fmt { background: var(--panel-border); padding: 1px 6px; border-radius: 8px; }
+.history-list .h-meta .h-status.success { color: var(--accent-2); }
+.history-list .h-meta .h-status.error { color: var(--error); }
+.history-list .h-meta .h-count { color: var(--accent); }
+.history-empty { color: var(--muted); font-style: italic; text-align: center; padding: 20px !important; cursor: default !important; }
+
 @media (max-width: 900px) {
   main { grid-template-columns: 1fr; grid-template-rows: auto auto auto; height: auto; }
   .form-panel, .screen-panel, .log-panel { grid-column: 1; grid-row: auto; }
