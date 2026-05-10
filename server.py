@@ -28,6 +28,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional
@@ -46,10 +47,36 @@ WEB_DIR = ROOT / "web"
 CDP_PORT_BASE = 9222
 CDP_PORT_RANGE = 50  # supporte jusqu'a 50 runs en parallele en theorie
 
-app = FastAPI(title="DOMAutopsy Web", version="0.1.0")
-
 # Etat global des runs
 RUNS: dict[str, dict] = {}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan: startup (rien) -> serve -> shutdown (kill tous les subprocess)"""
+    # --- Startup ---
+    yield
+    # --- Shutdown : kill tous les subprocess en cours ---
+    active = sum(1 for r in RUNS.values() if r["proc"].returncode is None)
+    print(f"[server] Shutdown : kill {active} runs actifs...")
+    for rid, r in RUNS.items():
+        proc = r["proc"]
+        if proc.returncode is None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
+    await asyncio.sleep(2)
+    for rid, r in RUNS.items():
+        proc = r["proc"]
+        if proc.returncode is None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+
+app = FastAPI(title="DOMAutopsy Web", version="0.1.0", lifespan=lifespan)
 
 def find_free_cdp_port() -> int:
     """Trouve un port CDP libre dans la plage [9222, 9272]"""
@@ -377,28 +404,6 @@ async def run_status(run_id: str):
         "task": r.get("task"),
         "output_format": r.get("output_format"),
     }
-
-
-@app.on_event("shutdown")
-async def cleanup_all_runs():
-    """Kill tous les subprocess en cours quand uvicorn s'arrete (Ctrl+C)"""
-    print(f"[server] Shutdown : kill {sum(1 for r in RUNS.values() if r['proc'].returncode is None)} runs actifs...")
-    for rid, r in RUNS.items():
-        proc = r["proc"]
-        if proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
-    # Laisse 2s pour terminer proprement, sinon kill
-    await asyncio.sleep(2)
-    for rid, r in RUNS.items():
-        proc = r["proc"]
-        if proc.returncode is None:
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                pass
 
 
 # Static files (CSS / JS) - tout ce qui est dans web/
