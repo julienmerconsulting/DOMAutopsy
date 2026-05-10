@@ -125,6 +125,100 @@ GROQ_VISION_MODELS = {
     "meta-llama/llama-4-scout-17b-16e-instruct",
     "meta-llama/llama-4-maverick-17b-128e-instruct",
 }
+
+# Formats de sortie supportes pour le code generate par l'IA de cleanup
+# Pour ajouter un format : meme structure (label, extension, code_instructions)
+# Le bloc code_instructions est injecte dans le prompt IA a la place du bloc Katalon
+OUTPUT_FORMATS = {
+    "katalon": {
+        "label": "Katalon Studio (Groovy)",
+        "extension": ".groovy",
+        "code_instructions": """6. Genere le code Katalon Studio (Groovy) complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs qui ont unique: true. Utilise-les EXACTEMENT tels quels.
+   - EXCEPTION pour unique: false : si le selecteur est non-unique ET qu'un texte est disponible
+     dans le log (champ "text"), genere un XPath avec le texte pour fiabiliser le clic.
+   - Pour creer un TestObject :
+     TestObject to = new TestObject("nomDescriptif")
+     to.addProperty("xpath" ou "css", ConditionType.EQUALS, "le_selecteur_exact")
+   - Imports requis :
+     import com.kms.katalon.core.testobject.TestObject
+     import com.kms.katalon.core.testobject.ConditionType
+     import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
+   - WebUI.openBrowser('') + WebUI.navigateToUrl(url) en debut
+   - WebUI.click(to) pour les clics, WebUI.setText(to, value) pour les inputs
+   - WebUI.verifyElementPresent(to, 10) avant chaque interaction, WebUI.delay(1) entre chaque
+   - Si "inShadowDOM": true, utilise WebUI.executeJavaScript() avec le jsSelector fourni
+   - WebUI.closeBrowser() en fin
+   - Commentaires en francais""",
+    },
+    "playwright": {
+        "label": "Playwright (TypeScript)",
+        "extension": ".spec.ts",
+        "code_instructions": """6. Genere un test Playwright en TypeScript complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour les selecteurs unique: false avec texte disponible, utilise getByText() ou getByRole() avec name.
+   - Structure :
+     import { test, expect } from '@playwright/test';
+     test('description', async ({ page }) => {
+       await page.goto(url);
+       await page.locator('selector').click();
+       await page.locator('selector').fill('value');
+     });
+   - Pour XPath utilise page.locator('xpath=...').click()
+   - Pour CSS utilise page.locator('selector').click()
+   - Pour shadow DOM utilise page.locator('host >>> inner').click()
+   - Ajoute await page.waitForLoadState('networkidle') apres les navigations
+   - Commentaires en francais""",
+    },
+    "cypress": {
+        "label": "Cypress (JavaScript)",
+        "extension": ".cy.js",
+        "code_instructions": """6. Genere un test Cypress en JavaScript complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour selecteurs unique: false avec texte disponible, utilise cy.contains() pour fiabiliser.
+   - Structure :
+     describe('parcours', () => {
+       it('test', () => {
+         cy.visit(url);
+         cy.get('selector').click();
+         cy.get('selector').type('value');
+       });
+     });
+   - Pour XPath, installe cypress-xpath et utilise cy.xpath('//...')
+   - Pour CSS utilise cy.get('selector')
+   - cy.contains(text) si le texte est plus stable que le selecteur
+   - Commentaires en francais""",
+    },
+    "selenium": {
+        "label": "Selenium (Python)",
+        "extension": ".py",
+        "code_instructions": """6. Genere un test Selenium WebDriver en Python complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour selecteurs unique: false avec texte, prefere XPath text-based.
+   - Structure :
+     from selenium import webdriver
+     from selenium.webdriver.common.by import By
+     from selenium.webdriver.support.ui import WebDriverWait
+     from selenium.webdriver.support import expected_conditions as EC
+     driver = webdriver.Chrome()
+     driver.get(url)
+     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'selector'))).click()
+     element = driver.find_element(By.CSS_SELECTOR, 'selector')
+     element.send_keys('value')
+   - Utilise By.XPATH pour selecteurs commencant par //, By.CSS_SELECTOR sinon
+   - WebDriverWait avant chaque interaction (attendre element_to_be_clickable)
+   - driver.quit() en fin
+   - Commentaires en francais""",
+    },
+}
 MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut browser-use: 0.5s, trop court pour les SPA)
 MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
 NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
@@ -357,6 +451,10 @@ def resolve_task():
         "--no-vision", dest="vision", action="store_false",
         help="Force la desactivation des screenshots (utile pour Groq text-only et reduire le coup token)"
     )
+    parser.add_argument(
+        "--output-format", default="katalon", choices=list(OUTPUT_FORMATS.keys()),
+        help="Format du code de test genere (defaut: katalon). Choix: " + ", ".join(OUTPUT_FORMATS.keys())
+    )
 
     args = parser.parse_args()
 
@@ -390,6 +488,7 @@ def resolve_task():
         "base_url": provider_cfg["base_url"],
         "api_key": api_key,
         "use_vision": use_vision,
+        "output_format": args.output_format,
     }
 
     # Mode 1 : Fichier JSON du Scenario Builder
@@ -473,7 +572,7 @@ def dedup_log(raw_log):
 # NETTOYAGE IA
 # ============================================================
 
-def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None):
+def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None, output_format="katalon"):
     """
     Envoie le log deduplique a GPT-4.1-mini pour :
     - Reconstituer le parcours ideal dans l'ordre
@@ -487,6 +586,11 @@ def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None,
     if api_key:
         client_kwargs["api_key"] = api_key
     client = OpenAI(**client_kwargs)
+
+    # Format de sortie : recupere le bloc d'instructions code-gen + label/extension
+    fmt = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
+    code_instructions_block = fmt["code_instructions"]
+    print(f"  Format de sortie : {fmt['label']} ({fmt['extension']})")
 
     # Bloc optionnel : scenario attendu pour comparaison
     scenario_block = ""
@@ -540,35 +644,7 @@ CONSIGNE :
    - Clics parasites supprimes (indiquer lesquels et pourquoi)
    - Etapes du scenario non couvertes par le log
    - Tout ecart entre le scenario attendu et le parcours reconstitue
-6. Genere le code Katalon Studio (Groovy) complet et fonctionnel pour rejouer ce parcours.
-   
-   REGLE CRITIQUE POUR LE CODE KATALON :
-   - Ne modifie JAMAIS les selecteurs qui ont unique: true. Utilise-les EXACTEMENT tels quels.
-   - EXCEPTION pour unique: false : si le selecteur est non-unique ET qu'un texte est disponible
-     dans le log (champ "text"), genere un XPath avec le texte pour fiabiliser le clic.
-     Exemple : selecteur "a.listItem__container" (15 matchs) avec texte "Compétitions"
-     → to.addProperty("xpath", ConditionType.EQUALS, "//a[contains(@class,'listItem__container') and contains(text(),'Compétitions')]")
-     Signale ce remplacement dans les anomalies.
-   - Pour creer un TestObject, utilise TOUJOURS ce pattern :
-     
-     TestObject to = new TestObject("nomDescriptif")
-     Si le selecteur commence par "//" :
-       to.addProperty("xpath", ConditionType.EQUALS, "le_selecteur_exact")
-     Sinon :
-       to.addProperty("css", ConditionType.EQUALS, "le_selecteur_exact")
-   
-   - Import requis en haut : 
-     import com.kms.katalon.core.testobject.TestObject
-     import com.kms.katalon.core.testobject.ConditionType
-     import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
-   - Utilise WebUI.openBrowser('') et WebUI.navigateToUrl() pour ouvrir la page
-   - Utilise WebUI.click(to) pour les clics
-   - Utilise WebUI.setText(to, value) pour les inputs
-   - Ajoute WebUI.delay(1) entre les etapes pour la stabilite
-   - Ajoute WebUI.verifyElementPresent(to, 10) avant chaque interaction
-   - Si l'entree a "inShadowDOM": true, utilise WebUI.executeJavaScript() avec le jsSelector fourni
-   - Termine avec WebUI.closeBrowser()
-   - Ajoute des commentaires en francais pour chaque etape
+{code_instructions_block}
 
 Reponds UNIQUEMENT en JSON valide, pas de markdown, pas de commentaires.
 Structure attendue :
@@ -590,7 +666,7 @@ Structure attendue :
       "unique": true
     }}
   ],
-  "katalon_code": "// Code Katalon complet ici en une seule string avec des \\n pour les sauts de ligne"
+  "katalon_code": "// Code complet ici en une seule string avec des \\n pour les sauts de ligne (peu importe le langage demande, on garde la cle 'katalon_code' pour compatibilite)"
 }}"""
 
     print("\n  Nettoyage IA en cours...")
@@ -733,6 +809,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     base_url = timing_opts.get("base_url")
     api_key = timing_opts.get("api_key")
     use_vision = timing_opts.get("use_vision", True)
+    output_format = timing_opts.get("output_format", "katalon")
 
     # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
     print_header("LANCEMENT CHROMIUM + CDP")
@@ -949,7 +1026,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         # -- ETAPE 8 : Nettoyage IA --
         if len(deduped) > 0:
-            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key)
+            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format)
 
             clean_file = f"clean_steps_{timestamp}.json"
             with open(clean_file, "w", encoding="utf-8") as f:
@@ -959,12 +1036,13 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             print_clean_steps(clean_data)
 
             # -- ETAPE 9 : Sauvegarder le code Katalon --
-            katalon_code = clean_data.get('katalon_code', '')
-            if katalon_code:
-                katalon_file = f"katalon_test_{timestamp}.groovy"
-                with open(katalon_file, "w", encoding="utf-8") as f:
-                    f.write(katalon_code)
-                print(f"\n  Code Katalon -> {katalon_file}")
+            generated_code = clean_data.get('katalon_code', '')
+            if generated_code:
+                fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
+                code_file = f"test_{output_format}_{timestamp}{fmt_info['extension']}"
+                with open(code_file, "w", encoding="utf-8") as f:
+                    f.write(generated_code)
+                print(f"\n  Code {fmt_info['label']} -> {code_file}")
 
             # -- ETAPE 10 : Generer le rapport HTML --
             if HAS_REPORT:
