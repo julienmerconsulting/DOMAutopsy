@@ -17,12 +17,23 @@ Lancement :
 
 import asyncio
 import sys
+import logging
 
 # CRITIQUE Windows : asyncio.create_subprocess_exec necessite ProactorEventLoop,
 # uvicorn utilise SelectorEventLoop par defaut -> NotImplementedError sans ce fix.
 # DOIT etre execute AVANT tout autre code qui touche a asyncio.
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
+
+# Filtrer les endpoints de polling silencieux des access logs uvicorn
+class _QuietAccessFilter(logging.Filter):
+    QUIET_PATHS = ("/api/runs", "/api/formats", "/api/providers", "/favicon.ico")
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(p in msg for p in self.QUIET_PATHS)
+
+logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse

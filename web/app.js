@@ -231,8 +231,15 @@ window.addEventListener("beforeunload", () => {
   }
 });
 
-// Refresh badge "runs actifs" toutes les 3s (utile pour voir les runs des AUTRES onglets)
-activeRunsTimer = setInterval(refreshActiveRuns, 3000);
+// Refresh badge "runs actifs" toutes les 10s (utile pour voir les runs des AUTRES onglets)
+// Pause le polling quand l'onglet est en background pour pas spammer le serveur
+activeRunsTimer = setInterval(() => {
+  if (!document.hidden) refreshActiveRuns();
+}, 10000);
+// Refresh immediatement quand l'utilisateur revient sur l'onglet
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshActiveRuns();
+});
 
 // Boot
 loadFormats();
