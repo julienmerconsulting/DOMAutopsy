@@ -888,6 +888,43 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         except Exception as e:
             print(f"  Injection CDP echouee (pas critique): {e}")
 
+        # -- ETAPE 2bis : Brancher la capture observabilite (V3 phase 1) --
+        # Runtime.exceptionThrown + Console.messageAdded sur la session CDP de la PAGE
+        # (pas browser-level : ces events sont per-target).
+        js_errors = []
+        console_messages = []
+        try:
+            page_cdp = await page.context.new_cdp_session(page)
+            await page_cdp.send("Runtime.enable")
+            await page_cdp.send("Console.enable")
+
+            def on_exception(event):
+                exc = event.get("exceptionDetails", {})
+                js_errors.append({
+                    "timestamp": event.get("timestamp"),
+                    "text": exc.get("text", ""),
+                    "exception": (exc.get("exception") or {}).get("description", ""),
+                    "url": exc.get("url"),
+                    "lineNumber": exc.get("lineNumber"),
+                    "columnNumber": exc.get("columnNumber"),
+                    "stackTrace": (exc.get("stackTrace") or {}).get("callFrames", [])[:5],
+                })
+
+            def on_console(event):
+                msg = event.get("message", {})
+                console_messages.append({
+                    "level": msg.get("level"),  # log | warning | error | info | debug
+                    "text": msg.get("text", "")[:500],
+                    "url": msg.get("url"),
+                    "line": msg.get("line"),
+                })
+
+            page_cdp.on("Runtime.exceptionThrown", on_exception)
+            page_cdp.on("Console.messageAdded", on_console)
+            print(f"  Capture observabilite : Runtime.exceptionThrown + Console.messageAdded actives")
+        except Exception as e:
+            print(f"  [WARN] Capture observabilite echouee : {e}")
+
         # -- ETAPE 3 : Lancer browser-use via CDP --
         print_header("LANCEMENT BROWSER-USE")
         print(f"  Timing : min_wait={min_wait}s max_wait={max_wait}s network_idle={network_idle}s max_steps={max_steps}")
@@ -1083,6 +1120,8 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     scenario_url=scenario_url,
                     timestamp=timestamp,
                     output_dir=str(output_dir),
+                    js_errors=js_errors if 'js_errors' in locals() else [],
+                    console_messages=console_messages if 'console_messages' in locals() else [],
                 )
                 print(f"  Rapport HTML -> {report_path}")
                 if should_open_report:
@@ -1094,6 +1133,25 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 print("\n  report_generator.py absent, pas de rapport HTML")
         else:
             print("\n  Aucune entree capturee, pas de nettoyage IA")
+
+        # -- ETAPE 10bis : Sauvegarder les captures observabilite (V3 phase 1) --
+        try:
+            if 'js_errors' in locals():
+                (output_dir / "js_errors.json").write_text(
+                    json.dumps(js_errors, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                if js_errors:
+                    print(f"\n  JS Errors silencieux captures : {len(js_errors)} -> js_errors.json")
+            if 'console_messages' in locals():
+                (output_dir / "console_messages.json").write_text(
+                    json.dumps(console_messages, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                console_warns = sum(1 for m in console_messages if m.get("level") == "warning")
+                console_errs = sum(1 for m in console_messages if m.get("level") == "error")
+                if console_messages:
+                    print(f"  Console : {len(console_messages)} messages ({console_errs} errors, {console_warns} warnings)")
+        except Exception as e:
+            print(f"  [WARN] Sauvegarde observabilite echouee : {e}")
 
         # -- ETAPE 11 : Ecrire meta.json (alimente l'historique du serveur web) --
         try:
@@ -1113,6 +1171,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "raw_count": len(raw_log),
                 "deduped_count": len(deduped) if 'deduped' in locals() else 0,
                 "report": f"qa_report_{timestamp}.html" if (output_dir / f"qa_report_{timestamp}.html").exists() else None,
+                "js_errors_count": len(js_errors) if 'js_errors' in locals() else 0,
+                "console_errors_count": sum(1 for m in console_messages if m.get("level") == "error") if 'console_messages' in locals() else 0,
+                "console_warnings_count": sum(1 for m in console_messages if m.get("level") == "warning") if 'console_messages' in locals() else 0,
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")

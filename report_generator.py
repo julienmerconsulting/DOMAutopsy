@@ -14,11 +14,12 @@ from datetime import datetime
 from collections import Counter
 
 
-def generate_report(clean_data, deduped_log, agent_result, scenario_name="", 
-                    scenario_url="", timestamp=None, output_dir="."):
+def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
+                    scenario_url="", timestamp=None, output_dir=".",
+                    js_errors=None, console_messages=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
-    
+
     Args:
         clean_data: dict issu du cleanup IA (clean_steps_*.json)
         deduped_log: list des entrees dedupliquees (locator_dedup_*.json)
@@ -27,10 +28,14 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         scenario_url: URL de depart
         timestamp: timestamp du run (format YYYYMMDD_HHMMSS)
         output_dir: dossier de sortie
-    
+        js_errors: list de Runtime.exceptionThrown captures (V3 phase 1)
+        console_messages: list de Console.messageAdded captures (V3 phase 1)
+
     Returns:
         filepath: chemin du rapport genere
     """
+    js_errors = js_errors or []
+    console_messages = console_messages or []
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -161,6 +166,64 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <div class="card">
             <h2>Code Katalon Studio (Groovy)</h2>
             <pre class="code-block"><code>{escaped_code}</code></pre>
+        </div>"""
+
+    # --- Observabilite (V3 phase 1) ---
+    observability_html = ""
+    js_err_count = len(js_errors)
+    console_err_count = sum(1 for m in console_messages if m.get("level") == "error")
+    console_warn_count = sum(1 for m in console_messages if m.get("level") == "warning")
+    if js_err_count or console_err_count or console_warn_count:
+        def _esc(s):
+            return (str(s or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+        js_rows = ""
+        for e in js_errors[:50]:
+            stack_top = ""
+            if e.get("stackTrace"):
+                fr = e["stackTrace"][0]
+                stack_top = f"{_esc(fr.get('functionName') or '?')} at {_esc(fr.get('url', '')[:80])}:{fr.get('lineNumber', '?')}"
+            js_rows += f"""
+            <tr>
+              <td><span class="status-badge status-fail">{_esc(e.get('text', '')[:120])}</span></td>
+              <td><code>{_esc(e.get('exception', '')[:200])}</code></td>
+              <td><small>{stack_top}</small></td>
+            </tr>"""
+
+        console_rows = ""
+        for m in console_messages[:50]:
+            level = m.get("level") or "log"
+            badge_cls = "status-fail" if level == "error" else ("status-warning" if level == "warning" else "status-success")
+            console_rows += f"""
+            <tr>
+              <td><span class="status-badge {badge_cls}">{_esc(level)}</span></td>
+              <td>{_esc(m.get('text', '')[:200])}</td>
+              <td><small>{_esc(m.get('url', '')[:60])}{':' + str(m['line']) if m.get('line') else ''}</small></td>
+            </tr>"""
+
+        observability_html = f"""
+        <div class="card">
+            <h2>Observabilite (V3 phase 1)</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>Runtime.exceptionThrown</code> et <code>Console.messageAdded</code>.
+                Ces events sont normalement invisibles a l'utilisateur QA mais signalent des bugs JS reels.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if js_err_count else '#3fb950'}">{js_err_count}</div>
+                    <div class="kpi-label">JS Errors silencieux</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if console_err_count else '#3fb950'}">{console_err_count}</div>
+                    <div class="kpi-label">Console errors</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#d29922' if console_warn_count else '#3fb950'}">{console_warn_count}</div>
+                    <div class="kpi-label">Console warnings</div>
+                </div>
+            </div>
+            {f'<h3 style="margin-top:0">JS Exceptions ({js_err_count})</h3><div class="table-wrap"><table><thead><tr><th>Texte</th><th>Exception</th><th>Stack top</th></tr></thead><tbody>{js_rows}</tbody></table></div>' if js_rows else ''}
+            {f'<h3>Console messages ({len(console_messages)})</h3><div class="table-wrap"><table><thead><tr><th>Niveau</th><th>Message</th><th>Source</th></tr></thead><tbody>{console_rows}</tbody></table></div>' if console_rows else ''}
         </div>"""
 
     # --- Deduped log details ---
@@ -581,6 +644,9 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                 </tbody>
             </table>
         </div>
+
+        <!-- Observabilite (V3 phase 1) -->
+        {observability_html}
 
         <!-- Code Katalon -->
         {katalon_html}
