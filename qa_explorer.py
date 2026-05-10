@@ -98,6 +98,10 @@ def _patch_browser_use():
 
 LLM_MODEL = "gpt-4.1-mini"
 CDP_PORT = 9222
+MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut browser-use: 0.5s, trop court pour les SPA)
+MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
+NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
+MAX_STEPS = 25                    # garde-fou anti-boucle infinie
 
 # TASK par defaut (legacy, utilise si aucun JSON ni --task)
 DEFAULT_TASK = """
@@ -298,8 +302,30 @@ def resolve_task():
         "--port", type=int, default=CDP_PORT,
         help=f"Port CDP Chromium (defaut: {CDP_PORT})"
     )
+    parser.add_argument(
+        "--min-wait", type=float, default=MIN_WAIT_PAGE_LOAD,
+        help=f"Temps min d'attente avant snapshot DOM en sec (defaut: {MIN_WAIT_PAGE_LOAD}s, augmente pour les SPA lentes)"
+    )
+    parser.add_argument(
+        "--max-wait", type=float, default=MAX_WAIT_PAGE_LOAD,
+        help=f"Temps max d'attente avant snapshot DOM en sec (defaut: {MAX_WAIT_PAGE_LOAD}s)"
+    )
+    parser.add_argument(
+        "--network-idle", type=float, default=NETWORK_IDLE_WAIT,
+        help=f"Temps d'attente reseau idle en sec (defaut: {NETWORK_IDLE_WAIT}s)"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=MAX_STEPS,
+        help=f"Nombre max d'etapes de l'agent (defaut: {MAX_STEPS}, evite les boucles infinies)"
+    )
 
     args = parser.parse_args()
+    timing_opts = {
+        "min_wait": args.min_wait,
+        "max_wait": args.max_wait,
+        "network_idle": args.network_idle,
+        "max_steps": args.max_steps,
+    }
 
     # Mode 1 : Fichier JSON du Scenario Builder
     if args.scenario_file:
@@ -309,7 +335,7 @@ def resolve_task():
         with open(args.scenario_file, "r", encoding="utf-8") as f:
             scenario = json.load(f)
         task = build_task_from_json(args.scenario_file)
-        return task, args.model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", [])
+        return task, args.model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", []), timing_opts
 
     # Mode 2 : --url + --task en ligne de commande
     if args.url and args.task:
@@ -323,13 +349,13 @@ Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."""
         print_header("MODE LIGNE DE COMMANDE")
         print(f"  URL  : {args.url}")
         print(f"  Task : {args.task}")
-        return task, args.model, args.port, "CLI", args.url, []
+        return task, args.model, args.port, "CLI", args.url, [], timing_opts
 
     # Mode 3 : TASK par defaut (legacy)
     print_header("MODE LEGACY (TASK PAR DEFAUT)")
     print("  Aucun scenario JSON ni --url/--task fourni")
     print("  Utilisation du TASK hardcode")
-    return DEFAULT_TASK, args.model, args.port, "Legacy", "", []
+    return DEFAULT_TASK, args.model, args.port, "Legacy", "", [], timing_opts
 
 
 # ============================================================
@@ -625,9 +651,14 @@ def print_clean_steps(clean_data):
 # MAIN
 # ============================================================
 
-async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None):
+async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None, timing_opts=None):
     """Fonction principale d'execution du QA Explorer"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timing_opts = timing_opts or {}
+    min_wait = timing_opts.get("min_wait", MIN_WAIT_PAGE_LOAD)
+    max_wait = timing_opts.get("max_wait", MAX_WAIT_PAGE_LOAD)
+    network_idle = timing_opts.get("network_idle", NETWORK_IDLE_WAIT)
+    max_steps = timing_opts.get("max_steps", MAX_STEPS)
 
     # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
     print_header("LANCEMENT CHROMIUM + CDP")
@@ -676,8 +707,19 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         # -- ETAPE 3 : Lancer browser-use via CDP --
         print_header("LANCEMENT BROWSER-USE")
+        print(f"  Timing : min_wait={min_wait}s max_wait={max_wait}s network_idle={network_idle}s max_steps={max_steps}")
         llm = ChatOpenAI(model=model)
-        browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
+        try:
+            browser_session = BrowserSession(
+                cdp_url=f"http://localhost:{cdp_port}",
+                minimum_wait_page_load_time=min_wait,
+                maximum_wait_page_load_time=max_wait,
+                wait_for_network_idle_page_load_time=network_idle,
+            )
+        except TypeError as e:
+            # Fallback : version de browser-use ne supportant pas ces kwargs
+            print(f"  [WARN] BrowserSession ne supporte pas les kwargs timing ({e}), fallback defauts")
+            browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
 
         agent = Agent(
             task=task,
@@ -685,7 +727,11 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             browser_session=browser_session,
         )
 
-        result = await agent.run()
+        try:
+            result = await agent.run(max_steps=max_steps)
+        except TypeError:
+            # Fallback : agent.run sans max_steps
+            result = await agent.run()
 
         # -- ETAPE 4 : Recuperer le log brut --
         print_header("RECUPERATION DES LOCATEURS")
@@ -827,5 +873,5 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
 if __name__ == "__main__":
     _patch_browser_use()
-    task, model, port, scenario_name, scenario_url, scenario_steps = resolve_task()
-    asyncio.run(run(task, model, port, scenario_name, scenario_url, scenario_steps))
+    task, model, port, scenario_name, scenario_url, scenario_steps, timing_opts = resolve_task()
+    asyncio.run(run(task, model, port, scenario_name, scenario_url, scenario_steps, timing_opts))
