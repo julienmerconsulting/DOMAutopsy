@@ -98,23 +98,25 @@
     </div>
   </section>
 
-  <section class="panel screen-panel">
-    <h2>Chromium en direct <span class="status-dot" id="screenStatus"></span></h2>
-    <div class="canvas-wrapper">
-      <canvas id="screen" width="1280" height="720"></canvas>
-      <div class="canvas-empty" id="canvasEmpty">En attente du run...</div>
-    </div>
-  </section>
+  <div class="main-pane">
+    <section class="panel screen-panel">
+      <h2>Chromium en direct <span class="status-dot" id="screenStatus"></span></h2>
+      <div class="canvas-wrapper">
+        <canvas id="screen" width="1280" height="720"></canvas>
+        <div class="canvas-empty" id="canvasEmpty">En attente du run...</div>
+      </div>
+    </section>
 
-  <section class="panel log-panel">
-    <h2>Log Python <span class="status-dot" id="logStatus"></span></h2>
-    <pre id="log" class="log-box">En attente...</pre>
-    <div class="actions">
-      <button id="reportBtn" disabled>Voir le rapport HTML</button>
-      <button id="codeBtn" type="button" disabled>Voir le code de test</button>
-      <button id="clearLogBtn" type="button">Effacer log</button>
-    </div>
-  </section>
+    <section class="panel log-panel">
+      <h2>Log Python <span class="status-dot" id="logStatus"></span></h2>
+      <pre id="log" class="log-box">En attente...</pre>
+      <div class="actions">
+        <button id="reportBtn" disabled>Voir le rapport HTML</button>
+        <button id="codeBtn" type="button" disabled>Voir le code de test</button>
+        <button id="clearLogBtn" type="button">Effacer log</button>
+      </div>
+    </section>
+  </div>
 </main>
 
 <script src="/web/app.js"></script>
