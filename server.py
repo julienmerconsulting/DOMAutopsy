@@ -18,12 +18,12 @@ Lancement :
 import asyncio
 import sys
 import logging
+import subprocess
 
-# CRITIQUE Windows : asyncio.create_subprocess_exec necessite ProactorEventLoop,
-# uvicorn utilise SelectorEventLoop par defaut -> NotImplementedError sans ce fix.
-# DOIT etre execute AVANT tout autre code qui touche a asyncio.
-if sys.platform == "win32":
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+# Note Windows : on n'utilise PAS asyncio.create_subprocess_exec (qui necessite
+# ProactorEventLoop, indisponible avec uvicorn --reload qui fork un worker en
+# SelectorEventLoop). On utilise subprocess.Popen standard + lecture stdout via
+# loop.run_in_executor. Compatible avec n'importe quel event loop, y compris uvloop.
 
 
 # Filtrer les endpoints de polling silencieux des access logs uvicorn
@@ -68,11 +68,11 @@ async def lifespan(app: FastAPI):
     # --- Startup ---
     yield
     # --- Shutdown : kill tous les subprocess en cours ---
-    active = sum(1 for r in RUNS.values() if r["proc"].returncode is None)
+    active = sum(1 for r in RUNS.values() if r["proc"].poll() is None)
     print(f"[server] Shutdown : kill {active} runs actifs...")
     for rid, r in RUNS.items():
         proc = r["proc"]
-        if proc.returncode is None:
+        if proc.poll() is None:
             try:
                 proc.terminate()
             except ProcessLookupError:
@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
     await asyncio.sleep(2)
     for rid, r in RUNS.items():
         proc = r["proc"]
-        if proc.returncode is None:
+        if proc.poll() is None:
             try:
                 proc.kill()
             except ProcessLookupError:
@@ -184,15 +184,17 @@ async def kill_run(run_id: str):
     if run_id not in RUNS:
         raise HTTPException(404, f"run_id inconnu: {run_id}")
     r = RUNS[run_id]
-    proc = r["proc"]
-    if proc.returncode is None:
+    proc: subprocess.Popen = r["proc"]
+    loop = asyncio.get_running_loop()
+    if proc.poll() is None:  # encore en vie
         try:
             proc.terminate()
             try:
-                await asyncio.wait_for(proc.wait(), timeout=3)
+                # wait via executor + timeout
+                await asyncio.wait_for(loop.run_in_executor(None, proc.wait), timeout=3)
             except asyncio.TimeoutError:
                 proc.kill()
-                await proc.wait()
+                await loop.run_in_executor(None, proc.wait)
         except ProcessLookupError:
             pass
     r["status"] = "killed"
@@ -222,11 +224,14 @@ async def start_run(req: RunRequest):
     if req.headless:
         args.append("--headless")
 
-    proc = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
+    # subprocess.Popen est event-loop-agnostique : marche avec uvicorn --reload sur Windows
+    # sans dependance a ProactorEventLoop
+    proc = subprocess.Popen(
+        args,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
         cwd=str(ROOT),
+        bufsize=1,           # line-buffered
     )
 
     log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
@@ -245,28 +250,29 @@ async def start_run(req: RunRequest):
     return {"run_id": run_id, "cdp_port": cdp_port}
 
 
-async def _pump_stdout(run_id: str, proc: asyncio.subprocess.Process, queue: asyncio.Queue):
-    """Lit stdout du subprocess ligne a ligne et push dans la queue. Sentinelle None en fin."""
+async def _pump_stdout(run_id: str, proc: subprocess.Popen, queue: asyncio.Queue):
+    """Lit stdout du subprocess ligne a ligne via thread executor (compat any event loop)."""
     assert proc.stdout is not None
+    loop = asyncio.get_running_loop()
     try:
         while True:
-            line_bytes = await proc.stdout.readline()
+            # readline est bloquant -> on le delegue au thread pool de l'event loop
+            line_bytes = await loop.run_in_executor(None, proc.stdout.readline)
             if not line_bytes:
                 break
             line = line_bytes.decode("utf-8", errors="replace").rstrip()
             await queue.put(line)
-            # Detecter la generation du rapport HTML pour le retrouver ensuite
             if "Rapport HTML ->" in line:
-                # Extrait le chemin (apres la fleche)
                 try:
                     path_part = line.split("->", 1)[1].strip()
                     RUNS[run_id]["report_path"] = path_part
                 except IndexError:
                     pass
     finally:
-        await proc.wait()
+        # Attendre que le process termine vraiment (idem, bloquant -> executor)
+        await loop.run_in_executor(None, proc.wait)
         RUNS[run_id]["status"] = "exit_" + str(proc.returncode)
-        await queue.put(None)  # sentinelle
+        await queue.put(None)
 
 
 @app.websocket("/ws/logs/{run_id}")
