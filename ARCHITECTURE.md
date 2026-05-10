@@ -583,19 +583,93 @@ FastAPI standard, ajouter dans `server.py` après les imports.
 | Rapport HTML enrichi : section "Drift report" si diff détecté | 2h | livrable client |
 | Endpoint `/api/run/{id}/diff` pour récupérer diff_report.json | 30 min | API pour intégrations |
 
-### 9.3 V3 (observabilité CDP, ~1 semaine)
+### 9.3 V3 (observabilité CDP, ~1 semaine) — ordre d'implémentation strict
 
-| Feature | Effort | Valeur |
-|---|---|---|
-| `Runtime.exceptionThrown` capture + section "JS Errors silencieux" dans rapport | 30 min | bugs invisibles révélés |
-| `Console.messageAdded` capture + section "Console output" | 30 min | warnings/errors |
-| `Network.requestWillBeSent` + `Network.responseReceived` capture | 2h | API telemetry |
-| Section "Network audit" dans rapport (3rd parties, volumes, status codes) | 2h | argument RGPD |
-| Mock generator : `--generate-mocks` produit `mocks.json` rejouable offline | 1j | tests deterministes |
-| API assertions auto-générées dans le code de test (`expect response.status === 200`) | 4h | qualité tests générés |
-| `DOM.attributeModified` + idle DOM auto-wait (kill la flake structurellement) | 4h | anti-flake |
-| `Performance.getMetrics` + baseline historique + alerte sur drift | 1j | régression perf |
-| `Coverage.takePreciseCoverage` + section "% code testé" dans rapport | 2h | couverture réelle |
+**Important** : faire dans cet ordre exact pour éviter le merge hell et les dépendances circulaires.
+
+| Phase | Feature | Effort | Valeur |
+|---|---|---|---|
+| 1 | `Runtime.exceptionThrown` capture + section "JS Errors silencieux" dans rapport | 30 min | bugs invisibles révélés |
+| 1 | `Console.messageAdded` capture + section "Console output" | 30 min | warnings/errors |
+| 2 | `Network.requestWillBeSent` + `Network.responseReceived` capture brute (sans assertions) | 2h | API telemetry |
+| 2 | Section "Network audit" dans rapport (3rd parties, volumes, status codes) | 2h | argument RGPD |
+| 3 | API assertions auto-générées dans le code de test (`expect response.status === 200`) | 4h | qualité tests générés |
+| 3 | Mock generator : `--generate-mocks` produit `mocks.json` rejouable offline | 1j | tests deterministes |
+| 4 | `Performance.getMetrics` snapshot start/end + delta dans meta.json | 1h | régression perf |
+| 4 | Baseline historique + alerte sur drift heap/layout/nodes | 1j | monitoring continu |
+| 5 | `Coverage.startPreciseCoverage` + `Coverage.takePreciseCoverage` + section "% code testé" | 2h | couverture réelle |
+| 6 | `DOM.attributeModified` idle-wait helper (kill la flake) | 4h | anti-flake structurel |
+| 6 | Layout shift detection (CLS-like) | 1j | qualité visuelle |
+
+**Pourquoi cet ordre** :
+- Phase 1 d'abord parce que c'est `cdp_session.on(event)` simple, pas de filtrage, valeur immédiate
+- Phase 2 sépare capture brute (validable) de la génération d'assertions (qui dépend de la qualité de la capture)
+- Phase 3 dépend de Phase 2 (les assertions utilisent le log Network)
+- Phase 4 et 5 indépendants, peuvent paralléliser
+- Phase 6 en dernier parce que le plus complexe (refactor des waits dans qa_explorer)
+
+### 9.3.1 Pièges techniques V3 — à connaître AVANT d'implémenter
+
+**Piège 1 : Filtrage du bruit Network**
+
+`Network.requestWillBeSent` capture **toutes** les requêtes : images, fonts, CSS, analytics beacons, CDN, etc. Sans filtre, `network_log.json` est inexploitable (200 entries pour 5 vrais API calls).
+
+Mitigation à coder dès la Phase 2 :
+```python
+# Garder seulement Fetch / XHR / Document
+KEEP_TYPES = {"Fetch", "XHR", "Document"}
+def on_request(event):
+    if event["type"] in KEEP_TYPES:
+        network_log.append(event)
+```
+
+À NE PAS confondre avec une "pollution par le screencast" : le CDP `Page.screencastFrame` arrive sur le WS CDP en JSON-RPC, pas comme requête HTTP, donc il n'apparaît jamais dans le Network domain. Pas besoin de filtrer le screencast — on filtre les assets/CSS/fonts/images du SUT.
+
+**Piège 2 : Coverage.startPreciseCoverage TIMING CRITIQUE**
+
+`Coverage.startPreciseCoverage` doit être appelé **avant que le JS bootstrap de la page testée ne s'exécute**, sinon le bootstrap n'est pas instrumenté et les % sortent faux (sous-estimés massifs).
+
+Ordre obligatoire dans `qa_explorer.py` :
+```python
+1. pw.chromium.launch(...)                                  # nouveau Chromium
+2. cdp = await browser.new_browser_cdp_session()
+3. await cdp.send("Profiler.enable")                        # prérequis Coverage
+4. await cdp.send("Coverage.startPreciseCoverage", {        # AVANT browser-use
+       "detailed": True, "callCount": False
+   })
+5. await context.add_init_script(DOM_LISTENER_JS)
+6. browser_session = BrowserSession(cdp_url=...)
+7. agent.run(...)                                           # navigate + actions ICI
+8. coverage = await cdp.send("Coverage.takePreciseCoverage")
+```
+
+Si tu enables après `agent.run()`, le bundle initial chargé est marqué comme "non exécuté" alors qu'il l'a été. Bug subtil et silencieux.
+
+**Piège 3 : Sélection de target CDP (Browser session vs Page session)**
+
+`browser.new_browser_cdp_session()` attache au **navigateur entier**, pas à une page spécifique. Pour les domaines `Network`, `Runtime`, `Console`, `DOM` qui sont **par-page**, il faut attacher à la page :
+
+```python
+# CORRECT pour Network/Runtime/Console/DOM
+cdp = await page.context.new_cdp_session(page)
+await cdp.send("Network.enable")
+cdp.on("Network.requestWillBeSent", on_request)
+
+# CORRECT pour Browser-level (Coverage, Page screencast)
+cdp = await browser.new_browser_cdp_session()
+await cdp.send("Coverage.startPreciseCoverage", {...})
+```
+
+Si tu mixes, soit tu rates des events (Network sur browser session ne capture rien), soit tu doubles (le multi-onglet va dispatcher le même event sur plusieurs sessions).
+
+**Piège 4 : CDP supporte plusieurs clients sans conflit**
+
+Contrairement à une intuition naturelle, **CDP autorise N clients en parallèle** sur la même cible. Le screencast côté `server.py` et la capture Network côté `qa_explorer.py` ne se "marchent pas dessus" — chaque session reçoit ses events indépendamment. **MAIS** la recommandation de tout faire côté `qa_explorer.py` reste juste, pour 2 raisons orthogonales aux conflits :
+
+1. **Locality** : qa_explorer écrit déjà tous les artefacts dans `runs/<id>/`, c'est le bon endroit pour `network_log.json` / `js_errors.json` / etc.
+2. **Lifecycle** : qa_explorer sait quand le run est fini (après `agent.run()` retourne), il peut faire `Network.disable` proprement. Le serveur ne sait pas quand kill ces collectes.
+
+Le serveur garde uniquement le screencast (forwarding pur, pas de logique métier).
 
 ### 9.4 V4 (premium / scale, ~2 semaines)
 
