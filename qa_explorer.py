@@ -789,17 +789,55 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         if api_key:
             llm_kwargs["api_key"] = api_key
         llm = ChatOpenAI(**llm_kwargs)
-        try:
-            browser_session = BrowserSession(
-                cdp_url=f"http://localhost:{cdp_port}",
-                minimum_wait_page_load_time=min_wait,
-                maximum_wait_page_load_time=max_wait,
-                wait_for_network_idle_page_load_time=network_idle,
-            )
-        except TypeError as e:
-            # Fallback : version de browser-use ne supportant pas ces kwargs
-            print(f"  [WARN] BrowserSession ne supporte pas les kwargs timing ({e}), fallback defauts")
-            browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
+        # Construire le BrowserProfile (browser-use 0.12+) qui porte les params de timing
+        # Avant 0.12 : kwargs directement sur BrowserSession. Apres : via BrowserProfile.
+        browser_session = None
+        profile_applied = False
+
+        # Tentative 1 : via BrowserProfile (browser-use 0.12+)
+        BrowserProfile = None
+        for import_path in ("browser_use", "browser_use.browser.profile", "browser_use.browser"):
+            try:
+                module = __import__(import_path, fromlist=["BrowserProfile"])
+                BrowserProfile = getattr(module, "BrowserProfile", None)
+                if BrowserProfile:
+                    break
+            except Exception:
+                continue
+
+        if BrowserProfile:
+            try:
+                profile = BrowserProfile(
+                    minimum_wait_page_load_time=min_wait,
+                    maximum_wait_page_load_time=max_wait,
+                    wait_for_network_idle_page_load_time=network_idle,
+                )
+                browser_session = BrowserSession(
+                    cdp_url=f"http://localhost:{cdp_port}",
+                    browser_profile=profile,
+                )
+                profile_applied = True
+                print(f"  [OK] BrowserProfile applique : min={min_wait}s max={max_wait}s idle={network_idle}s")
+            except (TypeError, ValueError) as e:
+                print(f"  [WARN] BrowserProfile rejete ({e}), tentative kwargs directs...")
+
+        # Tentative 2 : kwargs directs sur BrowserSession (versions plus anciennes)
+        if browser_session is None:
+            try:
+                browser_session = BrowserSession(
+                    cdp_url=f"http://localhost:{cdp_port}",
+                    minimum_wait_page_load_time=min_wait,
+                    maximum_wait_page_load_time=max_wait,
+                    wait_for_network_idle_page_load_time=network_idle,
+                )
+                profile_applied = True
+                print(f"  [OK] BrowserSession kwargs directs appliques : min={min_wait}s max={max_wait}s")
+            except TypeError as e:
+                print(f"  [WARN] Aucun mecanisme de timing supporte ({e}), defauts browser-use utilises (0.5s/2s)")
+                browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
+
+        if not profile_applied:
+            print(f"  [INFO] Les SPA lourdes (DuckDuckGo, Twitter...) risquent d'echouer sans timing custom")
 
         agent_kwargs = {
             "task": task,
