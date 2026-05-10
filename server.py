@@ -15,6 +15,15 @@ Lancement :
   uvicorn server:app --reload --port 8000
 """
 
+import asyncio
+import sys
+
+# CRITIQUE Windows : asyncio.create_subprocess_exec necessite ProactorEventLoop,
+# uvicorn utilise SelectorEventLoop par defaut -> NotImplementedError sans ce fix.
+# DOIT etre execute AVANT tout autre code qui touche a asyncio.
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,10 +31,8 @@ from pydantic import BaseModel
 from pathlib import Path
 from uuid import uuid4
 from typing import Optional
-import asyncio
 import json
 import os
-import sys
 import socket
 import aiohttp
 from dotenv import load_dotenv
