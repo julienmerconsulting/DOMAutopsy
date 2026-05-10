@@ -16,7 +16,7 @@ from collections import Counter
 
 def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                     scenario_url="", timestamp=None, output_dir=".",
-                    js_errors=None, console_messages=None):
+                    js_errors=None, console_messages=None, network_log=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
 
@@ -36,6 +36,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     """
     js_errors = js_errors or []
     console_messages = console_messages or []
+    network_log = network_log or []
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -168,6 +169,83 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
             <pre class="code-block"><code>{escaped_code}</code></pre>
         </div>"""
 
+    # --- Network audit (V3 phase 2) ---
+    def _esc_html(s):
+        return (str(s or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+    network_html = ""
+    if network_log:
+        api_count = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
+        fail_count = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
+        # Domaines tiers (different de l'origine principale)
+        from urllib.parse import urlparse
+        origin_domain = ""
+        for r in network_log:
+            if r.get("type") == "Document" and r.get("url"):
+                try:
+                    origin_domain = urlparse(r["url"]).netloc
+                    break
+                except Exception:
+                    pass
+        third_parties = {}
+        for r in network_log:
+            try:
+                d = urlparse(r.get("url", "")).netloc
+                if d and d != origin_domain:
+                    third_parties[d] = third_parties.get(d, 0) + 1
+            except Exception:
+                pass
+        third_party_rows = "".join(
+            f"<tr><td><code>{_esc_html(d)}</code></td><td>{c}</td></tr>"
+            for d, c in sorted(third_parties.items(), key=lambda x: -x[1])[:30]
+        )
+
+        net_rows = ""
+        for r in network_log[:100]:
+            status = r.get("status")
+            status_cls = "status-success" if status and status < 400 else ("status-fail" if status else "status-warning")
+            method_cls = "status-success" if r.get("method") == "GET" else "status-warning"
+            net_rows += f"""
+            <tr>
+              <td><span class="status-badge {method_cls}">{_esc_html(r.get('method', '?'))}</span></td>
+              <td><span class="status-badge {status_cls}">{status if status else '...'}</span></td>
+              <td><code style="font-size:11px;">{_esc_html((r.get('url') or '')[:100])}</code></td>
+              <td><small>{_esc_html(r.get('type', ''))}</small></td>
+              <td><small>{r.get('duration_ms', '?')} ms</small></td>
+            </tr>"""
+
+        network_html = f"""
+        <div class="card">
+            <h2>Network audit</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture <code>Network.requestWillBeSent</code> / <code>Network.responseReceived</code>
+                / <code>Network.loadingFinished</code> sur la page testee. Filtre {','.join(['Fetch','XHR','Document','WebSocket','EventSource'])}
+                (les assets images/css/fonts/scripts sont ignores). Headers <code>Cookie</code> et
+                <code>Authorization</code> sont redactes pour confidentialite.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value">{len(network_log)}</div>
+                    <div class="kpi-label">Requetes capturees</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#58a6ff">{api_count}</div>
+                    <div class="kpi-label">API calls (Fetch/XHR)</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if fail_count else '#3fb950'}">{fail_count}</div>
+                    <div class="kpi-label">Erreurs >=400</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{len(third_parties)}</div>
+                    <div class="kpi-label">Domaines tiers</div>
+                </div>
+            </div>
+            {f'<h3>Domaines tiers contactes (audit RGPD/privacy)</h3><div class="table-wrap"><table><thead><tr><th>Domaine</th><th>Requetes</th></tr></thead><tbody>{third_party_rows}</tbody></table></div>' if third_party_rows else ''}
+            <h3>Requetes detaillees ({min(len(network_log), 100)}/{len(network_log)})</h3>
+            <div class="table-wrap"><table><thead><tr><th>Method</th><th>Status</th><th>URL</th><th>Type</th><th>Duree</th></tr></thead><tbody>{net_rows}</tbody></table></div>
+        </div>"""
+
     # --- Observabilite (V3 phase 1) ---
     observability_html = ""
     js_err_count = len(js_errors)
@@ -203,7 +281,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
 
         observability_html = f"""
         <div class="card">
-            <h2>Observabilite (V3 phase 1)</h2>
+            <h2>Observabilite : Console + JS Errors</h2>
             <p style="color:#8b949e; font-size:13px;">
                 Capture via CDP <code>Runtime.exceptionThrown</code> et <code>Console.messageAdded</code>.
                 Ces events sont normalement invisibles a l'utilisateur QA mais signalent des bugs JS reels.
@@ -645,7 +723,10 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
             </table>
         </div>
 
-        <!-- Observabilite (V3 phase 1) -->
+        <!-- Network audit (V3 phase 2) -->
+        {network_html}
+
+        <!-- Observabilite Console + JS (V3 phase 1) -->
         {observability_html}
 
         <!-- Code Katalon -->

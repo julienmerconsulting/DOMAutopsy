@@ -888,15 +888,22 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         except Exception as e:
             print(f"  Injection CDP echouee (pas critique): {e}")
 
-        # -- ETAPE 2bis : Brancher la capture observabilite (V3 phase 1) --
-        # Runtime.exceptionThrown + Console.messageAdded sur la session CDP de la PAGE
-        # (pas browser-level : ces events sont per-target).
+        # -- ETAPE 2bis : Brancher la capture observabilite (V3 phases 1 + 2) --
+        # Sessions CDP de la PAGE (pas browser-level : ces events sont per-target).
         js_errors = []
         console_messages = []
+        network_log = []
+        # Index pour matcher les responses sur les requests : {requestId: index_dans_network_log}
+        _net_index = {}
+        # Filtre PIEGE 1 : on garde uniquement les types pertinents pour le QA
+        # (Fetch/XHR = API calls, Document = HTML page, WebSocket = realtime)
+        # On ignore : Image, Stylesheet, Font, Media, Other, Script (assets)
+        NETWORK_KEEP_TYPES = {"Fetch", "XHR", "Document", "WebSocket", "EventSource"}
         try:
             page_cdp = await page.context.new_cdp_session(page)
             await page_cdp.send("Runtime.enable")
             await page_cdp.send("Console.enable")
+            await page_cdp.send("Network.enable")
 
             def on_exception(event):
                 exc = event.get("exceptionDetails", {})
@@ -913,15 +920,67 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             def on_console(event):
                 msg = event.get("message", {})
                 console_messages.append({
-                    "level": msg.get("level"),  # log | warning | error | info | debug
+                    "level": msg.get("level"),
                     "text": msg.get("text", "")[:500],
                     "url": msg.get("url"),
                     "line": msg.get("line"),
                 })
 
+            def on_request(event):
+                # Filtre par resourceType (PIEGE 1)
+                rtype = event.get("type", "")
+                if rtype not in NETWORK_KEEP_TYPES:
+                    return
+                request_id = event.get("requestId")
+                req = event.get("request", {})
+                # Header sensibles (Cookie, Authorization) -> redact
+                headers = dict(req.get("headers", {}))
+                for sensitive_header in ("Cookie", "cookie", "Authorization", "authorization"):
+                    if sensitive_header in headers:
+                        headers[sensitive_header] = "<redacted>"
+                entry = {
+                    "requestId": request_id,
+                    "type": rtype,
+                    "method": req.get("method"),
+                    "url": req.get("url"),
+                    "timestamp": event.get("timestamp"),
+                    "wallTime": event.get("wallTime"),
+                    "headers": headers,
+                    "postData": (req.get("postData") or "")[:1000] if req.get("postData") else None,
+                    "status": None,
+                    "statusText": None,
+                    "responseType": None,
+                    "duration_ms": None,
+                }
+                _net_index[request_id] = len(network_log)
+                network_log.append(entry)
+
+            def on_response(event):
+                request_id = event.get("requestId")
+                idx = _net_index.get(request_id)
+                if idx is None:
+                    return
+                resp = event.get("response", {})
+                network_log[idx]["status"] = resp.get("status")
+                network_log[idx]["statusText"] = resp.get("statusText")
+                network_log[idx]["responseType"] = resp.get("mimeType")
+
+            def on_finished(event):
+                request_id = event.get("requestId")
+                idx = _net_index.get(request_id)
+                if idx is None:
+                    return
+                start = network_log[idx].get("timestamp") or 0
+                end = event.get("timestamp") or 0
+                if start and end:
+                    network_log[idx]["duration_ms"] = round((end - start) * 1000, 1)
+
             page_cdp.on("Runtime.exceptionThrown", on_exception)
             page_cdp.on("Console.messageAdded", on_console)
-            print(f"  Capture observabilite : Runtime.exceptionThrown + Console.messageAdded actives")
+            page_cdp.on("Network.requestWillBeSent", on_request)
+            page_cdp.on("Network.responseReceived", on_response)
+            page_cdp.on("Network.loadingFinished", on_finished)
+            print(f"  Capture observabilite : Runtime + Console + Network (filtre {','.join(NETWORK_KEEP_TYPES)})")
         except Exception as e:
             print(f"  [WARN] Capture observabilite echouee : {e}")
 
@@ -1122,6 +1181,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     output_dir=str(output_dir),
                     js_errors=js_errors if 'js_errors' in locals() else [],
                     console_messages=console_messages if 'console_messages' in locals() else [],
+                    network_log=network_log if 'network_log' in locals() else [],
                 )
                 print(f"  Rapport HTML -> {report_path}")
                 if should_open_report:
@@ -1134,7 +1194,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         else:
             print("\n  Aucune entree capturee, pas de nettoyage IA")
 
-        # -- ETAPE 10bis : Sauvegarder les captures observabilite (V3 phase 1) --
+        # -- ETAPE 10bis : Sauvegarder les captures observabilite (V3 phases 1+2) --
         try:
             if 'js_errors' in locals():
                 (output_dir / "js_errors.json").write_text(
@@ -1150,6 +1210,14 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 console_errs = sum(1 for m in console_messages if m.get("level") == "error")
                 if console_messages:
                     print(f"  Console : {len(console_messages)} messages ({console_errs} errors, {console_warns} warnings)")
+            if 'network_log' in locals():
+                (output_dir / "network_log.json").write_text(
+                    json.dumps(network_log, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                if network_log:
+                    api_calls = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
+                    fail_calls = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
+                    print(f"  Network : {len(network_log)} requetes filtrees ({api_calls} API, {fail_calls} >=400)")
         except Exception as e:
             print(f"  [WARN] Sauvegarde observabilite echouee : {e}")
 
@@ -1174,6 +1242,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "js_errors_count": len(js_errors) if 'js_errors' in locals() else 0,
                 "console_errors_count": sum(1 for m in console_messages if m.get("level") == "error") if 'console_messages' in locals() else 0,
                 "console_warnings_count": sum(1 for m in console_messages if m.get("level") == "warning") if 'console_messages' in locals() else 0,
+                "network_count": len(network_log) if 'network_log' in locals() else 0,
+                "network_api_count": sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR")) if 'network_log' in locals() else 0,
+                "network_fail_count": sum(1 for r in network_log if (r.get("status") or 0) >= 400) if 'network_log' in locals() else 0,
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
