@@ -33,12 +33,17 @@ Variables d'environnement :
 from browser_use import Agent, BrowserSession, ChatOpenAI
 from playwright.async_api import async_playwright
 from openai import OpenAI
+from dotenv import load_dotenv
 import asyncio
 import json
 import os
 import sys
 import argparse
 from datetime import datetime
+from pathlib import Path
+
+# Charger les variables du .env (OPENAI_API_KEY notamment)
+load_dotenv()
 
 # Import du generateur de rapport (optionnel)
 try:
@@ -85,8 +90,6 @@ def _patch_browser_use():
         print("  [PATCH] browser-use pas installe, patch ignore")
     except AttributeError:
         print("  [PATCH] API browser-use modifiee, patch non applique")
-
-_patch_browser_use()
 
 
 # ============================================================
@@ -333,325 +336,8 @@ Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."""
 # DOM LISTENER (injecte dans le navigateur)
 # ============================================================
 
-DOM_LISTENER_JS = """
-(function() {
-    if (window.__qaListenerInstalled) return;
-    window.__qaListenerInstalled = true;
+DOM_LISTENER_JS = (Path(__file__).parent / "dom_listener.js").read_text(encoding="utf-8")
 
-    // -- SAUVEGARDE --
-    function saveEntry(entry) {
-        try {
-            let log = JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]');
-            log.push(entry);
-            localStorage.setItem('__qaLocatorLog', JSON.stringify(log));
-        } catch(e) {}
-    }
-
-    // -- DETECTION SHADOW DOM --
-    function isInShadowDOM(el) {
-        let root = el.getRootNode();
-        return root instanceof ShadowRoot;
-    }
-
-    // -- SELECTEUR SHADOW DOM (chaine) --
-    function getShadowSelector(el) {
-        let chain = [];
-        let current = el;
-        while (current) {
-            let root = current.getRootNode();
-            let localSel = getQuickSelector(current);
-            if (root instanceof ShadowRoot) {
-                chain.unshift({selector: localSel, shadow: true});
-                current = root.host;
-            } else {
-                chain.unshift({selector: localSel, shadow: false});
-                break;
-            }
-        }
-        let pwSel = chain.map(c => c.selector).join(' >>> ');
-        let jsSel = chain.map((c, i) => {
-            if (i === 0) return 'document.querySelector("' + c.selector + '")';
-            return '.shadowRoot.querySelector("' + c.selector + '")';
-        }).join('');
-        return {
-            strategy: 'shadow',
-            value: pwSel,
-            inShadowDOM: true,
-            shadowChain: chain,
-            playwrightSelector: pwSel,
-            jsSelector: jsSel,
-            unique: true,
-            matchCount: 1
-        };
-    }
-
-    // -- SELECTEUR RAPIDE (pour shadow chain ou parent lookup) --
-    function getQuickSelector(el) {
-        if (!el || !el.getAttribute) return 'unknown';
-        if (el.getAttribute('data-testid')) return '[data-testid="' + el.getAttribute('data-testid') + '"]';
-        if (el.id && !el.id.match(/^[0-9]|react|ember|__/)) return '#' + el.id;
-        if (el.getAttribute('name')) return el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
-        if (el.getAttribute('aria-label')) return '[aria-label="' + el.getAttribute('aria-label') + '"]';
-        let sel = el.tagName.toLowerCase();
-        if (el.className && typeof el.className === 'string') {
-            let cls = el.className.trim().split(/\\s+/).filter(c => c.length > 2 && c.length < 30).slice(0, 2);
-            if (cls.length) sel += '.' + cls.join('.');
-        }
-        return sel;
-    }
-
-    // =========================================================
-    // -- SELECTEUR INTELLIGENT : cascade stricte + validation --
-    // =========================================================
-    function getBestSelector(el) {
-        if (!el || !el.getAttribute) return {strategy:'unknown', value:'unknown', inShadowDOM:false, unique:false, matchCount:0};
-
-        // Shadow DOM -> logique separee
-        if (isInShadowDOM(el)) return getShadowSelector(el);
-
-        let best = null;
-        let strategy = 'unknown';
-
-        // === Tier 1 : Attributs stables (fiabilite max) ===
-        if (el.getAttribute('data-testid')) {
-            best = '[data-testid="' + el.getAttribute('data-testid') + '"]';
-            strategy = 'data-testid';
-        }
-        else if (el.id && !el.id.match(/^[0-9]|react|ember|__|:/)) {
-            best = '#' + el.id;
-            strategy = 'id';
-        }
-        else if (el.getAttribute('name')) {
-            best = el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
-            strategy = 'name';
-        }
-
-        // === Tier 2 : Attributs semantiques ===
-        if (!best && el.getAttribute('aria-label')) {
-            best = '[aria-label="' + el.getAttribute('aria-label') + '"]';
-            strategy = 'aria-label';
-        }
-        if (!best && el.getAttribute('placeholder')) {
-            best = el.tagName.toLowerCase() + '[placeholder="' + el.getAttribute('placeholder') + '"]';
-            strategy = 'placeholder';
-        }
-        if (!best && el.getAttribute('title')) {
-            best = '[title="' + el.getAttribute('title') + '"]';
-            strategy = 'title';
-        }
-
-        // === Tier 3 : Href pour les liens ===
-        if (!best && el.tagName === 'A' && el.getAttribute('href')) {
-            let href = el.getAttribute('href');
-            if (href !== '#' && href !== '/' && href !== 'javascript:void(0)' && href.length < 100) {
-                best = 'a[href="' + href + '"]';
-                strategy = 'href';
-            }
-        }
-
-        // === Tier 4 : Remonter au parent avec attribut stable (icones, SVG) ===
-        if (!best) {
-            let parent = el.closest('[aria-label], [data-testid], [title]');
-            if (parent && parent !== el) {
-                if (parent.getAttribute('aria-label')) {
-                    best = '[aria-label="' + parent.getAttribute('aria-label') + '"]';
-                    strategy = 'parent-aria-label';
-                } else if (parent.getAttribute('data-testid')) {
-                    best = '[data-testid="' + parent.getAttribute('data-testid') + '"]';
-                    strategy = 'parent-data-testid';
-                } else if (parent.getAttribute('title')) {
-                    best = '[title="' + parent.getAttribute('title') + '"]';
-                    strategy = 'parent-title';
-                }
-            }
-        }
-
-        // === Tier 5 : Label associe (pour inputs) ===
-        if (!best && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA')) {
-            let label = null;
-            if (el.id) label = document.querySelector('label[for="' + el.id + '"]');
-            if (!label) label = el.closest('label');
-            if (label) {
-                let labelText = (label.textContent || '').trim().substring(0, 40);
-                if (labelText) {
-                    best = '//label[contains(text(),"' + labelText + '")]//input';
-                    strategy = 'label-xpath';
-                }
-            }
-        }
-
-        // === Tier 6 : CSS court + nth-of-type (dernier recours CSS) ===
-        if (!best) {
-            let sel = el.tagName.toLowerCase();
-            if (el.className && typeof el.className === 'string') {
-                let classes = el.className.trim().split(/\\s+/)
-                    .filter(c => c.length > 2 && c.length < 30
-                            && !c.match(/active|hover|focus|open|visible|show|selected|current/))
-                    .slice(0, 2);
-                if (classes.length) sel += '.' + classes.join('.');
-            }
-            if (el.parentElement) {
-                let same = Array.from(el.parentElement.children).filter(s => s.tagName === el.tagName);
-                if (same.length > 1) {
-                    sel += ':nth-of-type(' + (same.indexOf(el) + 1) + ')';
-                }
-            }
-            best = sel;
-            strategy = 'css-short';
-        }
-
-        // === VALIDATION : est-ce que le selecteur matche 1 seul element ? ===
-        let matchCount = 0;
-        try {
-            if (strategy === 'label-xpath' || best.startsWith('//')) {
-                let xr = document.evaluate(best, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                matchCount = xr.snapshotLength;
-            } else {
-                matchCount = document.querySelectorAll(best).length;
-            }
-        } catch(e) { matchCount = -1; }
-
-        // Si multi-match -> tenter XPath text-based
-        let text = (el.innerText || el.textContent || '').trim();
-        if (matchCount !== 1 && text && text.length > 0 && text.length < 50 && text.indexOf('\\n') === -1) {
-            let xpathText = '//' + el.tagName.toLowerCase() + '[contains(text(),"' + text.replace(/"/g, "'") + '")]';
-            let xpathCount = 0;
-            try {
-                let xr = document.evaluate(xpathText, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                xpathCount = xr.snapshotLength;
-            } catch(e) {}
-            if (xpathCount === 1) {
-                best = xpathText;
-                strategy = 'xpath-text';
-                matchCount = 1;
-            } else if (xpathCount > 0 && xpathCount < matchCount) {
-                best = xpathText;
-                strategy = 'xpath-text';
-                matchCount = xpathCount;
-            }
-        }
-
-        return {
-            strategy: strategy,
-            value: best,
-            inShadowDOM: false,
-            unique: matchCount === 1,
-            matchCount: matchCount
-        };
-    }
-
-    // -- RESOLUTION ELEMENT REEL (composedPath + bubble up) --
-    function getRealTarget(e) {
-        let el = e.target;
-        if (e.composedPath && e.composedPath().length > 0) {
-            el = e.composedPath()[0];
-        }
-        let interactiveTags = ['BUTTON', 'A', 'INPUT', 'SELECT', 'TEXTAREA'];
-        let maxDepth = 5;
-        let depth = 0;
-        while (el && depth < maxDepth) {
-            if (el.id || (el.getAttribute && el.getAttribute('data-testid')) || (el.getAttribute && el.getAttribute('name'))) break;
-            if (interactiveTags.includes(el.tagName)) break;
-            if (el.getAttribute && el.getAttribute('aria-label')) break;
-            let parent = el.parentElement;
-            if (!parent) break;
-            if (interactiveTags.includes(parent.tagName) || parent.id
-                || (parent.getAttribute && parent.getAttribute('data-testid'))
-                || (parent.getAttribute && parent.getAttribute('aria-label'))) {
-                el = parent;
-                break;
-            }
-            el = parent;
-            depth++;
-        }
-        return el;
-    }
-
-    // -- EVENT LISTENERS --
-    document.addEventListener('click', (e) => {
-        let el = getRealTarget(e);
-        let sel = getBestSelector(el);
-        let text = (el.innerText || el.textContent || '').trim().substring(0, 80);
-        saveEntry({
-            action: 'click',
-            timestamp: Date.now(),
-            tag: el.tagName,
-            text: text,
-            selector: sel,
-            url: location.href,
-            inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                class: (typeof el.className === 'string') ? el.className : null,
-                href: el.getAttribute ? el.getAttribute('href') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null,
-                role: el.getAttribute ? el.getAttribute('role') : null
-            }
-        });
-    }, true);
-
-    document.addEventListener('input', (e) => {
-        let el = getRealTarget(e);
-        let sel = getBestSelector(el);
-        saveEntry({
-            action: 'input',
-            timestamp: Date.now(),
-            tag: el.tagName,
-            value: el.value || '',
-            selector: sel,
-            url: location.href,
-            inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
-            }
-        });
-    }, true);
-
-    // -- SCROLL LISTENER (debounced) --
-    let scrollTimer = null;
-    let scrollStartY = window.scrollY;
-    window.addEventListener('scroll', () => {
-        if (!scrollTimer) {
-            scrollStartY = window.scrollY;
-        }
-        clearTimeout(scrollTimer);
-        scrollTimer = setTimeout(() => {
-            let scrollEndY = window.scrollY;
-            let delta = scrollEndY - scrollStartY;
-            if (Math.abs(delta) > 50) {
-                saveEntry({
-                    action: 'scroll',
-                    timestamp: Date.now(),
-                    tag: 'WINDOW',
-                    direction: delta > 0 ? 'down' : 'up',
-                    deltaY: delta,
-                    scrollY: scrollEndY,
-                    viewport: {
-                        width: window.innerWidth,
-                        height: window.innerHeight,
-                        docHeight: document.documentElement.scrollHeight
-                    },
-                    url: location.href,
-                    selector: {strategy: 'window', value: 'window.scrollTo(0, ' + scrollEndY + ')', inShadowDOM: false, unique: true, matchCount: 1},
-                    inShadowDOM: false,
-                    attributes: {}
-                });
-            }
-            scrollTimer = null;
-        }, 250);
-    }, true);
-
-    console.log('[QA Listener V3] Installed on ' + location.href + ' (Smart selectors + Shadow DOM + Scroll)');
-})();
-"""
 
 
 # ============================================================
@@ -940,9 +626,6 @@ def print_clean_steps(clean_data):
 # ============================================================
 
 async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None):
-    # Stocker les steps du scenario pour le cleanup IA
-    global _scenario_steps
-    _scenario_steps = scenario_steps
     """Fonction principale d'execution du QA Explorer"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -956,187 +639,193 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             "--start-maximized"
         ]
     )
-    context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
-    page = context.pages[0] if context.pages else await context.new_page()
-
-    # Forcer plein ecran via CDP
     try:
-        cdp = await page.context.new_cdp_session(page)
-        window = await cdp.send("Browser.getWindowForTarget")
-        window_id = window["windowId"]
-        await cdp.send("Browser.setWindowBounds", {
-            "windowId": window_id,
-            "bounds": {"windowState": "maximized"}
-        })
-        print(f"  Chromium lance PLEIN ECRAN sur CDP port {cdp_port}")
-    except Exception as e:
-        print(f"  Chromium lance sur CDP port {cdp_port} (maximized via args)")
-        print(f"  CDP maximize fallback: {e}")
+        context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+        page = context.pages[0] if context.pages else await context.new_page()
 
-    print(f"  Page prete : {page.url}")
-
-    # -- ETAPE 2 : Injecter le DOM Listener --
-    await context.add_init_script(DOM_LISTENER_JS)
-    await page.evaluate(DOM_LISTENER_JS)
-    print(f"  DOM Listener injecte via Playwright")
-
-    # Via CDP direct (couvre TOUS les contextes, y compris celui de browser-use)
-    try:
-        cdp_session = await browser.new_browser_cdp_session()
-        await cdp_session.send("Page.addScriptToEvaluateOnNewDocument", {
-            "source": DOM_LISTENER_JS
-        })
-        print(f"  DOM Listener injecte via CDP (global, tous contextes)")
-    except Exception as e:
-        print(f"  Injection CDP echouee (pas critique): {e}")
-
-    # -- ETAPE 3 : Lancer browser-use via CDP --
-    print_header("LANCEMENT BROWSER-USE")
-    llm = ChatOpenAI(model=model)
-    browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
-
-    agent = Agent(
-        task=task,
-        llm=llm,
-        browser_session=browser_session,
-    )
-
-    result = await agent.run()
-
-    # -- ETAPE 4 : Recuperer le log brut --
-    print_header("RECUPERATION DES LOCATEURS")
-    raw_log = []
-
-    # Methode 1 : Via le contexte browser-use (CDP)
-    try:
-        bu_context = agent.browser_session.context
-        if bu_context:
-            for p in bu_context.pages:
-                try:
-                    log = await p.evaluate(
-                        "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
-                    )
-                    if log:
-                        raw_log.extend(log)
-                        print(f"  {len(log)} entrees via contexte browser-use (page: {p.url[:60]})")
-                except Exception as e:
-                    print(f"  Page browser-use inaccessible: {e}")
-                    continue
-    except Exception as e:
-        print(f"  Contexte browser-use non accessible: {e}")
-
-    # Methode 2 : Via notre contexte Playwright original (fallback)
-    if len(raw_log) == 0:
-        print("  Fallback: tentative via contexte Playwright original...")
+        # Forcer plein ecran via CDP
         try:
-            for p in context.pages:
-                try:
-                    log = await p.evaluate(
-                        "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
-                    )
-                    if log:
-                        raw_log.extend(log)
-                        print(f"  {len(log)} entrees via Playwright (page: {p.url[:60]})")
-                except Exception:
-                    continue
+            cdp = await page.context.new_cdp_session(page)
+            window = await cdp.send("Browser.getWindowForTarget")
+            window_id = window["windowId"]
+            await cdp.send("Browser.setWindowBounds", {
+                "windowId": window_id,
+                "bounds": {"windowState": "maximized"}
+            })
+            print(f"  Chromium lance PLEIN ECRAN sur CDP port {cdp_port}")
         except Exception as e:
-            print(f"  Contexte Playwright non accessible: {e}")
+            print(f"  Chromium lance sur CDP port {cdp_port} (maximized via args)")
+            print(f"  CDP maximize fallback: {e}")
 
-    # Methode 3 : Via CDP direct (dernier recours)
-    if len(raw_log) == 0:
-        print("  Fallback 2: tentative via CDP direct...")
+        print(f"  Page prete : {page.url}")
+
+        # -- ETAPE 2 : Injecter le DOM Listener --
+        await context.add_init_script(DOM_LISTENER_JS)
+        await page.evaluate(DOM_LISTENER_JS)
+        print(f"  DOM Listener injecte via Playwright")
+
+        # Via CDP direct (couvre TOUS les contextes, y compris celui de browser-use)
         try:
-            cdp = await browser.new_browser_cdp_session()
-            targets = await cdp.send("Target.getTargets")
-            for target in targets.get("targetInfos", []):
-                if target.get("type") == "page":
-                    print(f"  CDP target trouve: {target.get('url', 'N/A')[:60]}")
+            cdp_session = await browser.new_browser_cdp_session()
+            await cdp_session.send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": DOM_LISTENER_JS
+            })
+            print(f"  DOM Listener injecte via CDP (global, tous contextes)")
         except Exception as e:
-            print(f"  CDP direct echoue: {e}")
+            print(f"  Injection CDP echouee (pas critique): {e}")
 
-    if len(raw_log) == 0:
-        print("  AUCUNE ENTREE CAPTUREE - Le listener n'a peut-etre pas ete injecte dans le bon contexte")
-        print("  Astuce: verifier que add_init_script est applique au contexte utilise par browser-use")
+        # -- ETAPE 3 : Lancer browser-use via CDP --
+        print_header("LANCEMENT BROWSER-USE")
+        llm = ChatOpenAI(model=model)
+        browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
 
-    # Dedupliquer par timestamp (si plusieurs pages ont capture la meme chose)
-    seen = set()
-    unique_log = []
-    for entry in raw_log:
-        ts = entry.get('timestamp')
-        if ts not in seen:
-            seen.add(ts)
-            unique_log.append(entry)
-    raw_log = sorted(unique_log, key=lambda x: x.get('timestamp', 0))
+        agent = Agent(
+            task=task,
+            llm=llm,
+            browser_session=browser_session,
+        )
 
-    print(f"  {len(raw_log)} entrees brutes recuperees")
+        result = await agent.run()
 
-    # Sauvegarder le log brut
-    raw_file = f"locator_log_{timestamp}.json"
-    with open(raw_file, "w", encoding="utf-8") as f:
-        json.dump(raw_log, f, indent=2, ensure_ascii=False)
-    print(f"  Log brut -> {raw_file}")
+        # -- ETAPE 4 : Recuperer le log brut --
+        print_header("RECUPERATION DES LOCATEURS")
+        raw_log = []
 
-    # -- ETAPE 5 : Dedupliquer les inputs --
-    deduped = dedup_log(raw_log)
-    print(f"  {len(raw_log)} -> {len(deduped)} apres deduplication")
+        # Methode 1 : Via le contexte browser-use (CDP)
+        try:
+            bu_context = agent.browser_session.context
+            if bu_context:
+                for p in bu_context.pages:
+                    try:
+                        log = await p.evaluate(
+                            "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
+                        )
+                        if log:
+                            raw_log.extend(log)
+                            print(f"  {len(log)} entrees via contexte browser-use (page: {p.url[:60]})")
+                    except Exception as e:
+                        print(f"  Page browser-use inaccessible: {e}")
+                        continue
+        except Exception as e:
+            print(f"  Contexte browser-use non accessible: {e}")
 
-    dedup_file = f"locator_dedup_{timestamp}.json"
-    with open(dedup_file, "w", encoding="utf-8") as f:
-        json.dump(deduped, f, indent=2, ensure_ascii=False)
-    print(f"  Log deduplique -> {dedup_file}")
+        # Methode 2 : Via notre contexte Playwright original (fallback)
+        if len(raw_log) == 0:
+            print("  Fallback: tentative via contexte Playwright original...")
+            try:
+                for p in context.pages:
+                    try:
+                        log = await p.evaluate(
+                            "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
+                        )
+                        if log:
+                            raw_log.extend(log)
+                            print(f"  {len(log)} entrees via Playwright (page: {p.url[:60]})")
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"  Contexte Playwright non accessible: {e}")
 
-    # -- ETAPE 6 : Afficher le resultat agent --
-    print_header("RESULTAT AGENT")
-    print(f"  {result.final_result()}")
+        # Methode 3 : Via CDP direct (dernier recours)
+        if len(raw_log) == 0:
+            print("  Fallback 2: tentative via CDP direct...")
+            try:
+                cdp = await browser.new_browser_cdp_session()
+                targets = await cdp.send("Target.getTargets")
+                for target in targets.get("targetInfos", []):
+                    if target.get("type") == "page":
+                        print(f"  CDP target trouve: {target.get('url', 'N/A')[:60]}")
+            except Exception as e:
+                print(f"  CDP direct echoue: {e}")
 
-    # -- ETAPE 7 : Afficher le log deduplique --
-    print_raw_log(deduped)
+        if len(raw_log) == 0:
+            print("  AUCUNE ENTREE CAPTUREE - Le listener n'a peut-etre pas ete injecte dans le bon contexte")
+            print("  Astuce: verifier que add_init_script est applique au contexte utilise par browser-use")
 
-    # -- ETAPE 8 : Nettoyage IA --
-    if len(deduped) > 0:
-        clean_data = ai_cleanup(deduped, scenario_steps=_scenario_steps, model=model)
+        # Dedupliquer par timestamp (si plusieurs pages ont capture la meme chose)
+        seen = set()
+        unique_log = []
+        for entry in raw_log:
+            ts = entry.get('timestamp')
+            if ts not in seen:
+                seen.add(ts)
+                unique_log.append(entry)
+        raw_log = sorted(unique_log, key=lambda x: x.get('timestamp', 0))
 
-        clean_file = f"clean_steps_{timestamp}.json"
-        with open(clean_file, "w", encoding="utf-8") as f:
-            json.dump(clean_data, f, indent=2, ensure_ascii=False)
-        print(f"\n  Parcours nettoye -> {clean_file}")
+        print(f"  {len(raw_log)} entrees brutes recuperees")
 
-        print_clean_steps(clean_data)
+        # Sauvegarder le log brut
+        raw_file = f"locator_log_{timestamp}.json"
+        with open(raw_file, "w", encoding="utf-8") as f:
+            json.dump(raw_log, f, indent=2, ensure_ascii=False)
+        print(f"  Log brut -> {raw_file}")
 
-        # -- ETAPE 9 : Sauvegarder le code Katalon --
-        katalon_code = clean_data.get('katalon_code', '')
-        if katalon_code:
-            katalon_file = f"katalon_test_{timestamp}.groovy"
-            with open(katalon_file, "w", encoding="utf-8") as f:
-                f.write(katalon_code)
-            print(f"\n  Code Katalon -> {katalon_file}")
+        # -- ETAPE 5 : Dedupliquer les inputs --
+        deduped = dedup_log(raw_log)
+        print(f"  {len(raw_log)} -> {len(deduped)} apres deduplication")
 
-        # -- ETAPE 10 : Generer le rapport HTML --
-        if HAS_REPORT:
-            print_header("GENERATION DU RAPPORT")
-            report_path = generate_report(
-                clean_data=clean_data,
-                deduped_log=deduped,
-                agent_result=str(result.final_result()),
-                scenario_name=scenario_name,
-                scenario_url=scenario_url,
-                timestamp=timestamp,
-            )
-            print(f"  Rapport HTML -> {report_path}")
-            open_report(report_path)
-            print(f"  Rapport ouvert dans le navigateur")
+        dedup_file = f"locator_dedup_{timestamp}.json"
+        with open(dedup_file, "w", encoding="utf-8") as f:
+            json.dump(deduped, f, indent=2, ensure_ascii=False)
+        print(f"  Log deduplique -> {dedup_file}")
+
+        # -- ETAPE 6 : Afficher le resultat agent --
+        print_header("RESULTAT AGENT")
+        print(f"  {result.final_result()}")
+
+        # -- ETAPE 7 : Afficher le log deduplique --
+        print_raw_log(deduped)
+
+        # -- ETAPE 8 : Nettoyage IA --
+        if len(deduped) > 0:
+            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model)
+
+            clean_file = f"clean_steps_{timestamp}.json"
+            with open(clean_file, "w", encoding="utf-8") as f:
+                json.dump(clean_data, f, indent=2, ensure_ascii=False)
+            print(f"\n  Parcours nettoye -> {clean_file}")
+
+            print_clean_steps(clean_data)
+
+            # -- ETAPE 9 : Sauvegarder le code Katalon --
+            katalon_code = clean_data.get('katalon_code', '')
+            if katalon_code:
+                katalon_file = f"katalon_test_{timestamp}.groovy"
+                with open(katalon_file, "w", encoding="utf-8") as f:
+                    f.write(katalon_code)
+                print(f"\n  Code Katalon -> {katalon_file}")
+
+            # -- ETAPE 10 : Generer le rapport HTML --
+            if HAS_REPORT:
+                print_header("GENERATION DU RAPPORT")
+                report_path = generate_report(
+                    clean_data=clean_data,
+                    deduped_log=deduped,
+                    agent_result=str(result.final_result()),
+                    scenario_name=scenario_name,
+                    scenario_url=scenario_url,
+                    timestamp=timestamp,
+                )
+                print(f"  Rapport HTML -> {report_path}")
+                open_report(report_path)
+                print(f"  Rapport ouvert dans le navigateur")
+            else:
+                print("\n  report_generator.py absent, pas de rapport HTML")
         else:
-            print("\n  report_generator.py absent, pas de rapport HTML")
-    else:
-        print("\n  Aucune entree capturee, pas de nettoyage IA")
+            print("\n  Aucune entree capturee, pas de nettoyage IA")
 
-    # -- CLEANUP --
-    print_header("FERMETURE")
-    await browser.close()
-    await pw.stop()
-    print("  Termine !")
+    finally:
+        # -- CLEANUP : garantit la fermeture meme en cas d'exception --
+        print_header("FERMETURE")
+        try:
+            await browser.close()
+        except Exception as e:
+            print(f"  Erreur fermeture browser: {e}")
+        await pw.stop()
+        print("  Termine !")
 
 
 if __name__ == "__main__":
+    _patch_browser_use()
     task, model, port, scenario_name, scenario_url, scenario_steps = resolve_task()
     asyncio.run(run(task, model, port, scenario_name, scenario_url, scenario_steps))

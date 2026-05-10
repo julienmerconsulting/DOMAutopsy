@@ -5,7 +5,6 @@ clean_steps_*.json
 katalon_test_*.groovy
 qa_report_*.html
 _temp_scenario.json
-*.json
 *.bak
 # Python
 __pycache__/

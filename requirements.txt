@@ -1,7 +1,8 @@
 # DOMAutopsy - Python 3.12+ requis
 # pip install -r requirements.txt
 
-browser-use
-playwright
-openai
-PySide6
+browser-use>=0.3.0
+playwright>=1.49.0
+openai>=1.50.0
+PySide6>=6.8.0
+python-dotenv>=1.0.0
