@@ -930,6 +930,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         js_errors = []
         console_messages = []
         network_log = []
+        dom_mutations = {"attribute_modified": 0, "child_node_inserted": 0, "child_node_removed": 0, "first_mutation_ms": None, "last_mutation_ms": None}
         # Index pour matcher les responses sur les requests : {requestId: index_dans_network_log}
         _net_index = {}
         # Filtre PIEGE 1 : on garde uniquement les types pertinents pour le QA
@@ -1018,6 +1019,34 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             page_cdp.on("Network.responseReceived", on_response)
             page_cdp.on("Network.loadingFinished", on_finished)
             await page_cdp.send("Performance.enable")
+            # PIEGE : DOM domain doit etre enable, et on doit demander getDocument()
+            # pour amorcer le tracking des nodes. Sans ca, les events ne firent pas.
+            try:
+                import time as _time
+                _t0 = _time.monotonic()
+                def _now_ms():
+                    return int((_time.monotonic() - _t0) * 1000)
+
+                def on_attr_modified(_):
+                    dom_mutations["attribute_modified"] += 1
+                    if dom_mutations["first_mutation_ms"] is None:
+                        dom_mutations["first_mutation_ms"] = _now_ms()
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+                def on_child_inserted(_):
+                    dom_mutations["child_node_inserted"] += 1
+                    if dom_mutations["first_mutation_ms"] is None:
+                        dom_mutations["first_mutation_ms"] = _now_ms()
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+                def on_child_removed(_):
+                    dom_mutations["child_node_removed"] += 1
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+
+                await page_cdp.send("DOM.enable")
+                page_cdp.on("DOM.attributeModified", on_attr_modified)
+                page_cdp.on("DOM.childNodeInserted", on_child_inserted)
+                page_cdp.on("DOM.childNodeRemoved", on_child_removed)
+            except Exception as dom_e:
+                print(f"  [WARN] DOM mutations capture echouee : {dom_e}")
             # PIEGE 2 : Coverage doit etre active AVANT toute navigation, sinon le bundle
             # initial est marque comme non-execute et les % sortent faussement bas.
             # On le fait ici, avant que browser-use ait fait son premier goto.
@@ -1302,6 +1331,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     perf_before=perf_before if 'perf_before' in locals() else {},
                     perf_after=perf_after if 'perf_after' in locals() else {},
                     coverage_summary=coverage_summary if 'coverage_summary' in locals() else None,
+                    dom_mutations=dom_mutations if 'dom_mutations' in locals() else {},
                 )
                 print(f"  Rapport HTML -> {report_path}")
                 if should_open_report:
@@ -1342,6 +1372,13 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 (output_dir / "coverage.json").write_text(
                     json.dumps(coverage_summary, indent=2, ensure_ascii=False), encoding="utf-8"
                 )
+            if 'dom_mutations' in locals():
+                total_mut = sum(v for k, v in dom_mutations.items() if isinstance(v, int) and not k.endswith("_ms"))
+                if total_mut > 0:
+                    (output_dir / "dom_mutations.json").write_text(
+                        json.dumps(dom_mutations, indent=2, ensure_ascii=False), encoding="utf-8"
+                    )
+                    print(f"  DOM mutations : {dom_mutations['attribute_modified']} attr, {dom_mutations['child_node_inserted']} insert, {dom_mutations['child_node_removed']} remove")
             if 'perf_before' in locals() and 'perf_after' in locals():
                 # Calcule delta sur les metriques cles
                 perf_delta = {
@@ -1391,6 +1428,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "coverage_pct": coverage_summary["total_pct"] if 'coverage_summary' in locals() and coverage_summary else None,
                 "coverage_used_kb": coverage_summary["total_used"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
                 "coverage_total_kb": coverage_summary["total_size"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
+                "dom_mutations_total": (dom_mutations["attribute_modified"] + dom_mutations["child_node_inserted"] + dom_mutations["child_node_removed"]) if 'dom_mutations' in locals() else 0,
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")

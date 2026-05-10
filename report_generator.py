@@ -17,7 +17,8 @@ from collections import Counter
 def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                     scenario_url="", timestamp=None, output_dir=".",
                     js_errors=None, console_messages=None, network_log=None,
-                    perf_before=None, perf_after=None, coverage_summary=None):
+                    perf_before=None, perf_after=None, coverage_summary=None,
+                    dom_mutations=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
 
@@ -41,6 +42,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     perf_before = perf_before or {}
     perf_after = perf_after or {}
     coverage_summary = coverage_summary or None
+    dom_mutations = dom_mutations or {}
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -171,6 +173,55 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <div class="card">
             <h2>Code Katalon Studio (Groovy)</h2>
             <pre class="code-block"><code>{escaped_code}</code></pre>
+        </div>"""
+
+    # --- DOM mutations (V3 phase 6) ---
+    dom_html = ""
+    total_mut = (dom_mutations.get("attribute_modified", 0)
+                 + dom_mutations.get("child_node_inserted", 0)
+                 + dom_mutations.get("child_node_removed", 0))
+    if total_mut > 0:
+        first_ms = dom_mutations.get("first_mutation_ms") or 0
+        last_ms = dom_mutations.get("last_mutation_ms") or 0
+        active_window_s = round((last_ms - first_ms) / 1000, 1) if last_ms > first_ms else 0
+        rate = round(total_mut / active_window_s, 1) if active_window_s > 0 else 0
+        # Page "stable" si le rythme moyen est < 5 mutations/s sur la fenetre active
+        rate_color = "#3fb950" if rate < 5 else ("#d29922" if rate < 20 else "#f85149")
+        dom_html = f"""
+        <div class="card">
+            <h2>DOM mutations</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>DOM.attributeModified</code> + <code>childNodeInserted</code>
+                + <code>childNodeRemoved</code>. Indique le rythme d'activite du DOM pendant le
+                parcours - utile pour detecter les pages instables (animation infinie, polling
+                long-poll, framework qui re-render en boucle).
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value">{total_mut:,}</div>
+                    <div class="kpi-label">Mutations totales</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{dom_mutations.get('attribute_modified', 0):,}</div>
+                    <div class="kpi-label">Attributs modifies</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#58a6ff">{dom_mutations.get('child_node_inserted', 0):,}</div>
+                    <div class="kpi-label">Noeuds inseres</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{dom_mutations.get('child_node_removed', 0):,}</div>
+                    <div class="kpi-label">Noeuds supprimes</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{rate_color}">{rate}</div>
+                    <div class="kpi-label">Mutations/s moyennes</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{active_window_s}s</div>
+                    <div class="kpi-label">Fenetre active</div>
+                </div>
+            </div>
         </div>"""
 
     # --- Coverage (V3 phase 5) ---
@@ -841,6 +892,9 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
 
         <!-- Performance metrics (V3 phase 4) -->
         {perf_html}
+
+        <!-- DOM mutations (V3 phase 6) -->
+        {dom_html}
 
         <!-- Coverage JS (V3 phase 5) -->
         {coverage_html}
