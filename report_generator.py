@@ -17,7 +17,7 @@ from collections import Counter
 def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                     scenario_url="", timestamp=None, output_dir=".",
                     js_errors=None, console_messages=None, network_log=None,
-                    perf_before=None, perf_after=None):
+                    perf_before=None, perf_after=None, coverage_summary=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
 
@@ -40,6 +40,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     network_log = network_log or []
     perf_before = perf_before or {}
     perf_after = perf_after or {}
+    coverage_summary = coverage_summary or None
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -170,6 +171,60 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <div class="card">
             <h2>Code Katalon Studio (Groovy)</h2>
             <pre class="code-block"><code>{escaped_code}</code></pre>
+        </div>"""
+
+    # --- Coverage (V3 phase 5) ---
+    coverage_html = ""
+    if coverage_summary and coverage_summary.get("total_size", 0) > 0:
+        pct = coverage_summary.get("total_pct", 0)
+        used_kb = coverage_summary.get("total_used", 0) // 1024
+        total_kb = coverage_summary.get("total_size", 0) // 1024
+        unused_kb = total_kb - used_kb
+        pct_color = "#3fb950" if pct > 60 else ("#d29922" if pct > 30 else "#f85149")
+
+        cov_rows = ""
+        for s in coverage_summary.get("scripts", [])[:30]:
+            url_short = (s.get("url") or "").rsplit("/", 1)[-1][:60] or "(inline)"
+            size_kb = s.get("size", 0) // 1024
+            used_kb_s = s.get("used", 0) // 1024
+            spct = s.get("pct", 0)
+            spct_color = "#3fb950" if spct > 60 else ("#d29922" if spct > 30 else "#f85149")
+            cov_rows += f"""
+            <tr>
+              <td><code style="font-size:11px;">{(s.get('url') or '').replace('<','').replace('>','')[:100]}</code></td>
+              <td>{size_kb} KB</td>
+              <td>{used_kb_s} KB</td>
+              <td style="color:{spct_color};font-weight:600;">{spct}%</td>
+            </tr>"""
+
+        coverage_html = f"""
+        <div class="card">
+            <h2>Coverage JS du parcours</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>Profiler.startPreciseCoverage</code> activee AVANT toute
+                navigation (sinon le bundle initial est marque comme non-execute, faussant les %).
+                Indique quelle proportion du JS charge a ete reellement executee pendant le parcours.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{pct_color}">{pct}%</div>
+                    <div class="kpi-label">Code execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{used_kb} KB</div>
+                    <div class="kpi-label">JS execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{unused_kb} KB</div>
+                    <div class="kpi-label">JS non execute (dead)</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{len(coverage_summary.get('scripts', []))}</div>
+                    <div class="kpi-label">Scripts charges</div>
+                </div>
+            </div>
+            <h3>Top 30 scripts par taille</h3>
+            <div class="table-wrap"><table><thead><tr><th>URL</th><th>Taille</th><th>Execute</th><th>%</th></tr></thead><tbody>{cov_rows}</tbody></table></div>
         </div>"""
 
     # --- Performance metrics (V3 phase 4) ---
@@ -786,6 +841,9 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
 
         <!-- Performance metrics (V3 phase 4) -->
         {perf_html}
+
+        <!-- Coverage JS (V3 phase 5) -->
+        {coverage_html}
 
         <!-- Network audit (V3 phase 2) -->
         {network_html}

@@ -1018,10 +1018,26 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             page_cdp.on("Network.responseReceived", on_response)
             page_cdp.on("Network.loadingFinished", on_finished)
             await page_cdp.send("Performance.enable")
-            print(f"  Capture observabilite : Runtime + Console + Network + Performance (filtre {','.join(NETWORK_KEEP_TYPES)})")
+            # PIEGE 2 : Coverage doit etre active AVANT toute navigation, sinon le bundle
+            # initial est marque comme non-execute et les % sortent faussement bas.
+            # On le fait ici, avant que browser-use ait fait son premier goto.
+            coverage_enabled = False
+            try:
+                await page_cdp.send("Profiler.enable")
+                await page_cdp.send("Profiler.startPreciseCoverage", {
+                    "callCount": False,
+                    "detailed": True,
+                    "allowTriggeredUpdates": False,
+                })
+                coverage_enabled = True
+            except Exception as cov_e:
+                print(f"  [WARN] Coverage.startPreciseCoverage echouee : {cov_e}")
+            cov_str = " + Coverage" if coverage_enabled else ""
+            print(f"  Capture observabilite : Runtime + Console + Network + Performance{cov_str} (filtre {','.join(NETWORK_KEEP_TYPES)})")
         except Exception as e:
             print(f"  [WARN] Capture observabilite echouee : {e}")
             page_cdp = None
+            coverage_enabled = False
 
         # -- ETAPE 3 : Lancer browser-use via CDP --
         print_header("LANCEMENT BROWSER-USE")
@@ -1119,6 +1135,50 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 perf_after = {m["name"]: m["value"] for m in resp.get("metrics", [])}
             except Exception as e:
                 print(f"  [WARN] Performance.getMetrics apres : {e}")
+
+        # -- Take Coverage APRES le run (V3 phase 5) --
+        coverage_summary = None
+        if 'page_cdp' in locals() and page_cdp and 'coverage_enabled' in locals() and coverage_enabled:
+            try:
+                cov_resp = await page_cdp.send("Profiler.takePreciseCoverage")
+                # Calcule % couverture par script
+                scripts = cov_resp.get("result", [])
+                summary = []
+                total_used = 0
+                total_size = 0
+                for s in scripts:
+                    url = s.get("url", "")
+                    # Skip extensions chrome:// et about:blank
+                    if not url or url.startswith(("chrome://", "chrome-extension://", "about:")):
+                        continue
+                    used = 0
+                    size = 0
+                    for fn in s.get("functions", []):
+                        for r in fn.get("ranges", []):
+                            length = r.get("endOffset", 0) - r.get("startOffset", 0)
+                            size += length
+                            if r.get("count", 0) > 0:
+                                used += length
+                    if size > 0:
+                        summary.append({
+                            "url": url[:200],
+                            "size": size,
+                            "used": used,
+                            "pct": round(used * 100 / size, 1),
+                        })
+                        total_used += used
+                        total_size += size
+                summary.sort(key=lambda x: -x["size"])
+                coverage_summary = {
+                    "total_size": total_size,
+                    "total_used": total_used,
+                    "total_pct": round(total_used * 100 / total_size, 1) if total_size else 0,
+                    "scripts": summary[:50],  # top 50 par taille
+                }
+                await page_cdp.send("Profiler.stopPreciseCoverage")
+                print(f"  Coverage : {coverage_summary['total_pct']}% du JS execute ({total_used // 1024} KB / {total_size // 1024} KB sur {len(summary)} scripts)")
+            except Exception as e:
+                print(f"  [WARN] Profiler.takePreciseCoverage : {e}")
 
         # -- ETAPE 4 : Recuperer le log brut --
         print_header("RECUPERATION DES LOCATEURS")
@@ -1241,6 +1301,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     network_log=network_log if 'network_log' in locals() else [],
                     perf_before=perf_before if 'perf_before' in locals() else {},
                     perf_after=perf_after if 'perf_after' in locals() else {},
+                    coverage_summary=coverage_summary if 'coverage_summary' in locals() else None,
                 )
                 print(f"  Rapport HTML -> {report_path}")
                 if should_open_report:
@@ -1277,6 +1338,10 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     api_calls = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
                     fail_calls = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
                     print(f"  Network : {len(network_log)} requetes filtrees ({api_calls} API, {fail_calls} >=400)")
+            if 'coverage_summary' in locals() and coverage_summary:
+                (output_dir / "coverage.json").write_text(
+                    json.dumps(coverage_summary, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
             if 'perf_before' in locals() and 'perf_after' in locals():
                 # Calcule delta sur les metriques cles
                 perf_delta = {
@@ -1323,6 +1388,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "perf_heap_delta_mb": round((perf_after.get("JSHeapUsedSize", 0) - perf_before.get("JSHeapUsedSize", 0)) / 1024 / 1024, 2) if 'perf_after' in locals() and 'perf_before' in locals() else None,
                 "perf_layout_count": int(perf_after.get("LayoutCount", 0)) if 'perf_after' in locals() else None,
                 "perf_nodes": int(perf_after.get("Nodes", 0)) if 'perf_after' in locals() else None,
+                "coverage_pct": coverage_summary["total_pct"] if 'coverage_summary' in locals() and coverage_summary else None,
+                "coverage_used_kb": coverage_summary["total_used"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
+                "coverage_total_kb": coverage_summary["total_size"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
