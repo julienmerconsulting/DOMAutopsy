@@ -404,3 +404,30 @@ async def cleanup_all_runs():
 # Static files (CSS / JS) - tout ce qui est dans web/
 if WEB_DIR.exists():
     app.mount("/web", StaticFiles(directory=str(WEB_DIR)), name="web")
+
+
+# ============================================================
+# ENTRY POINT : python server.py
+# ============================================================
+# IMPORTANT Windows : utiliser CE point d'entree (pas `uvicorn server:app`)
+# car uvicorn cree son event loop AVANT d'importer server.py, ce qui rend
+# le set_event_loop_policy au top du fichier inoperant. Ici, comme on lance
+# uvicorn programmatiquement, la policy Proactor est deja en place quand
+# uvicorn cree son loop -> create_subprocess_exec marche.
+if __name__ == "__main__":
+    import uvicorn
+    import argparse
+    parser = argparse.ArgumentParser(description="DOMAutopsy Web Server")
+    parser.add_argument("--host", default="127.0.0.1", help="Adresse d'ecoute (defaut: 127.0.0.1)")
+    parser.add_argument("--port", type=int, default=8000, help="Port HTTP (defaut: 8000)")
+    parser.add_argument("--reload", action="store_true", help="Hot reload pour le dev")
+    args = parser.parse_args()
+    print(f"[server] Starting on http://{args.host}:{args.port}")
+    print(f"[server] Event loop policy: {type(asyncio.get_event_loop_policy()).__name__}")
+    uvicorn.run(
+        "server:app",
+        host=args.host,
+        port=args.port,
+        reload=args.reload,
+        loop="asyncio",  # force le loop standard, pas uvloop (incompatible Windows)
+    )
