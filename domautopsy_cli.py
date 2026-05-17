@@ -204,6 +204,36 @@ def cmd_status(args):
     sys.exit(0 if result.get("verdict") == "success" else 1)
 
 
+def cmd_auth_mint(args):
+    """Genere un token fils via le master token. Output : juste le token (ou JSON)."""
+    body = {"label": args.label, "ttl_seconds": args.ttl, "scope": args.scope}
+    result = _http(args.server, "/api/auth/token", "POST", body, token=args.token)
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        # Mode pratique pour shell : sort juste le token pour pouvoir faire
+        #   export TOKEN=$(python domautopsy_cli.py auth mint --master $MASTER --label foo)
+        print(result["token"])
+
+
+def cmd_auth_list(args):
+    """Liste les tokens fils actifs (master token requis)."""
+    result = _http(args.server, "/api/auth/tokens", token=args.token)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_auth_revoke(args):
+    """Revoque un token fils par son suffix."""
+    result = _http(args.server, f"/api/auth/token/{args.suffix}", "DELETE", token=args.token)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_auth_whoami(args):
+    """Affiche les infos du token courant."""
+    result = _http(args.server, "/api/auth/me", token=args.token)
+    print(json.dumps(result, indent=2))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DOMAutopsy CLI : trigger des runs a distance, polling CI ou tail live"
@@ -251,6 +281,27 @@ def main():
     p_status = sub.add_parser("status", help="Affiche le statut JSON d'un run (poll unique)")
     p_status.add_argument("--run-id", required=True)
     p_status.set_defaults(func=cmd_status)
+
+    # auth (groupe de sous-commandes)
+    p_auth = sub.add_parser("auth", help="Gestion des tokens (mint, list, revoke, whoami)")
+    auth_sub = p_auth.add_subparsers(dest="auth_cmd", required=True)
+
+    p_mint = auth_sub.add_parser("mint", help="Genere un nouveau token fils (master requis)")
+    p_mint.add_argument("--label", required=True, help="Label descriptif (github-run-42, jenkins-nightly, etc.)")
+    p_mint.add_argument("--ttl", type=int, default=3600, help="TTL en secondes (defaut: 3600 = 1h)")
+    p_mint.add_argument("--scope", default="user", help="Scope (cosmetique: user|readonly)")
+    p_mint.add_argument("--json", action="store_true", help="Output JSON complet au lieu du token brut")
+    p_mint.set_defaults(func=cmd_auth_mint)
+
+    p_list = auth_sub.add_parser("list", help="Liste les tokens fils actifs (master requis)")
+    p_list.set_defaults(func=cmd_auth_list)
+
+    p_revoke = auth_sub.add_parser("revoke", help="Revoque un token fils (master requis)")
+    p_revoke.add_argument("--suffix", required=True, help="8 derniers chars du token (donne par list)")
+    p_revoke.set_defaults(func=cmd_auth_revoke)
+
+    p_whoami = auth_sub.add_parser("whoami", help="Affiche les infos du token courant")
+    p_whoami.set_defaults(func=cmd_auth_whoami)
 
     args = parser.parse_args()
     args.func(args)

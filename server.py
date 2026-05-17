@@ -140,6 +140,90 @@ async def index():
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
+@app.post("/api/auth/token", dependencies=[Depends(require_master)])
+async def mint_token(req: TokenMintRequest):
+    """Genere un token fils dynamique (Bearer Auth = master token requis).
+
+    Body: {label, ttl_seconds, scope}
+    Retourne: {token, label, expires_at, scope}
+
+    Use case GitHub Action :
+        # job de setup (1 fois en debut de pipeline) :
+        TOKEN=$(curl -X POST https://dom.example.com/api/auth/token \\
+          -H "Authorization: Bearer $MASTER_TOKEN" \\
+          -d '{"label":"gh-action-run-${{ github.run_id }}","ttl_seconds":7200}' | jq -r .token)
+        # jobs suivants utilisent $TOKEN, et il s'auto-detruit dans 2h.
+        # Pas besoin de revoquer manuellement.
+    """
+    if not req.label.strip():
+        raise HTTPException(400, "label vide")
+    ttl = req.ttl_seconds if req.ttl_seconds and req.ttl_seconds > 0 else 3600
+    token_value = secrets.token_urlsafe(32)  # 256 bits d'entropie
+    expires_at = time.time() + ttl
+    DYNAMIC_TOKENS[token_value] = {
+        "label": req.label.strip()[:80],
+        "created_at": time.time(),
+        "expires_at": expires_at,
+        "scope": req.scope or "user",
+    }
+    return {
+        "token": token_value,
+        "label": req.label.strip()[:80],
+        "expires_at": expires_at,
+        "expires_in_s": ttl,
+        "scope": req.scope or "user",
+    }
+
+
+@app.get("/api/auth/tokens", dependencies=[Depends(require_master)])
+async def list_tokens():
+    """Liste les tokens fils actifs (sans exposer leur valeur). Master only."""
+    now = time.time()
+    # Nettoie les expires au passage
+    expired = [t for t, m in DYNAMIC_TOKENS.items() if m.get("expires_at") and m["expires_at"] < now]
+    for t in expired:
+        DYNAMIC_TOKENS.pop(t, None)
+    return [
+        {
+            "label": m["label"],
+            "created_at": m["created_at"],
+            "expires_at": m["expires_at"],
+            "expires_in_s": int(m["expires_at"] - now) if m.get("expires_at") else None,
+            "scope": m.get("scope", "user"),
+            # On expose 8 derniers chars du token pour permettre de l'identifier sans le compromettre
+            "token_suffix": t[-8:],
+        }
+        for t, m in DYNAMIC_TOKENS.items()
+    ]
+
+
+@app.delete("/api/auth/token/{token_suffix}", dependencies=[Depends(require_master)])
+async def revoke_token(token_suffix: str):
+    """Revoque un token fils par son suffix (les 8 derniers chars). Master only."""
+    if len(token_suffix) < 4:
+        raise HTTPException(400, "Suffix trop court (min 4 chars)")
+    matched = [t for t in DYNAMIC_TOKENS.keys() if t.endswith(token_suffix)]
+    if not matched:
+        raise HTTPException(404, f"Aucun token actif avec suffix '{token_suffix}'")
+    for t in matched:
+        DYNAMIC_TOKENS.pop(t, None)
+    return {"revoked": len(matched)}
+
+
+@app.get("/api/auth/me")
+async def whoami(authorization: Optional[str] = Header(None)):
+    """Retourne les infos du token courant (utile pour le CLI / debug)."""
+    if not MASTER_TOKEN:
+        return {"auth_enabled": False, "label": None}
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token")
+    token = authorization.split(None, 1)[1].strip()
+    meta = _valid_token(token)
+    if not meta:
+        raise HTTPException(403, "Invalid or expired Bearer token")
+    return {"auth_enabled": True, **meta}
+
+
 @app.get("/health")
 async def health():
     """Health check pour reverse proxy (Caddy) + sondes K8s liveness/readiness."""
@@ -465,24 +549,63 @@ class ScreencastHub:
 SCREENCAST_HUBS: dict[str, ScreencastHub] = {}
 
 
-# --- Auth optionnelle via Bearer token ---
-# Si DOMAUTOPSY_API_TOKEN est set dans l'env (ou .env), les endpoints qui
-# MUTENT l'etat (POST/DELETE) exigent le header 'Authorization: Bearer <token>'.
-# Si pas set : no-auth (mode dev/local par defaut).
-# GET endpoints + WS + /ci/{id} restent toujours ouverts pour le partage des
-# rapports et la lecture publique.
-API_TOKEN = os.getenv("DOMAUTOPSY_API_TOKEN", "").strip() or None
+# --- Auth Bearer token : 1 master + N tokens fils generes a la demande ---
+# MASTER_TOKEN (env DOMAUTOPSY_API_TOKEN) : token immuable, donne tous les droits,
+#   sert a generer des tokens fils via POST /api/auth/token. Si non set : no-auth.
+# Tokens fils : generes a la volee, stockes en memoire avec label + expires_at,
+#   peuvent etre revoques sans redemarrer. Accepteres comme le master.
+# Persistance : in-memory uniquement. Au restart serveur les tokens fils sont
+#   perdus (le master continue de marcher). Pour persistance permanente,
+#   stocker en SQLite/Redis (V4).
+import secrets
+import time
+
+MASTER_TOKEN = os.getenv("DOMAUTOPSY_API_TOKEN", "").strip() or None
+
+# {token_value: {"label": str, "created_at": float, "expires_at": float | None, "scope": str}}
+DYNAMIC_TOKENS: dict[str, dict] = {}
+
+
+def _valid_token(token: str) -> Optional[dict]:
+    """Verifie si un token est valide (master ou fils non expire). Retourne meta ou None."""
+    if MASTER_TOKEN and token == MASTER_TOKEN:
+        return {"label": "master", "scope": "admin", "expires_at": None}
+    t = DYNAMIC_TOKENS.get(token)
+    if not t:
+        return None
+    if t.get("expires_at") and time.time() > t["expires_at"]:
+        # Expire, on le retire
+        DYNAMIC_TOKENS.pop(token, None)
+        return None
+    return t
 
 
 async def require_token(authorization: Optional[str] = Header(None)):
-    """Dependency qui valide le Bearer token si API_TOKEN est configure."""
-    if not API_TOKEN:
-        return  # No-auth mode
+    """Dependency : valide Bearer (master OU token fils non expire)."""
+    if not MASTER_TOKEN:
+        return  # No-auth mode (pas de master = pas de auth)
     if not authorization or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "Missing Bearer token in Authorization header")
     token = authorization.split(None, 1)[1].strip()
-    if token != API_TOKEN:
-        raise HTTPException(403, "Invalid Bearer token")
+    if not _valid_token(token):
+        raise HTTPException(403, "Invalid or expired Bearer token")
+
+
+async def require_master(authorization: Optional[str] = Header(None)):
+    """Dependency : exige le master token (operations d'admin sur les tokens)."""
+    if not MASTER_TOKEN:
+        raise HTTPException(503, "Master token not configured server-side (set DOMAUTOPSY_API_TOKEN env)")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token in Authorization header")
+    token = authorization.split(None, 1)[1].strip()
+    if token != MASTER_TOKEN:
+        raise HTTPException(403, "Master token required for token management")
+
+
+class TokenMintRequest(BaseModel):
+    label: str
+    ttl_seconds: Optional[int] = 3600   # 1h par defaut
+    scope: Optional[str] = "user"       # user | readonly (cosmetique pour l'instant)
 
 # Cache des scripts importes : {import_id: {format, original_source, parsed_actions}}
 IMPORTS: dict[str, dict] = {}
