@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 DOMAutopsy CLI - Trigger un run a distance + suivi
 ===================================================
 Outil shell pour declencher un run depuis n'importe ou (GitHub Action,
