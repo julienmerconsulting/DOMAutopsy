@@ -234,6 +234,18 @@ def cmd_auth_whoami(args):
     print(json.dumps(result, indent=2))
 
 
+def cmd_auth_genkey(args):
+    """Genere un master token aleatoire fort (256 bits d'entropie). Pas de
+    connexion serveur, juste un helper local pour remplir .env."""
+    import secrets
+    nbytes = max(16, args.bytes)
+    token = secrets.token_hex(nbytes)
+    if args.env:
+        print(f"DOMAUTOPSY_API_TOKEN={token}")
+    else:
+        print(token)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DOMAutopsy CLI : trigger des runs a distance, polling CI ou tail live"
@@ -302,6 +314,11 @@ def main():
 
     p_whoami = auth_sub.add_parser("whoami", help="Affiche les infos du token courant")
     p_whoami.set_defaults(func=cmd_auth_whoami)
+
+    p_genkey = auth_sub.add_parser("genkey", help="Genere un master token aleatoire (offline, pas de serveur requis)")
+    p_genkey.add_argument("--bytes", type=int, default=32, help="Nombre d'octets (defaut: 32 = 64 chars hex = 256 bits)")
+    p_genkey.add_argument("--env", action="store_true", help="Sortie au format 'DOMAUTOPSY_API_TOKEN=...' pour append direct a .env")
+    p_genkey.set_defaults(func=cmd_auth_genkey)
 
     args = parser.parse_args()
     args.func(args)
