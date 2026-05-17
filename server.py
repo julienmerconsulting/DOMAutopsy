@@ -292,7 +292,8 @@ async def health():
         "active_runs": active,
         "total_runs_inmem": len(RUNS),
         "screencast_hubs": len(SCREENCAST_HUBS),
-        "auth_enabled": API_TOKEN is not None,
+        "auth_enabled": MASTER_TOKEN is not None,
+        "dynamic_tokens": len(DYNAMIC_TOKENS),
     }
 
 
