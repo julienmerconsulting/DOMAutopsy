@@ -26,19 +26,29 @@ Prerequis :
   pip install browser-use playwright openai
   playwright install chromium
   
-Variables d'environnement :
-  OPENAI_API_KEY=sk-...
+Variables d'environnement (selon --provider) :
+  OPENAI_API_KEY=sk-...        # pour --provider openai (defaut)
+  GROQ_API_KEY=gsk_...          # pour --provider groq
+
+Exemples avec Groq :
+  python qa_explorer.py --provider groq --url https://example.com --task "..."
+  python qa_explorer.py --provider groq --model llama-3.3-70b-versatile scenario.json
 """
 
 from browser_use import Agent, BrowserSession, ChatOpenAI
 from playwright.async_api import async_playwright
 from openai import OpenAI
+from dotenv import load_dotenv
 import asyncio
 import json
 import os
 import sys
 import argparse
 from datetime import datetime
+from pathlib import Path
+
+# Charger les variables du .env (OPENAI_API_KEY notamment)
+load_dotenv()
 
 # Import du generateur de rapport (optionnel)
 try:
@@ -86,15 +96,133 @@ def _patch_browser_use():
     except AttributeError:
         print("  [PATCH] API browser-use modifiee, patch non applique")
 
-_patch_browser_use()
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-LLM_MODEL = "gpt-4.1-mini"
+LLM_MODEL = "gpt-4.1-mini"            # defaut historique (provider openai)
 CDP_PORT = 9222
+
+# Providers LLM compatibles API OpenAI (chat.completions)
+# Pour ajouter un provider : meme structure (base_url, env_var, default_model)
+PROVIDERS = {
+    "openai": {
+        "base_url": None,                       # URL par defaut du SDK OpenAI
+        "env_var": "OPENAI_API_KEY",
+        "default_model": "gpt-4.1-mini",
+    },
+    "groq": {
+        "base_url": "https://api.groq.com/openai/v1",
+        "env_var": "GROQ_API_KEY",
+        "default_model": "llama-3.3-70b-versatile",
+    },
+}
+
+# Modeles Groq qui acceptent le format multimodal (content list avec images)
+# browser-use envoie un screenshot a chaque step -> sans vision, il faut forcer use_vision=False
+GROQ_VISION_MODELS = {
+    "meta-llama/llama-4-scout-17b-16e-instruct",
+    "meta-llama/llama-4-maverick-17b-128e-instruct",
+}
+
+# Formats de sortie supportes pour le code generate par l'IA de cleanup
+# Pour ajouter un format : meme structure (label, extension, code_instructions)
+# Le bloc code_instructions est injecte dans le prompt IA a la place du bloc Katalon
+OUTPUT_FORMATS = {
+    "katalon": {
+        "label": "Katalon Studio (Groovy)",
+        "extension": ".groovy",
+        "code_instructions": """6. Genere le code Katalon Studio (Groovy) complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs qui ont unique: true. Utilise-les EXACTEMENT tels quels.
+   - EXCEPTION pour unique: false : si le selecteur est non-unique ET qu'un texte est disponible
+     dans le log (champ "text"), genere un XPath avec le texte pour fiabiliser le clic.
+   - Pour creer un TestObject :
+     TestObject to = new TestObject("nomDescriptif")
+     to.addProperty("xpath" ou "css", ConditionType.EQUALS, "le_selecteur_exact")
+   - Imports requis :
+     import com.kms.katalon.core.testobject.TestObject
+     import com.kms.katalon.core.testobject.ConditionType
+     import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
+   - WebUI.openBrowser('') + WebUI.navigateToUrl(url) en debut
+   - WebUI.click(to) pour les clics, WebUI.setText(to, value) pour les inputs
+   - WebUI.verifyElementPresent(to, 10) avant chaque interaction, WebUI.delay(1) entre chaque
+   - Si "inShadowDOM": true, utilise WebUI.executeJavaScript() avec le jsSelector fourni
+   - WebUI.closeBrowser() en fin
+   - Commentaires en francais""",
+    },
+    "playwright": {
+        "label": "Playwright (TypeScript)",
+        "extension": ".spec.ts",
+        "code_instructions": """6. Genere un test Playwright en TypeScript complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour les selecteurs unique: false avec texte disponible, utilise getByText() ou getByRole() avec name.
+   - Structure :
+     import { test, expect } from '@playwright/test';
+     test('description', async ({ page }) => {
+       await page.goto(url);
+       await page.locator('selector').click();
+       await page.locator('selector').fill('value');
+     });
+   - Pour XPath utilise page.locator('xpath=...').click()
+   - Pour CSS utilise page.locator('selector').click()
+   - Pour shadow DOM utilise page.locator('host >>> inner').click()
+   - Ajoute await page.waitForLoadState('networkidle') apres les navigations
+   - Commentaires en francais""",
+    },
+    "cypress": {
+        "label": "Cypress (JavaScript)",
+        "extension": ".cy.js",
+        "code_instructions": """6. Genere un test Cypress en JavaScript complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour selecteurs unique: false avec texte disponible, utilise cy.contains() pour fiabiliser.
+   - Structure :
+     describe('parcours', () => {
+       it('test', () => {
+         cy.visit(url);
+         cy.get('selector').click();
+         cy.get('selector').type('value');
+       });
+     });
+   - Pour XPath, installe cypress-xpath et utilise cy.xpath('//...')
+   - Pour CSS utilise cy.get('selector')
+   - cy.contains(text) si le texte est plus stable que le selecteur
+   - Commentaires en francais""",
+    },
+    "selenium": {
+        "label": "Selenium (Python)",
+        "extension": ".py",
+        "code_instructions": """6. Genere un test Selenium WebDriver en Python complet et fonctionnel pour rejouer ce parcours.
+
+   REGLE CRITIQUE :
+   - Ne modifie JAMAIS les selecteurs unique: true. Utilise-les EXACTEMENT tels quels.
+   - Pour selecteurs unique: false avec texte, prefere XPath text-based.
+   - Structure :
+     from selenium import webdriver
+     from selenium.webdriver.common.by import By
+     from selenium.webdriver.support.ui import WebDriverWait
+     from selenium.webdriver.support import expected_conditions as EC
+     driver = webdriver.Chrome()
+     driver.get(url)
+     WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.CSS_SELECTOR, 'selector'))).click()
+     element = driver.find_element(By.CSS_SELECTOR, 'selector')
+     element.send_keys('value')
+   - Utilise By.XPATH pour selecteurs commencant par //, By.CSS_SELECTOR sinon
+   - WebDriverWait avant chaque interaction (attendre element_to_be_clickable)
+   - driver.quit() en fin
+   - Commentaires en francais""",
+    },
+}
+MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut browser-use: 0.5s, trop court pour les SPA)
+MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
+NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
+MAX_STEPS = 25                    # garde-fou anti-boucle infinie
 
 # TASK par defaut (legacy, utilise si aucun JSON ni --task)
 DEFAULT_TASK = """
@@ -288,15 +416,95 @@ def resolve_task():
         help="Description du parcours en texte libre"
     )
     parser.add_argument(
-        "--model", default=LLM_MODEL,
-        help=f"Modele LLM (defaut: {LLM_MODEL})"
+        "--provider", default="openai", choices=list(PROVIDERS.keys()),
+        help="Provider LLM (defaut: openai). Lit la cle dans la variable d'env du provider."
+    )
+    parser.add_argument(
+        "--model", default=None,
+        help="Modele LLM (defaut: depend du provider, ex gpt-4.1-mini pour openai, llama-3.3-70b-versatile pour groq)"
     )
     parser.add_argument(
         "--port", type=int, default=CDP_PORT,
         help=f"Port CDP Chromium (defaut: {CDP_PORT})"
     )
+    parser.add_argument(
+        "--min-wait", type=float, default=MIN_WAIT_PAGE_LOAD,
+        help=f"Temps min d'attente avant snapshot DOM en sec (defaut: {MIN_WAIT_PAGE_LOAD}s, augmente pour les SPA lentes)"
+    )
+    parser.add_argument(
+        "--max-wait", type=float, default=MAX_WAIT_PAGE_LOAD,
+        help=f"Temps max d'attente avant snapshot DOM en sec (defaut: {MAX_WAIT_PAGE_LOAD}s)"
+    )
+    parser.add_argument(
+        "--network-idle", type=float, default=NETWORK_IDLE_WAIT,
+        help=f"Temps d'attente reseau idle en sec (defaut: {NETWORK_IDLE_WAIT}s)"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=MAX_STEPS,
+        help=f"Nombre max d'etapes de l'agent (defaut: {MAX_STEPS}, evite les boucles infinies)"
+    )
+    parser.add_argument(
+        "--vision", dest="vision", action="store_true", default=None,
+        help="Force l'envoi de screenshots au LLM (defaut: auto - OFF pour Groq non-vision, ON sinon)"
+    )
+    parser.add_argument(
+        "--no-vision", dest="vision", action="store_false",
+        help="Force la desactivation des screenshots (utile pour Groq text-only et reduire le coup token)"
+    )
+    parser.add_argument(
+        "--output-format", default="katalon", choices=list(OUTPUT_FORMATS.keys()),
+        help="Format du code de test genere (defaut: katalon). Choix: " + ", ".join(OUTPUT_FORMATS.keys())
+    )
+    parser.add_argument(
+        "--headless", action="store_true",
+        help="Lance Chromium en mode headless (defaut: visible). Recommande pour le serveur web et le multi-run."
+    )
+    parser.add_argument(
+        "--output-dir", default=None,
+        help="Dossier de sortie pour les artefacts du run (defaut: runs/<timestamp>/). Cree s'il n'existe pas."
+    )
+    parser.add_argument(
+        "--no-open-report", dest="open_report", action="store_false", default=True,
+        help="Ne pas ouvrir le rapport HTML dans le navigateur a la fin (utile pour le mode serveur)."
+    )
 
     args = parser.parse_args()
+
+    # Resoudre le provider LLM : base_url + cle API + modele par defaut
+    provider_cfg = PROVIDERS[args.provider]
+    api_key = os.getenv(provider_cfg["env_var"])
+    if not api_key:
+        print(f"  ERREUR : variable d'env {provider_cfg['env_var']} manquante pour --provider {args.provider}")
+        print(f"  Soit la mettre dans .env, soit changer de provider via --provider")
+        sys.exit(1)
+    model = args.model or provider_cfg["default_model"]
+    # Resoudre use_vision : explicite si --vision/--no-vision, sinon auto selon provider/modele
+    if args.vision is not None:
+        use_vision = args.vision
+        vision_reason = "force par CLI"
+    elif args.provider == "groq" and model not in GROQ_VISION_MODELS:
+        use_vision = False
+        vision_reason = "auto OFF (modele Groq text-only)"
+    else:
+        use_vision = True
+        vision_reason = "auto ON"
+    print(f"  Provider : {args.provider} (modele: {model})")
+    print(f"  Vision   : {use_vision} ({vision_reason})")
+
+    timing_opts = {
+        "min_wait": args.min_wait,
+        "max_wait": args.max_wait,
+        "network_idle": args.network_idle,
+        "max_steps": args.max_steps,
+        "provider": args.provider,
+        "base_url": provider_cfg["base_url"],
+        "api_key": api_key,
+        "use_vision": use_vision,
+        "output_format": args.output_format,
+        "headless": args.headless,
+        "output_dir": args.output_dir,
+        "open_report": args.open_report,
+    }
 
     # Mode 1 : Fichier JSON du Scenario Builder
     if args.scenario_file:
@@ -306,7 +514,7 @@ def resolve_task():
         with open(args.scenario_file, "r", encoding="utf-8") as f:
             scenario = json.load(f)
         task = build_task_from_json(args.scenario_file)
-        return task, args.model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", [])
+        return task, model, args.port, scenario.get("name", "Scenario"), scenario.get("url", ""), scenario.get("steps", []), timing_opts
 
     # Mode 2 : --url + --task en ligne de commande
     if args.url and args.task:
@@ -320,338 +528,21 @@ Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."""
         print_header("MODE LIGNE DE COMMANDE")
         print(f"  URL  : {args.url}")
         print(f"  Task : {args.task}")
-        return task, args.model, args.port, "CLI", args.url, []
+        return task, model, args.port, "CLI", args.url, [], timing_opts
 
     # Mode 3 : TASK par defaut (legacy)
     print_header("MODE LEGACY (TASK PAR DEFAUT)")
     print("  Aucun scenario JSON ni --url/--task fourni")
     print("  Utilisation du TASK hardcode")
-    return DEFAULT_TASK, args.model, args.port, "Legacy", "", []
+    return DEFAULT_TASK, model, args.port, "Legacy", "", [], timing_opts
 
 
 # ============================================================
 # DOM LISTENER (injecte dans le navigateur)
 # ============================================================
 
-DOM_LISTENER_JS = """
-(function() {
-    if (window.__qaListenerInstalled) return;
-    window.__qaListenerInstalled = true;
+DOM_LISTENER_JS = (Path(__file__).parent / "dom_listener.js").read_text(encoding="utf-8")
 
-    // -- SAUVEGARDE --
-    function saveEntry(entry) {
-        try {
-            let log = JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]');
-            log.push(entry);
-            localStorage.setItem('__qaLocatorLog', JSON.stringify(log));
-        } catch(e) {}
-    }
-
-    // -- DETECTION SHADOW DOM --
-    function isInShadowDOM(el) {
-        let root = el.getRootNode();
-        return root instanceof ShadowRoot;
-    }
-
-    // -- SELECTEUR SHADOW DOM (chaine) --
-    function getShadowSelector(el) {
-        let chain = [];
-        let current = el;
-        while (current) {
-            let root = current.getRootNode();
-            let localSel = getQuickSelector(current);
-            if (root instanceof ShadowRoot) {
-                chain.unshift({selector: localSel, shadow: true});
-                current = root.host;
-            } else {
-                chain.unshift({selector: localSel, shadow: false});
-                break;
-            }
-        }
-        let pwSel = chain.map(c => c.selector).join(' >>> ');
-        let jsSel = chain.map((c, i) => {
-            if (i === 0) return 'document.querySelector("' + c.selector + '")';
-            return '.shadowRoot.querySelector("' + c.selector + '")';
-        }).join('');
-        return {
-            strategy: 'shadow',
-            value: pwSel,
-            inShadowDOM: true,
-            shadowChain: chain,
-            playwrightSelector: pwSel,
-            jsSelector: jsSel,
-            unique: true,
-            matchCount: 1
-        };
-    }
-
-    // -- SELECTEUR RAPIDE (pour shadow chain ou parent lookup) --
-    function getQuickSelector(el) {
-        if (!el || !el.getAttribute) return 'unknown';
-        if (el.getAttribute('data-testid')) return '[data-testid="' + el.getAttribute('data-testid') + '"]';
-        if (el.id && !el.id.match(/^[0-9]|react|ember|__/)) return '#' + el.id;
-        if (el.getAttribute('name')) return el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
-        if (el.getAttribute('aria-label')) return '[aria-label="' + el.getAttribute('aria-label') + '"]';
-        let sel = el.tagName.toLowerCase();
-        if (el.className && typeof el.className === 'string') {
-            let cls = el.className.trim().split(/\\s+/).filter(c => c.length > 2 && c.length < 30).slice(0, 2);
-            if (cls.length) sel += '.' + cls.join('.');
-        }
-        return sel;
-    }
-
-    // =========================================================
-    // -- SELECTEUR INTELLIGENT : cascade stricte + validation --
-    // =========================================================
-    function getBestSelector(el) {
-        if (!el || !el.getAttribute) return {strategy:'unknown', value:'unknown', inShadowDOM:false, unique:false, matchCount:0};
-
-        // Shadow DOM -> logique separee
-        if (isInShadowDOM(el)) return getShadowSelector(el);
-
-        let best = null;
-        let strategy = 'unknown';
-
-        // === Tier 1 : Attributs stables (fiabilite max) ===
-        if (el.getAttribute('data-testid')) {
-            best = '[data-testid="' + el.getAttribute('data-testid') + '"]';
-            strategy = 'data-testid';
-        }
-        else if (el.id && !el.id.match(/^[0-9]|react|ember|__|:/)) {
-            best = '#' + el.id;
-            strategy = 'id';
-        }
-        else if (el.getAttribute('name')) {
-            best = el.tagName.toLowerCase() + '[name="' + el.getAttribute('name') + '"]';
-            strategy = 'name';
-        }
-
-        // === Tier 2 : Attributs semantiques ===
-        if (!best && el.getAttribute('aria-label')) {
-            best = '[aria-label="' + el.getAttribute('aria-label') + '"]';
-            strategy = 'aria-label';
-        }
-        if (!best && el.getAttribute('placeholder')) {
-            best = el.tagName.toLowerCase() + '[placeholder="' + el.getAttribute('placeholder') + '"]';
-            strategy = 'placeholder';
-        }
-        if (!best && el.getAttribute('title')) {
-            best = '[title="' + el.getAttribute('title') + '"]';
-            strategy = 'title';
-        }
-
-        // === Tier 3 : Href pour les liens ===
-        if (!best && el.tagName === 'A' && el.getAttribute('href')) {
-            let href = el.getAttribute('href');
-            if (href !== '#' && href !== '/' && href !== 'javascript:void(0)' && href.length < 100) {
-                best = 'a[href="' + href + '"]';
-                strategy = 'href';
-            }
-        }
-
-        // === Tier 4 : Remonter au parent avec attribut stable (icones, SVG) ===
-        if (!best) {
-            let parent = el.closest('[aria-label], [data-testid], [title]');
-            if (parent && parent !== el) {
-                if (parent.getAttribute('aria-label')) {
-                    best = '[aria-label="' + parent.getAttribute('aria-label') + '"]';
-                    strategy = 'parent-aria-label';
-                } else if (parent.getAttribute('data-testid')) {
-                    best = '[data-testid="' + parent.getAttribute('data-testid') + '"]';
-                    strategy = 'parent-data-testid';
-                } else if (parent.getAttribute('title')) {
-                    best = '[title="' + parent.getAttribute('title') + '"]';
-                    strategy = 'parent-title';
-                }
-            }
-        }
-
-        // === Tier 5 : Label associe (pour inputs) ===
-        if (!best && (el.tagName === 'INPUT' || el.tagName === 'SELECT' || el.tagName === 'TEXTAREA')) {
-            let label = null;
-            if (el.id) label = document.querySelector('label[for="' + el.id + '"]');
-            if (!label) label = el.closest('label');
-            if (label) {
-                let labelText = (label.textContent || '').trim().substring(0, 40);
-                if (labelText) {
-                    best = '//label[contains(text(),"' + labelText + '")]//input';
-                    strategy = 'label-xpath';
-                }
-            }
-        }
-
-        // === Tier 6 : CSS court + nth-of-type (dernier recours CSS) ===
-        if (!best) {
-            let sel = el.tagName.toLowerCase();
-            if (el.className && typeof el.className === 'string') {
-                let classes = el.className.trim().split(/\\s+/)
-                    .filter(c => c.length > 2 && c.length < 30
-                            && !c.match(/active|hover|focus|open|visible|show|selected|current/))
-                    .slice(0, 2);
-                if (classes.length) sel += '.' + classes.join('.');
-            }
-            if (el.parentElement) {
-                let same = Array.from(el.parentElement.children).filter(s => s.tagName === el.tagName);
-                if (same.length > 1) {
-                    sel += ':nth-of-type(' + (same.indexOf(el) + 1) + ')';
-                }
-            }
-            best = sel;
-            strategy = 'css-short';
-        }
-
-        // === VALIDATION : est-ce que le selecteur matche 1 seul element ? ===
-        let matchCount = 0;
-        try {
-            if (strategy === 'label-xpath' || best.startsWith('//')) {
-                let xr = document.evaluate(best, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                matchCount = xr.snapshotLength;
-            } else {
-                matchCount = document.querySelectorAll(best).length;
-            }
-        } catch(e) { matchCount = -1; }
-
-        // Si multi-match -> tenter XPath text-based
-        let text = (el.innerText || el.textContent || '').trim();
-        if (matchCount !== 1 && text && text.length > 0 && text.length < 50 && text.indexOf('\\n') === -1) {
-            let xpathText = '//' + el.tagName.toLowerCase() + '[contains(text(),"' + text.replace(/"/g, "'") + '")]';
-            let xpathCount = 0;
-            try {
-                let xr = document.evaluate(xpathText, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                xpathCount = xr.snapshotLength;
-            } catch(e) {}
-            if (xpathCount === 1) {
-                best = xpathText;
-                strategy = 'xpath-text';
-                matchCount = 1;
-            } else if (xpathCount > 0 && xpathCount < matchCount) {
-                best = xpathText;
-                strategy = 'xpath-text';
-                matchCount = xpathCount;
-            }
-        }
-
-        return {
-            strategy: strategy,
-            value: best,
-            inShadowDOM: false,
-            unique: matchCount === 1,
-            matchCount: matchCount
-        };
-    }
-
-    // -- RESOLUTION ELEMENT REEL (composedPath + bubble up) --
-    function getRealTarget(e) {
-        let el = e.target;
-        if (e.composedPath && e.composedPath().length > 0) {
-            el = e.composedPath()[0];
-        }
-        let interactiveTags = ['BUTTON', 'A', 'INPUT', 'SELECT', 'TEXTAREA'];
-        let maxDepth = 5;
-        let depth = 0;
-        while (el && depth < maxDepth) {
-            if (el.id || (el.getAttribute && el.getAttribute('data-testid')) || (el.getAttribute && el.getAttribute('name'))) break;
-            if (interactiveTags.includes(el.tagName)) break;
-            if (el.getAttribute && el.getAttribute('aria-label')) break;
-            let parent = el.parentElement;
-            if (!parent) break;
-            if (interactiveTags.includes(parent.tagName) || parent.id
-                || (parent.getAttribute && parent.getAttribute('data-testid'))
-                || (parent.getAttribute && parent.getAttribute('aria-label'))) {
-                el = parent;
-                break;
-            }
-            el = parent;
-            depth++;
-        }
-        return el;
-    }
-
-    // -- EVENT LISTENERS --
-    document.addEventListener('click', (e) => {
-        let el = getRealTarget(e);
-        let sel = getBestSelector(el);
-        let text = (el.innerText || el.textContent || '').trim().substring(0, 80);
-        saveEntry({
-            action: 'click',
-            timestamp: Date.now(),
-            tag: el.tagName,
-            text: text,
-            selector: sel,
-            url: location.href,
-            inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                class: (typeof el.className === 'string') ? el.className : null,
-                href: el.getAttribute ? el.getAttribute('href') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null,
-                role: el.getAttribute ? el.getAttribute('role') : null
-            }
-        });
-    }, true);
-
-    document.addEventListener('input', (e) => {
-        let el = getRealTarget(e);
-        let sel = getBestSelector(el);
-        saveEntry({
-            action: 'input',
-            timestamp: Date.now(),
-            tag: el.tagName,
-            value: el.value || '',
-            selector: sel,
-            url: location.href,
-            inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
-            }
-        });
-    }, true);
-
-    // -- SCROLL LISTENER (debounced) --
-    let scrollTimer = null;
-    let scrollStartY = window.scrollY;
-    window.addEventListener('scroll', () => {
-        if (!scrollTimer) {
-            scrollStartY = window.scrollY;
-        }
-        clearTimeout(scrollTimer);
-        scrollTimer = setTimeout(() => {
-            let scrollEndY = window.scrollY;
-            let delta = scrollEndY - scrollStartY;
-            if (Math.abs(delta) > 50) {
-                saveEntry({
-                    action: 'scroll',
-                    timestamp: Date.now(),
-                    tag: 'WINDOW',
-                    direction: delta > 0 ? 'down' : 'up',
-                    deltaY: delta,
-                    scrollY: scrollEndY,
-                    viewport: {
-                        width: window.innerWidth,
-                        height: window.innerHeight,
-                        docHeight: document.documentElement.scrollHeight
-                    },
-                    url: location.href,
-                    selector: {strategy: 'window', value: 'window.scrollTo(0, ' + scrollEndY + ')', inShadowDOM: false, unique: true, matchCount: 1},
-                    inShadowDOM: false,
-                    attributes: {}
-                });
-            }
-            scrollTimer = null;
-        }, 250);
-    }, true);
-
-    console.log('[QA Listener V3] Installed on ' + location.href + ' (Smart selectors + Shadow DOM + Scroll)');
-})();
-"""
 
 
 # ============================================================
@@ -696,7 +587,7 @@ def dedup_log(raw_log):
 # NETTOYAGE IA
 # ============================================================
 
-def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL):
+def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None, output_format="katalon", network_log=None):
     """
     Envoie le log deduplique a GPT-4.1-mini pour :
     - Reconstituer le parcours ideal dans l'ordre
@@ -704,7 +595,17 @@ def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL):
     - Comparer avec le scenario attendu si fourni
     - Signaler les anomalies
     """
-    client = OpenAI()
+    client_kwargs = {}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+    if api_key:
+        client_kwargs["api_key"] = api_key
+    client = OpenAI(**client_kwargs)
+
+    # Format de sortie : recupere le bloc d'instructions code-gen + label/extension
+    fmt = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
+    code_instructions_block = fmt["code_instructions"]
+    print(f"  Format de sortie : {fmt['label']} ({fmt['extension']})")
 
     # Bloc optionnel : scenario attendu pour comparaison
     scenario_block = ""
@@ -721,12 +622,49 @@ REGLE IMPORTANTE :
 - Le parcours nettoye doit correspondre au scenario attendu, pas au log brut
 """
 
+    # Bloc optionnel : network log pour generation d'API assertions (V3 phase 3)
+    network_block = ""
+    if network_log:
+        # Garde uniquement les API calls (Fetch/XHR) avec status >= 200, max 30 entrees
+        api_calls = [
+            {
+                "method": r.get("method"),
+                "url": r.get("url", "")[:200],
+                "status": r.get("status"),
+                "type": r.get("type"),
+                "duration_ms": r.get("duration_ms"),
+            }
+            for r in network_log
+            if r.get("type") in ("Fetch", "XHR") and r.get("status")
+        ][:30]
+        if api_calls:
+            network_block = f"""
+API CALLS CAPTURES PENDANT LE PARCOURS (Network.* via CDP) :
+{json.dumps(api_calls, indent=2, ensure_ascii=False)}
+
+REGLE POUR ENRICHIR LE CODE GENERE AVEC DES ASSERTIONS API :
+- Apres chaque action 'click' qui declenche probablement un appel API (login, submit form,
+  add to cart, etc.), AJOUTE une assertion qui verifie que l'API a bien repondu en 2xx.
+- Utilise la syntaxe native du framework de sortie pour intercepter ou attendre la reponse :
+    * Playwright : await page.waitForResponse(url => url.includes('/api/...'))
+                   puis expect(response.status()).toBe(200)
+    * Cypress : cy.intercept('POST', '/api/...').as('login') AVANT le click,
+                puis cy.wait('@login').its('response.statusCode').should('eq', 200)
+    * Selenium : pas d'API simple, ajoute un commentaire '# TODO: assert API call here'
+    * Katalon : WS.verifyResponseStatusCode(response, 200) si applicable, sinon commentaire
+- Si une URL d'API call contient un domain tier (analytics, ads), NE PAS generer d'assertion
+  dessus, c'est du tracking pas du contrat metier.
+- Signale dans 'anomalies' si tu vois un status >= 400 dans les API calls : c'est probablement
+  un bug du SUT ou un endpoint deprecie.
+"""
+
     prompt = f"""Tu es un expert QA automation Katalon Studio. Voici le log des actions capturees 
 pendant un parcours automatise par un agent IA (browser-use).
 
 L'agent a potentiellement fait des erreurs : clics dans le desordre, 
 etapes recommencees, clics parasites sur des overlays/modals/conteneurs, etc.
 {scenario_block}
+{network_block}
 ACTIONS CAPTUREES (deja dedupliquees pour les inputs) :
 {json.dumps(deduped_log, indent=2, ensure_ascii=False)}
 
@@ -758,35 +696,7 @@ CONSIGNE :
    - Clics parasites supprimes (indiquer lesquels et pourquoi)
    - Etapes du scenario non couvertes par le log
    - Tout ecart entre le scenario attendu et le parcours reconstitue
-6. Genere le code Katalon Studio (Groovy) complet et fonctionnel pour rejouer ce parcours.
-   
-   REGLE CRITIQUE POUR LE CODE KATALON :
-   - Ne modifie JAMAIS les selecteurs qui ont unique: true. Utilise-les EXACTEMENT tels quels.
-   - EXCEPTION pour unique: false : si le selecteur est non-unique ET qu'un texte est disponible
-     dans le log (champ "text"), genere un XPath avec le texte pour fiabiliser le clic.
-     Exemple : selecteur "a.listItem__container" (15 matchs) avec texte "Compétitions"
-     → to.addProperty("xpath", ConditionType.EQUALS, "//a[contains(@class,'listItem__container') and contains(text(),'Compétitions')]")
-     Signale ce remplacement dans les anomalies.
-   - Pour creer un TestObject, utilise TOUJOURS ce pattern :
-     
-     TestObject to = new TestObject("nomDescriptif")
-     Si le selecteur commence par "//" :
-       to.addProperty("xpath", ConditionType.EQUALS, "le_selecteur_exact")
-     Sinon :
-       to.addProperty("css", ConditionType.EQUALS, "le_selecteur_exact")
-   
-   - Import requis en haut : 
-     import com.kms.katalon.core.testobject.TestObject
-     import com.kms.katalon.core.testobject.ConditionType
-     import com.kms.katalon.core.webui.keyword.WebUiBuiltInKeywords as WebUI
-   - Utilise WebUI.openBrowser('') et WebUI.navigateToUrl() pour ouvrir la page
-   - Utilise WebUI.click(to) pour les clics
-   - Utilise WebUI.setText(to, value) pour les inputs
-   - Ajoute WebUI.delay(1) entre les etapes pour la stabilite
-   - Ajoute WebUI.verifyElementPresent(to, 10) avant chaque interaction
-   - Si l'entree a "inShadowDOM": true, utilise WebUI.executeJavaScript() avec le jsSelector fourni
-   - Termine avec WebUI.closeBrowser()
-   - Ajoute des commentaires en francais pour chaque etape
+{code_instructions_block}
 
 Reponds UNIQUEMENT en JSON valide, pas de markdown, pas de commentaires.
 Structure attendue :
@@ -808,7 +718,7 @@ Structure attendue :
       "unique": true
     }}
   ],
-  "katalon_code": "// Code Katalon complet ici en une seule string avec des \\n pour les sauts de ligne"
+  "katalon_code": "// Code complet ici en une seule string avec des \\n pour les sauts de ligne (peu importe le langage demande, on garde la cle 'katalon_code' pour compatibilite)"
 }}"""
 
     print("\n  Nettoyage IA en cours...")
@@ -939,204 +849,604 @@ def print_clean_steps(clean_data):
 # MAIN
 # ============================================================
 
-async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None):
-    # Stocker les steps du scenario pour le cleanup IA
-    global _scenario_steps
-    _scenario_steps = scenario_steps
+async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None, timing_opts=None):
     """Fonction principale d'execution du QA Explorer"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    timing_opts = timing_opts or {}
+    started_at = datetime.now().isoformat()
+    min_wait = timing_opts.get("min_wait", MIN_WAIT_PAGE_LOAD)
+    max_wait = timing_opts.get("max_wait", MAX_WAIT_PAGE_LOAD)
+    network_idle = timing_opts.get("network_idle", NETWORK_IDLE_WAIT)
+    max_steps = timing_opts.get("max_steps", MAX_STEPS)
+    provider = timing_opts.get("provider", "openai")
+    base_url = timing_opts.get("base_url")
+    api_key = timing_opts.get("api_key")
+    use_vision = timing_opts.get("use_vision", True)
+    output_format = timing_opts.get("output_format", "katalon")
+    headless = timing_opts.get("headless", False)
+    output_dir_arg = timing_opts.get("output_dir") or os.path.join("runs", timestamp)
+    output_dir = Path(output_dir_arg)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    should_open_report = timing_opts.get("open_report", True)
+    print(f"  Output dir : {output_dir}")
 
-    # -- ETAPE 1 : Lancer Chromium avec CDP (plein ecran) --
-    print_header("LANCEMENT CHROMIUM + CDP")
+    # -- ETAPE 1 : Lancer Chromium avec CDP --
+    # Headless=True : indispensable en multi-run web UI (sinon 12 fenetres se chevauchent)
+    # Le screencast CDP marche aussi bien en headless qu'en headed
+    print_header("LANCEMENT CHROMIUM + CDP" + (" [HEADLESS]" if headless else ""))
     pw = await async_playwright().start()
-    browser = await pw.chromium.launch(
-        headless=False,
-        args=[
-            f"--remote-debugging-port={cdp_port}",
-            "--start-maximized"
+    chromium_args = [f"--remote-debugging-port={cdp_port}"]
+    if headless:
+        # Optimisations RAM/CPU pour permettre N Chromiums en parallele
+        chromium_args += [
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--window-size=1280,720",
         ]
-    )
-    context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
-    page = context.pages[0] if context.pages else await context.new_page()
-
-    # Forcer plein ecran via CDP
-    try:
-        cdp = await page.context.new_cdp_session(page)
-        window = await cdp.send("Browser.getWindowForTarget")
-        window_id = window["windowId"]
-        await cdp.send("Browser.setWindowBounds", {
-            "windowId": window_id,
-            "bounds": {"windowState": "maximized"}
-        })
-        print(f"  Chromium lance PLEIN ECRAN sur CDP port {cdp_port}")
-    except Exception as e:
-        print(f"  Chromium lance sur CDP port {cdp_port} (maximized via args)")
-        print(f"  CDP maximize fallback: {e}")
-
-    print(f"  Page prete : {page.url}")
-
-    # -- ETAPE 2 : Injecter le DOM Listener --
-    await context.add_init_script(DOM_LISTENER_JS)
-    await page.evaluate(DOM_LISTENER_JS)
-    print(f"  DOM Listener injecte via Playwright")
-
-    # Via CDP direct (couvre TOUS les contextes, y compris celui de browser-use)
-    try:
-        cdp_session = await browser.new_browser_cdp_session()
-        await cdp_session.send("Page.addScriptToEvaluateOnNewDocument", {
-            "source": DOM_LISTENER_JS
-        })
-        print(f"  DOM Listener injecte via CDP (global, tous contextes)")
-    except Exception as e:
-        print(f"  Injection CDP echouee (pas critique): {e}")
-
-    # -- ETAPE 3 : Lancer browser-use via CDP --
-    print_header("LANCEMENT BROWSER-USE")
-    llm = ChatOpenAI(model=model)
-    browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
-
-    agent = Agent(
-        task=task,
-        llm=llm,
-        browser_session=browser_session,
-    )
-
-    result = await agent.run()
-
-    # -- ETAPE 4 : Recuperer le log brut --
-    print_header("RECUPERATION DES LOCATEURS")
-    raw_log = []
-
-    # Methode 1 : Via le contexte browser-use (CDP)
-    try:
-        bu_context = agent.browser_session.context
-        if bu_context:
-            for p in bu_context.pages:
-                try:
-                    log = await p.evaluate(
-                        "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
-                    )
-                    if log:
-                        raw_log.extend(log)
-                        print(f"  {len(log)} entrees via contexte browser-use (page: {p.url[:60]})")
-                except Exception as e:
-                    print(f"  Page browser-use inaccessible: {e}")
-                    continue
-    except Exception as e:
-        print(f"  Contexte browser-use non accessible: {e}")
-
-    # Methode 2 : Via notre contexte Playwright original (fallback)
-    if len(raw_log) == 0:
-        print("  Fallback: tentative via contexte Playwright original...")
-        try:
-            for p in context.pages:
-                try:
-                    log = await p.evaluate(
-                        "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
-                    )
-                    if log:
-                        raw_log.extend(log)
-                        print(f"  {len(log)} entrees via Playwright (page: {p.url[:60]})")
-                except Exception:
-                    continue
-        except Exception as e:
-            print(f"  Contexte Playwright non accessible: {e}")
-
-    # Methode 3 : Via CDP direct (dernier recours)
-    if len(raw_log) == 0:
-        print("  Fallback 2: tentative via CDP direct...")
-        try:
-            cdp = await browser.new_browser_cdp_session()
-            targets = await cdp.send("Target.getTargets")
-            for target in targets.get("targetInfos", []):
-                if target.get("type") == "page":
-                    print(f"  CDP target trouve: {target.get('url', 'N/A')[:60]}")
-        except Exception as e:
-            print(f"  CDP direct echoue: {e}")
-
-    if len(raw_log) == 0:
-        print("  AUCUNE ENTREE CAPTUREE - Le listener n'a peut-etre pas ete injecte dans le bon contexte")
-        print("  Astuce: verifier que add_init_script est applique au contexte utilise par browser-use")
-
-    # Dedupliquer par timestamp (si plusieurs pages ont capture la meme chose)
-    seen = set()
-    unique_log = []
-    for entry in raw_log:
-        ts = entry.get('timestamp')
-        if ts not in seen:
-            seen.add(ts)
-            unique_log.append(entry)
-    raw_log = sorted(unique_log, key=lambda x: x.get('timestamp', 0))
-
-    print(f"  {len(raw_log)} entrees brutes recuperees")
-
-    # Sauvegarder le log brut
-    raw_file = f"locator_log_{timestamp}.json"
-    with open(raw_file, "w", encoding="utf-8") as f:
-        json.dump(raw_log, f, indent=2, ensure_ascii=False)
-    print(f"  Log brut -> {raw_file}")
-
-    # -- ETAPE 5 : Dedupliquer les inputs --
-    deduped = dedup_log(raw_log)
-    print(f"  {len(raw_log)} -> {len(deduped)} apres deduplication")
-
-    dedup_file = f"locator_dedup_{timestamp}.json"
-    with open(dedup_file, "w", encoding="utf-8") as f:
-        json.dump(deduped, f, indent=2, ensure_ascii=False)
-    print(f"  Log deduplique -> {dedup_file}")
-
-    # -- ETAPE 6 : Afficher le resultat agent --
-    print_header("RESULTAT AGENT")
-    print(f"  {result.final_result()}")
-
-    # -- ETAPE 7 : Afficher le log deduplique --
-    print_raw_log(deduped)
-
-    # -- ETAPE 8 : Nettoyage IA --
-    if len(deduped) > 0:
-        clean_data = ai_cleanup(deduped, scenario_steps=_scenario_steps, model=model)
-
-        clean_file = f"clean_steps_{timestamp}.json"
-        with open(clean_file, "w", encoding="utf-8") as f:
-            json.dump(clean_data, f, indent=2, ensure_ascii=False)
-        print(f"\n  Parcours nettoye -> {clean_file}")
-
-        print_clean_steps(clean_data)
-
-        # -- ETAPE 9 : Sauvegarder le code Katalon --
-        katalon_code = clean_data.get('katalon_code', '')
-        if katalon_code:
-            katalon_file = f"katalon_test_{timestamp}.groovy"
-            with open(katalon_file, "w", encoding="utf-8") as f:
-                f.write(katalon_code)
-            print(f"\n  Code Katalon -> {katalon_file}")
-
-        # -- ETAPE 10 : Generer le rapport HTML --
-        if HAS_REPORT:
-            print_header("GENERATION DU RAPPORT")
-            report_path = generate_report(
-                clean_data=clean_data,
-                deduped_log=deduped,
-                agent_result=str(result.final_result()),
-                scenario_name=scenario_name,
-                scenario_url=scenario_url,
-                timestamp=timestamp,
-            )
-            print(f"  Rapport HTML -> {report_path}")
-            open_report(report_path)
-            print(f"  Rapport ouvert dans le navigateur")
-        else:
-            print("\n  report_generator.py absent, pas de rapport HTML")
     else:
-        print("\n  Aucune entree capturee, pas de nettoyage IA")
+        chromium_args.append("--start-maximized")
+    browser = await pw.chromium.launch(headless=headless, args=chromium_args)
+    try:
+        context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
+        page = context.pages[0] if context.pages else await context.new_page()
 
-    # -- CLEANUP --
-    print_header("FERMETURE")
-    await browser.close()
-    await pw.stop()
-    print("  Termine !")
+        # Forcer plein ecran via CDP
+        try:
+            cdp = await page.context.new_cdp_session(page)
+            window = await cdp.send("Browser.getWindowForTarget")
+            window_id = window["windowId"]
+            await cdp.send("Browser.setWindowBounds", {
+                "windowId": window_id,
+                "bounds": {"windowState": "maximized"}
+            })
+            print(f"  Chromium lance PLEIN ECRAN sur CDP port {cdp_port}")
+        except Exception as e:
+            print(f"  Chromium lance sur CDP port {cdp_port} (maximized via args)")
+            print(f"  CDP maximize fallback: {e}")
+
+        print(f"  Page prete : {page.url}")
+
+        # -- ETAPE 2 : Injecter le DOM Listener --
+        await context.add_init_script(DOM_LISTENER_JS)
+        await page.evaluate(DOM_LISTENER_JS)
+        print(f"  DOM Listener injecte via Playwright")
+
+        # Via CDP direct (couvre TOUS les contextes, y compris celui de browser-use)
+        try:
+            cdp_session = await browser.new_browser_cdp_session()
+            await cdp_session.send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": DOM_LISTENER_JS
+            })
+            print(f"  DOM Listener injecte via CDP (global, tous contextes)")
+        except Exception as e:
+            print(f"  Injection CDP echouee (pas critique): {e}")
+
+        # -- ETAPE 2bis : Brancher la capture observabilite (V3 phases 1 + 2) --
+        # Sessions CDP de la PAGE (pas browser-level : ces events sont per-target).
+        js_errors = []
+        console_messages = []
+        network_log = []
+        dom_mutations = {"attribute_modified": 0, "child_node_inserted": 0, "child_node_removed": 0, "first_mutation_ms": None, "last_mutation_ms": None}
+        # Index pour matcher les responses sur les requests : {requestId: index_dans_network_log}
+        _net_index = {}
+        # Filtre PIEGE 1 : on garde uniquement les types pertinents pour le QA
+        # (Fetch/XHR = API calls, Document = HTML page, WebSocket = realtime)
+        # On ignore : Image, Stylesheet, Font, Media, Other, Script (assets)
+        NETWORK_KEEP_TYPES = {"Fetch", "XHR", "Document", "WebSocket", "EventSource"}
+        try:
+            page_cdp = await page.context.new_cdp_session(page)
+            await page_cdp.send("Runtime.enable")
+            await page_cdp.send("Console.enable")
+            await page_cdp.send("Network.enable")
+
+            def on_exception(event):
+                exc = event.get("exceptionDetails", {})
+                js_errors.append({
+                    "timestamp": event.get("timestamp"),
+                    "text": exc.get("text", ""),
+                    "exception": (exc.get("exception") or {}).get("description", ""),
+                    "url": exc.get("url"),
+                    "lineNumber": exc.get("lineNumber"),
+                    "columnNumber": exc.get("columnNumber"),
+                    "stackTrace": (exc.get("stackTrace") or {}).get("callFrames", [])[:5],
+                })
+
+            def on_console(event):
+                msg = event.get("message", {})
+                console_messages.append({
+                    "level": msg.get("level"),
+                    "text": msg.get("text", "")[:500],
+                    "url": msg.get("url"),
+                    "line": msg.get("line"),
+                })
+
+            def on_request(event):
+                # Filtre par resourceType (PIEGE 1)
+                rtype = event.get("type", "")
+                if rtype not in NETWORK_KEEP_TYPES:
+                    return
+                request_id = event.get("requestId")
+                req = event.get("request", {})
+                # Header sensibles (Cookie, Authorization) -> redact
+                headers = dict(req.get("headers", {}))
+                for sensitive_header in ("Cookie", "cookie", "Authorization", "authorization"):
+                    if sensitive_header in headers:
+                        headers[sensitive_header] = "<redacted>"
+                entry = {
+                    "requestId": request_id,
+                    "type": rtype,
+                    "method": req.get("method"),
+                    "url": req.get("url"),
+                    "timestamp": event.get("timestamp"),
+                    "wallTime": event.get("wallTime"),
+                    "headers": headers,
+                    "postData": (req.get("postData") or "")[:1000] if req.get("postData") else None,
+                    "status": None,
+                    "statusText": None,
+                    "responseType": None,
+                    "duration_ms": None,
+                }
+                _net_index[request_id] = len(network_log)
+                network_log.append(entry)
+
+            def on_response(event):
+                request_id = event.get("requestId")
+                idx = _net_index.get(request_id)
+                if idx is None:
+                    return
+                resp = event.get("response", {})
+                network_log[idx]["status"] = resp.get("status")
+                network_log[idx]["statusText"] = resp.get("statusText")
+                network_log[idx]["responseType"] = resp.get("mimeType")
+
+            def on_finished(event):
+                request_id = event.get("requestId")
+                idx = _net_index.get(request_id)
+                if idx is None:
+                    return
+                start = network_log[idx].get("timestamp") or 0
+                end = event.get("timestamp") or 0
+                if start and end:
+                    network_log[idx]["duration_ms"] = round((end - start) * 1000, 1)
+
+            page_cdp.on("Runtime.exceptionThrown", on_exception)
+            page_cdp.on("Console.messageAdded", on_console)
+            page_cdp.on("Network.requestWillBeSent", on_request)
+            page_cdp.on("Network.responseReceived", on_response)
+            page_cdp.on("Network.loadingFinished", on_finished)
+            await page_cdp.send("Performance.enable")
+            # PIEGE : DOM domain doit etre enable, et on doit demander getDocument()
+            # pour amorcer le tracking des nodes. Sans ca, les events ne firent pas.
+            try:
+                import time as _time
+                _t0 = _time.monotonic()
+                def _now_ms():
+                    return int((_time.monotonic() - _t0) * 1000)
+
+                def on_attr_modified(_):
+                    dom_mutations["attribute_modified"] += 1
+                    if dom_mutations["first_mutation_ms"] is None:
+                        dom_mutations["first_mutation_ms"] = _now_ms()
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+                def on_child_inserted(_):
+                    dom_mutations["child_node_inserted"] += 1
+                    if dom_mutations["first_mutation_ms"] is None:
+                        dom_mutations["first_mutation_ms"] = _now_ms()
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+                def on_child_removed(_):
+                    dom_mutations["child_node_removed"] += 1
+                    dom_mutations["last_mutation_ms"] = _now_ms()
+
+                await page_cdp.send("DOM.enable")
+                page_cdp.on("DOM.attributeModified", on_attr_modified)
+                page_cdp.on("DOM.childNodeInserted", on_child_inserted)
+                page_cdp.on("DOM.childNodeRemoved", on_child_removed)
+            except Exception as dom_e:
+                print(f"  [WARN] DOM mutations capture echouee : {dom_e}")
+            # PIEGE 2 : Coverage doit etre active AVANT toute navigation, sinon le bundle
+            # initial est marque comme non-execute et les % sortent faussement bas.
+            # On le fait ici, avant que browser-use ait fait son premier goto.
+            coverage_enabled = False
+            try:
+                await page_cdp.send("Profiler.enable")
+                await page_cdp.send("Profiler.startPreciseCoverage", {
+                    "callCount": False,
+                    "detailed": True,
+                    "allowTriggeredUpdates": False,
+                })
+                coverage_enabled = True
+            except Exception as cov_e:
+                print(f"  [WARN] Coverage.startPreciseCoverage echouee : {cov_e}")
+            cov_str = " + Coverage" if coverage_enabled else ""
+            print(f"  Capture observabilite : Runtime + Console + Network + Performance{cov_str} (filtre {','.join(NETWORK_KEEP_TYPES)})")
+        except Exception as e:
+            print(f"  [WARN] Capture observabilite echouee : {e}")
+            page_cdp = None
+            coverage_enabled = False
+
+        # -- ETAPE 3 : Lancer browser-use via CDP --
+        print_header("LANCEMENT BROWSER-USE")
+        print(f"  Timing : min_wait={min_wait}s max_wait={max_wait}s network_idle={network_idle}s max_steps={max_steps}")
+        print(f"  Provider: {provider} -> {model}")
+        llm_kwargs = {"model": model}
+        if base_url:
+            llm_kwargs["base_url"] = base_url
+        if api_key:
+            llm_kwargs["api_key"] = api_key
+        llm = ChatOpenAI(**llm_kwargs)
+        # Construire le BrowserProfile (browser-use 0.12+) qui porte les params de timing
+        # Avant 0.12 : kwargs directement sur BrowserSession. Apres : via BrowserProfile.
+        browser_session = None
+        profile_applied = False
+
+        # Tentative 1 : via BrowserProfile (browser-use 0.12+)
+        BrowserProfile = None
+        for import_path in ("browser_use", "browser_use.browser.profile", "browser_use.browser"):
+            try:
+                module = __import__(import_path, fromlist=["BrowserProfile"])
+                BrowserProfile = getattr(module, "BrowserProfile", None)
+                if BrowserProfile:
+                    break
+            except Exception:
+                continue
+
+        if BrowserProfile:
+            try:
+                profile = BrowserProfile(
+                    minimum_wait_page_load_time=min_wait,
+                    maximum_wait_page_load_time=max_wait,
+                    wait_for_network_idle_page_load_time=network_idle,
+                )
+                browser_session = BrowserSession(
+                    cdp_url=f"http://localhost:{cdp_port}",
+                    browser_profile=profile,
+                )
+                profile_applied = True
+                print(f"  [OK] BrowserProfile applique : min={min_wait}s max={max_wait}s idle={network_idle}s")
+            except (TypeError, ValueError) as e:
+                print(f"  [WARN] BrowserProfile rejete ({e}), tentative kwargs directs...")
+
+        # Tentative 2 : kwargs directs sur BrowserSession (versions plus anciennes)
+        if browser_session is None:
+            try:
+                browser_session = BrowserSession(
+                    cdp_url=f"http://localhost:{cdp_port}",
+                    minimum_wait_page_load_time=min_wait,
+                    maximum_wait_page_load_time=max_wait,
+                    wait_for_network_idle_page_load_time=network_idle,
+                )
+                profile_applied = True
+                print(f"  [OK] BrowserSession kwargs directs appliques : min={min_wait}s max={max_wait}s")
+            except TypeError as e:
+                print(f"  [WARN] Aucun mecanisme de timing supporte ({e}), defauts browser-use utilises (0.5s/2s)")
+                browser_session = BrowserSession(cdp_url=f"http://localhost:{cdp_port}")
+
+        if not profile_applied:
+            print(f"  [INFO] Les SPA lourdes (DuckDuckGo, Twitter...) risquent d'echouer sans timing custom")
+
+        agent_kwargs = {
+            "task": task,
+            "llm": llm,
+            "browser_session": browser_session,
+            "use_vision": use_vision,
+        }
+        try:
+            agent = Agent(**agent_kwargs)
+        except TypeError:
+            # Version de browser-use sans support use_vision -> fallback
+            agent_kwargs.pop("use_vision", None)
+            agent = Agent(**agent_kwargs)
+
+        # -- Snapshot Performance AVANT le run (V3 phase 4) --
+        perf_before = {}
+        perf_after = {}
+        if 'page_cdp' in locals() and page_cdp:
+            try:
+                resp = await page_cdp.send("Performance.getMetrics")
+                perf_before = {m["name"]: m["value"] for m in resp.get("metrics", [])}
+            except Exception as e:
+                print(f"  [WARN] Performance.getMetrics avant : {e}")
+
+        try:
+            result = await agent.run(max_steps=max_steps)
+        except TypeError:
+            # Fallback : agent.run sans max_steps
+            result = await agent.run()
+
+        # -- Snapshot Performance APRES le run --
+        if 'page_cdp' in locals() and page_cdp:
+            try:
+                resp = await page_cdp.send("Performance.getMetrics")
+                perf_after = {m["name"]: m["value"] for m in resp.get("metrics", [])}
+            except Exception as e:
+                print(f"  [WARN] Performance.getMetrics apres : {e}")
+
+        # -- Take Coverage APRES le run (V3 phase 5) --
+        coverage_summary = None
+        if 'page_cdp' in locals() and page_cdp and 'coverage_enabled' in locals() and coverage_enabled:
+            try:
+                cov_resp = await page_cdp.send("Profiler.takePreciseCoverage")
+                # Calcule % couverture par script
+                scripts = cov_resp.get("result", [])
+                summary = []
+                total_used = 0
+                total_size = 0
+                for s in scripts:
+                    url = s.get("url", "")
+                    # Skip extensions chrome:// et about:blank
+                    if not url or url.startswith(("chrome://", "chrome-extension://", "about:")):
+                        continue
+                    used = 0
+                    size = 0
+                    for fn in s.get("functions", []):
+                        for r in fn.get("ranges", []):
+                            length = r.get("endOffset", 0) - r.get("startOffset", 0)
+                            size += length
+                            if r.get("count", 0) > 0:
+                                used += length
+                    if size > 0:
+                        summary.append({
+                            "url": url[:200],
+                            "size": size,
+                            "used": used,
+                            "pct": round(used * 100 / size, 1),
+                        })
+                        total_used += used
+                        total_size += size
+                summary.sort(key=lambda x: -x["size"])
+                coverage_summary = {
+                    "total_size": total_size,
+                    "total_used": total_used,
+                    "total_pct": round(total_used * 100 / total_size, 1) if total_size else 0,
+                    "scripts": summary[:50],  # top 50 par taille
+                }
+                await page_cdp.send("Profiler.stopPreciseCoverage")
+                print(f"  Coverage : {coverage_summary['total_pct']}% du JS execute ({total_used // 1024} KB / {total_size // 1024} KB sur {len(summary)} scripts)")
+            except Exception as e:
+                print(f"  [WARN] Profiler.takePreciseCoverage : {e}")
+
+        # -- ETAPE 4 : Recuperer le log brut --
+        print_header("RECUPERATION DES LOCATEURS")
+        raw_log = []
+
+        # Methode 1 : Via le contexte browser-use (CDP)
+        try:
+            bu_context = agent.browser_session.context
+            if bu_context:
+                for p in bu_context.pages:
+                    try:
+                        log = await p.evaluate(
+                            "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
+                        )
+                        if log:
+                            raw_log.extend(log)
+                            print(f"  {len(log)} entrees via contexte browser-use (page: {p.url[:60]})")
+                    except Exception as e:
+                        print(f"  Page browser-use inaccessible: {e}")
+                        continue
+        except Exception as e:
+            print(f"  Contexte browser-use non accessible: {e}")
+
+        # Methode 2 : Via notre contexte Playwright original (fallback)
+        if len(raw_log) == 0:
+            print("  Fallback: tentative via contexte Playwright original...")
+            try:
+                for p in context.pages:
+                    try:
+                        log = await p.evaluate(
+                            "JSON.parse(localStorage.getItem('__qaLocatorLog') || '[]')"
+                        )
+                        if log:
+                            raw_log.extend(log)
+                            print(f"  {len(log)} entrees via Playwright (page: {p.url[:60]})")
+                    except Exception:
+                        continue
+            except Exception as e:
+                print(f"  Contexte Playwright non accessible: {e}")
+
+        # Methode 3 : Via CDP direct (dernier recours)
+        if len(raw_log) == 0:
+            print("  Fallback 2: tentative via CDP direct...")
+            try:
+                cdp = await browser.new_browser_cdp_session()
+                targets = await cdp.send("Target.getTargets")
+                for target in targets.get("targetInfos", []):
+                    if target.get("type") == "page":
+                        print(f"  CDP target trouve: {target.get('url', 'N/A')[:60]}")
+            except Exception as e:
+                print(f"  CDP direct echoue: {e}")
+
+        if len(raw_log) == 0:
+            print("  AUCUNE ENTREE CAPTUREE - Le listener n'a peut-etre pas ete injecte dans le bon contexte")
+            print("  Astuce: verifier que add_init_script est applique au contexte utilise par browser-use")
+
+        # Dedupliquer par timestamp (si plusieurs pages ont capture la meme chose)
+        seen = set()
+        unique_log = []
+        for entry in raw_log:
+            ts = entry.get('timestamp')
+            if ts not in seen:
+                seen.add(ts)
+                unique_log.append(entry)
+        raw_log = sorted(unique_log, key=lambda x: x.get('timestamp', 0))
+
+        print(f"  {len(raw_log)} entrees brutes recuperees")
+
+        # Sauvegarder le log brut (dans le dossier du run)
+        raw_file = output_dir / "locator_log.json"
+        raw_file.write_text(json.dumps(raw_log, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  Log brut -> {raw_file}")
+
+        # -- ETAPE 5 : Dedupliquer les inputs --
+        deduped = dedup_log(raw_log)
+        print(f"  {len(raw_log)} -> {len(deduped)} apres deduplication")
+
+        dedup_file = output_dir / "locator_dedup.json"
+        dedup_file.write_text(json.dumps(deduped, indent=2, ensure_ascii=False), encoding="utf-8")
+        print(f"  Log deduplique -> {dedup_file}")
+
+        # -- ETAPE 6 : Afficher le resultat agent --
+        print_header("RESULTAT AGENT")
+        print(f"  {result.final_result()}")
+
+        # -- ETAPE 7 : Afficher le log deduplique --
+        print_raw_log(deduped)
+
+        # -- ETAPE 8 : Nettoyage IA --
+        if len(deduped) > 0:
+            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format, network_log=network_log if 'network_log' in locals() else None)
+
+            clean_file = output_dir / "clean_steps.json"
+            clean_file.write_text(json.dumps(clean_data, indent=2, ensure_ascii=False), encoding="utf-8")
+            print(f"\n  Parcours nettoye -> {clean_file}")
+
+            print_clean_steps(clean_data)
+
+            # -- ETAPE 9 : Sauvegarder le code de test (Katalon/Playwright/Cypress/Selenium) --
+            generated_code = clean_data.get('katalon_code', '')
+            if generated_code:
+                fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
+                code_file = output_dir / f"test_{output_format}{fmt_info['extension']}"
+                code_file.write_text(generated_code, encoding="utf-8")
+                print(f"\n  Code {fmt_info['label']} -> {code_file}")
+
+            # -- ETAPE 10 : Generer le rapport HTML --
+            if HAS_REPORT:
+                print_header("GENERATION DU RAPPORT")
+                report_path = generate_report(
+                    clean_data=clean_data,
+                    deduped_log=deduped,
+                    agent_result=str(result.final_result()),
+                    scenario_name=scenario_name,
+                    scenario_url=scenario_url,
+                    timestamp=timestamp,
+                    output_dir=str(output_dir),
+                    js_errors=js_errors if 'js_errors' in locals() else [],
+                    console_messages=console_messages if 'console_messages' in locals() else [],
+                    network_log=network_log if 'network_log' in locals() else [],
+                    perf_before=perf_before if 'perf_before' in locals() else {},
+                    perf_after=perf_after if 'perf_after' in locals() else {},
+                    coverage_summary=coverage_summary if 'coverage_summary' in locals() else None,
+                    dom_mutations=dom_mutations if 'dom_mutations' in locals() else {},
+                )
+                print(f"  Rapport HTML -> {report_path}")
+                if should_open_report:
+                    open_report(report_path)
+                    print(f"  Rapport ouvert dans le navigateur")
+                else:
+                    print(f"  (ouverture auto desactivee, --no-open-report)")
+            else:
+                print("\n  report_generator.py absent, pas de rapport HTML")
+        else:
+            print("\n  Aucune entree capturee, pas de nettoyage IA")
+
+        # -- ETAPE 10bis : Sauvegarder les captures observabilite (V3 phases 1+2) --
+        try:
+            if 'js_errors' in locals():
+                (output_dir / "js_errors.json").write_text(
+                    json.dumps(js_errors, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                if js_errors:
+                    print(f"\n  JS Errors silencieux captures : {len(js_errors)} -> js_errors.json")
+            if 'console_messages' in locals():
+                (output_dir / "console_messages.json").write_text(
+                    json.dumps(console_messages, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                console_warns = sum(1 for m in console_messages if m.get("level") == "warning")
+                console_errs = sum(1 for m in console_messages if m.get("level") == "error")
+                if console_messages:
+                    print(f"  Console : {len(console_messages)} messages ({console_errs} errors, {console_warns} warnings)")
+            if 'network_log' in locals():
+                (output_dir / "network_log.json").write_text(
+                    json.dumps(network_log, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                if network_log:
+                    api_calls = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
+                    fail_calls = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
+                    print(f"  Network : {len(network_log)} requetes filtrees ({api_calls} API, {fail_calls} >=400)")
+            if 'coverage_summary' in locals() and coverage_summary:
+                (output_dir / "coverage.json").write_text(
+                    json.dumps(coverage_summary, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+            if 'dom_mutations' in locals():
+                total_mut = sum(v for k, v in dom_mutations.items() if isinstance(v, int) and not k.endswith("_ms"))
+                if total_mut > 0:
+                    (output_dir / "dom_mutations.json").write_text(
+                        json.dumps(dom_mutations, indent=2, ensure_ascii=False), encoding="utf-8"
+                    )
+                    print(f"  DOM mutations : {dom_mutations['attribute_modified']} attr, {dom_mutations['child_node_inserted']} insert, {dom_mutations['child_node_removed']} remove")
+            if 'perf_before' in locals() and 'perf_after' in locals():
+                # Calcule delta sur les metriques cles
+                perf_delta = {
+                    k: round(perf_after.get(k, 0) - perf_before.get(k, 0), 2)
+                    for k in perf_after.keys()
+                }
+                perf_report = {
+                    "before": perf_before,
+                    "after": perf_after,
+                    "delta": perf_delta,
+                }
+                (output_dir / "performance.json").write_text(
+                    json.dumps(perf_report, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                heap_delta_mb = round(perf_delta.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+                print(f"  Performance : heap delta {heap_delta_mb:+}MB, layouts={int(perf_delta.get('LayoutCount', 0))}, nodes={int(perf_delta.get('Nodes', 0))}")
+        except Exception as e:
+            print(f"  [WARN] Sauvegarde observabilite echouee : {e}")
+
+        # -- ETAPE 11 : Ecrire meta.json (alimente l'historique du serveur web) --
+        try:
+            meta = {
+                "timestamp": timestamp,
+                "started_at": started_at,
+                "ended_at": datetime.now().isoformat(),
+                "scenario_name": scenario_name,
+                "scenario_url": scenario_url,
+                "task": task,
+                "output_format": output_format,
+                "provider": provider,
+                "model": model,
+                "headless": headless,
+                "use_vision": use_vision,
+                "agent_result": str(result.final_result()) if 'result' in locals() and result else None,
+                "raw_count": len(raw_log),
+                "deduped_count": len(deduped) if 'deduped' in locals() else 0,
+                "report": f"qa_report_{timestamp}.html" if (output_dir / f"qa_report_{timestamp}.html").exists() else None,
+                "js_errors_count": len(js_errors) if 'js_errors' in locals() else 0,
+                "console_errors_count": sum(1 for m in console_messages if m.get("level") == "error") if 'console_messages' in locals() else 0,
+                "console_warnings_count": sum(1 for m in console_messages if m.get("level") == "warning") if 'console_messages' in locals() else 0,
+                "network_count": len(network_log) if 'network_log' in locals() else 0,
+                "network_api_count": sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR")) if 'network_log' in locals() else 0,
+                "network_fail_count": sum(1 for r in network_log if (r.get("status") or 0) >= 400) if 'network_log' in locals() else 0,
+                "perf_heap_delta_mb": round((perf_after.get("JSHeapUsedSize", 0) - perf_before.get("JSHeapUsedSize", 0)) / 1024 / 1024, 2) if 'perf_after' in locals() and 'perf_before' in locals() else None,
+                "perf_layout_count": int(perf_after.get("LayoutCount", 0)) if 'perf_after' in locals() else None,
+                "perf_nodes": int(perf_after.get("Nodes", 0)) if 'perf_after' in locals() else None,
+                "coverage_pct": coverage_summary["total_pct"] if 'coverage_summary' in locals() and coverage_summary else None,
+                "coverage_used_kb": coverage_summary["total_used"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
+                "coverage_total_kb": coverage_summary["total_size"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
+                "dom_mutations_total": (dom_mutations["attribute_modified"] + dom_mutations["child_node_inserted"] + dom_mutations["child_node_removed"]) if 'dom_mutations' in locals() else 0,
+                "status": "success",
+            }
+            (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print(f"  [WARN] Impossible d'ecrire meta.json: {e}")
+
+    finally:
+        # -- CLEANUP : garantit la fermeture meme en cas d'exception --
+        print_header("FERMETURE")
+        try:
+            await browser.close()
+        except Exception as e:
+            print(f"  Erreur fermeture browser: {e}")
+        await pw.stop()
+        print("  Termine !")
 
 
 if __name__ == "__main__":
-    task, model, port, scenario_name, scenario_url, scenario_steps = resolve_task()
-    asyncio.run(run(task, model, port, scenario_name, scenario_url, scenario_steps))
+    _patch_browser_use()
+    task, model, port, scenario_name, scenario_url, scenario_steps, timing_opts = resolve_task()
+    asyncio.run(run(task, model, port, scenario_name, scenario_url, scenario_steps, timing_opts))

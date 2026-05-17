@@ -14,11 +14,14 @@ from datetime import datetime
 from collections import Counter
 
 
-def generate_report(clean_data, deduped_log, agent_result, scenario_name="", 
-                    scenario_url="", timestamp=None, output_dir="."):
+def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
+                    scenario_url="", timestamp=None, output_dir=".",
+                    js_errors=None, console_messages=None, network_log=None,
+                    perf_before=None, perf_after=None, coverage_summary=None,
+                    dom_mutations=None):
     """
     Genere un rapport HTML complet depuis les donnees du run.
-    
+
     Args:
         clean_data: dict issu du cleanup IA (clean_steps_*.json)
         deduped_log: list des entrees dedupliquees (locator_dedup_*.json)
@@ -27,10 +30,19 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         scenario_url: URL de depart
         timestamp: timestamp du run (format YYYYMMDD_HHMMSS)
         output_dir: dossier de sortie
-    
+        js_errors: list de Runtime.exceptionThrown captures (V3 phase 1)
+        console_messages: list de Console.messageAdded captures (V3 phase 1)
+
     Returns:
         filepath: chemin du rapport genere
     """
+    js_errors = js_errors or []
+    console_messages = console_messages or []
+    network_log = network_log or []
+    perf_before = perf_before or {}
+    perf_after = perf_after or {}
+    coverage_summary = coverage_summary or None
+    dom_mutations = dom_mutations or {}
     if timestamp is None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -161,6 +173,302 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <div class="card">
             <h2>Code Katalon Studio (Groovy)</h2>
             <pre class="code-block"><code>{escaped_code}</code></pre>
+        </div>"""
+
+    # --- DOM mutations (V3 phase 6) ---
+    dom_html = ""
+    total_mut = (dom_mutations.get("attribute_modified", 0)
+                 + dom_mutations.get("child_node_inserted", 0)
+                 + dom_mutations.get("child_node_removed", 0))
+    if total_mut > 0:
+        first_ms = dom_mutations.get("first_mutation_ms") or 0
+        last_ms = dom_mutations.get("last_mutation_ms") or 0
+        active_window_s = round((last_ms - first_ms) / 1000, 1) if last_ms > first_ms else 0
+        rate = round(total_mut / active_window_s, 1) if active_window_s > 0 else 0
+        # Page "stable" si le rythme moyen est < 5 mutations/s sur la fenetre active
+        rate_color = "#3fb950" if rate < 5 else ("#d29922" if rate < 20 else "#f85149")
+        dom_html = f"""
+        <div class="card">
+            <h2>DOM mutations</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>DOM.attributeModified</code> + <code>childNodeInserted</code>
+                + <code>childNodeRemoved</code>. Indique le rythme d'activite du DOM pendant le
+                parcours - utile pour detecter les pages instables (animation infinie, polling
+                long-poll, framework qui re-render en boucle).
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value">{total_mut:,}</div>
+                    <div class="kpi-label">Mutations totales</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{dom_mutations.get('attribute_modified', 0):,}</div>
+                    <div class="kpi-label">Attributs modifies</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#58a6ff">{dom_mutations.get('child_node_inserted', 0):,}</div>
+                    <div class="kpi-label">Noeuds inseres</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{dom_mutations.get('child_node_removed', 0):,}</div>
+                    <div class="kpi-label">Noeuds supprimes</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{rate_color}">{rate}</div>
+                    <div class="kpi-label">Mutations/s moyennes</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{active_window_s}s</div>
+                    <div class="kpi-label">Fenetre active</div>
+                </div>
+            </div>
+        </div>"""
+
+    # --- Coverage (V3 phase 5) ---
+    coverage_html = ""
+    if coverage_summary and coverage_summary.get("total_size", 0) > 0:
+        pct = coverage_summary.get("total_pct", 0)
+        used_kb = coverage_summary.get("total_used", 0) // 1024
+        total_kb = coverage_summary.get("total_size", 0) // 1024
+        unused_kb = total_kb - used_kb
+        pct_color = "#3fb950" if pct > 60 else ("#d29922" if pct > 30 else "#f85149")
+
+        cov_rows = ""
+        for s in coverage_summary.get("scripts", [])[:30]:
+            url_short = (s.get("url") or "").rsplit("/", 1)[-1][:60] or "(inline)"
+            size_kb = s.get("size", 0) // 1024
+            used_kb_s = s.get("used", 0) // 1024
+            spct = s.get("pct", 0)
+            spct_color = "#3fb950" if spct > 60 else ("#d29922" if spct > 30 else "#f85149")
+            cov_rows += f"""
+            <tr>
+              <td><code style="font-size:11px;">{(s.get('url') or '').replace('<','').replace('>','')[:100]}</code></td>
+              <td>{size_kb} KB</td>
+              <td>{used_kb_s} KB</td>
+              <td style="color:{spct_color};font-weight:600;">{spct}%</td>
+            </tr>"""
+
+        coverage_html = f"""
+        <div class="card">
+            <h2>Coverage JS du parcours</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>Profiler.startPreciseCoverage</code> activee AVANT toute
+                navigation (sinon le bundle initial est marque comme non-execute, faussant les %).
+                Indique quelle proportion du JS charge a ete reellement executee pendant le parcours.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{pct_color}">{pct}%</div>
+                    <div class="kpi-label">Code execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{used_kb} KB</div>
+                    <div class="kpi-label">JS execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{unused_kb} KB</div>
+                    <div class="kpi-label">JS non execute (dead)</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{len(coverage_summary.get('scripts', []))}</div>
+                    <div class="kpi-label">Scripts charges</div>
+                </div>
+            </div>
+            <h3>Top 30 scripts par taille</h3>
+            <div class="table-wrap"><table><thead><tr><th>URL</th><th>Taille</th><th>Execute</th><th>%</th></tr></thead><tbody>{cov_rows}</tbody></table></div>
+        </div>"""
+
+    # --- Performance metrics (V3 phase 4) ---
+    perf_html = ""
+    if perf_after:
+        heap_before_mb = round(perf_before.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+        heap_after_mb = round(perf_after.get("JSHeapUsedSize", 0) / 1024 / 1024, 2)
+        heap_delta = round(heap_after_mb - heap_before_mb, 2)
+        nodes_before = int(perf_before.get("Nodes", 0))
+        nodes_after = int(perf_after.get("Nodes", 0))
+        layout_count = int(perf_after.get("LayoutCount", 0)) - int(perf_before.get("LayoutCount", 0))
+        recalc_count = int(perf_after.get("RecalcStyleCount", 0)) - int(perf_before.get("RecalcStyleCount", 0))
+        script_duration = round(perf_after.get("ScriptDuration", 0) - perf_before.get("ScriptDuration", 0), 3)
+        layout_duration = round(perf_after.get("LayoutDuration", 0) - perf_before.get("LayoutDuration", 0), 3)
+
+        # Couleur selon seuils
+        heap_color = "#f85149" if heap_delta > 50 else ("#d29922" if heap_delta > 10 else "#3fb950")
+        layout_color = "#f85149" if layout_count > 100 else ("#d29922" if layout_count > 30 else "#3fb950")
+
+        perf_html = f"""
+        <div class="card">
+            <h2>Performance metrics</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Snapshot via CDP <code>Performance.getMetrics</code> avant et apres le parcours.
+                Le delta indique la croissance du runtime pendant l'execution.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{heap_color}">{heap_delta:+} MB</div>
+                    <div class="kpi-label">Heap delta</div>
+                    <div style="font-size:10px;color:#6e7681;margin-top:4px">
+                        {heap_before_mb} MB -&gt; {heap_after_mb} MB
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{nodes_after:,}</div>
+                    <div class="kpi-label">DOM nodes (final)</div>
+                    <div style="font-size:10px;color:#6e7681;margin-top:4px">
+                        {nodes_before:,} -&gt; {nodes_after:,}
+                    </div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{layout_color}">{layout_count}</div>
+                    <div class="kpi-label">Layouts forces</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{recalc_count}</div>
+                    <div class="kpi-label">Recalc styles</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{script_duration}s</div>
+                    <div class="kpi-label">JS execute</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value">{layout_duration}s</div>
+                    <div class="kpi-label">Layout time</div>
+                </div>
+            </div>
+        </div>"""
+
+    # --- Network audit (V3 phase 2) ---
+    def _esc_html(s):
+        return (str(s or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+    network_html = ""
+    if network_log:
+        api_count = sum(1 for r in network_log if r.get("type") in ("Fetch", "XHR"))
+        fail_count = sum(1 for r in network_log if (r.get("status") or 0) >= 400)
+        # Domaines tiers (different de l'origine principale)
+        from urllib.parse import urlparse
+        origin_domain = ""
+        for r in network_log:
+            if r.get("type") == "Document" and r.get("url"):
+                try:
+                    origin_domain = urlparse(r["url"]).netloc
+                    break
+                except Exception:
+                    pass
+        third_parties = {}
+        for r in network_log:
+            try:
+                d = urlparse(r.get("url", "")).netloc
+                if d and d != origin_domain:
+                    third_parties[d] = third_parties.get(d, 0) + 1
+            except Exception:
+                pass
+        third_party_rows = "".join(
+            f"<tr><td><code>{_esc_html(d)}</code></td><td>{c}</td></tr>"
+            for d, c in sorted(third_parties.items(), key=lambda x: -x[1])[:30]
+        )
+
+        net_rows = ""
+        for r in network_log[:100]:
+            status = r.get("status")
+            status_cls = "status-success" if status and status < 400 else ("status-fail" if status else "status-warning")
+            method_cls = "status-success" if r.get("method") == "GET" else "status-warning"
+            net_rows += f"""
+            <tr>
+              <td><span class="status-badge {method_cls}">{_esc_html(r.get('method', '?'))}</span></td>
+              <td><span class="status-badge {status_cls}">{status if status else '...'}</span></td>
+              <td><code style="font-size:11px;">{_esc_html((r.get('url') or '')[:100])}</code></td>
+              <td><small>{_esc_html(r.get('type', ''))}</small></td>
+              <td><small>{r.get('duration_ms', '?')} ms</small></td>
+            </tr>"""
+
+        network_html = f"""
+        <div class="card">
+            <h2>Network audit</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture <code>Network.requestWillBeSent</code> / <code>Network.responseReceived</code>
+                / <code>Network.loadingFinished</code> sur la page testee. Filtre {','.join(['Fetch','XHR','Document','WebSocket','EventSource'])}
+                (les assets images/css/fonts/scripts sont ignores). Headers <code>Cookie</code> et
+                <code>Authorization</code> sont redactes pour confidentialite.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value">{len(network_log)}</div>
+                    <div class="kpi-label">Requetes capturees</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#58a6ff">{api_count}</div>
+                    <div class="kpi-label">API calls (Fetch/XHR)</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if fail_count else '#3fb950'}">{fail_count}</div>
+                    <div class="kpi-label">Erreurs >=400</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:#d29922">{len(third_parties)}</div>
+                    <div class="kpi-label">Domaines tiers</div>
+                </div>
+            </div>
+            {f'<h3>Domaines tiers contactes (audit RGPD/privacy)</h3><div class="table-wrap"><table><thead><tr><th>Domaine</th><th>Requetes</th></tr></thead><tbody>{third_party_rows}</tbody></table></div>' if third_party_rows else ''}
+            <h3>Requetes detaillees ({min(len(network_log), 100)}/{len(network_log)})</h3>
+            <div class="table-wrap"><table><thead><tr><th>Method</th><th>Status</th><th>URL</th><th>Type</th><th>Duree</th></tr></thead><tbody>{net_rows}</tbody></table></div>
+        </div>"""
+
+    # --- Observabilite (V3 phase 1) ---
+    observability_html = ""
+    js_err_count = len(js_errors)
+    console_err_count = sum(1 for m in console_messages if m.get("level") == "error")
+    console_warn_count = sum(1 for m in console_messages if m.get("level") == "warning")
+    if js_err_count or console_err_count or console_warn_count:
+        def _esc(s):
+            return (str(s or "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+
+        js_rows = ""
+        for e in js_errors[:50]:
+            stack_top = ""
+            if e.get("stackTrace"):
+                fr = e["stackTrace"][0]
+                stack_top = f"{_esc(fr.get('functionName') or '?')} at {_esc(fr.get('url', '')[:80])}:{fr.get('lineNumber', '?')}"
+            js_rows += f"""
+            <tr>
+              <td><span class="status-badge status-fail">{_esc(e.get('text', '')[:120])}</span></td>
+              <td><code>{_esc(e.get('exception', '')[:200])}</code></td>
+              <td><small>{stack_top}</small></td>
+            </tr>"""
+
+        console_rows = ""
+        for m in console_messages[:50]:
+            level = m.get("level") or "log"
+            badge_cls = "status-fail" if level == "error" else ("status-warning" if level == "warning" else "status-success")
+            console_rows += f"""
+            <tr>
+              <td><span class="status-badge {badge_cls}">{_esc(level)}</span></td>
+              <td>{_esc(m.get('text', '')[:200])}</td>
+              <td><small>{_esc(m.get('url', '')[:60])}{':' + str(m['line']) if m.get('line') else ''}</small></td>
+            </tr>"""
+
+        observability_html = f"""
+        <div class="card">
+            <h2>Observabilite : Console + JS Errors</h2>
+            <p style="color:#8b949e; font-size:13px;">
+                Capture via CDP <code>Runtime.exceptionThrown</code> et <code>Console.messageAdded</code>.
+                Ces events sont normalement invisibles a l'utilisateur QA mais signalent des bugs JS reels.
+            </p>
+            <div class="kpis" style="margin-bottom:20px;">
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if js_err_count else '#3fb950'}">{js_err_count}</div>
+                    <div class="kpi-label">JS Errors silencieux</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#f85149' if console_err_count else '#3fb950'}">{console_err_count}</div>
+                    <div class="kpi-label">Console errors</div>
+                </div>
+                <div class="kpi">
+                    <div class="kpi-value" style="color:{'#d29922' if console_warn_count else '#3fb950'}">{console_warn_count}</div>
+                    <div class="kpi-label">Console warnings</div>
+                </div>
+            </div>
+            {f'<h3 style="margin-top:0">JS Exceptions ({js_err_count})</h3><div class="table-wrap"><table><thead><tr><th>Texte</th><th>Exception</th><th>Stack top</th></tr></thead><tbody>{js_rows}</tbody></table></div>' if js_rows else ''}
+            {f'<h3>Console messages ({len(console_messages)})</h3><div class="table-wrap"><table><thead><tr><th>Niveau</th><th>Message</th><th>Source</th></tr></thead><tbody>{console_rows}</tbody></table></div>' if console_rows else ''}
         </div>"""
 
     # --- Deduped log details ---
@@ -581,6 +889,21 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                 </tbody>
             </table>
         </div>
+
+        <!-- Performance metrics (V3 phase 4) -->
+        {perf_html}
+
+        <!-- DOM mutations (V3 phase 6) -->
+        {dom_html}
+
+        <!-- Coverage JS (V3 phase 5) -->
+        {coverage_html}
+
+        <!-- Network audit (V3 phase 2) -->
+        {network_html}
+
+        <!-- Observabilite Console + JS (V3 phase 1) -->
+        {observability_html}
 
         <!-- Code Katalon -->
         {katalon_html}
