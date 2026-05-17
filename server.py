@@ -140,6 +140,19 @@ async def index():
     return HTMLResponse(html_path.read_text(encoding="utf-8"))
 
 
+@app.get("/health")
+async def health():
+    """Health check pour reverse proxy (Caddy) + sondes K8s liveness/readiness."""
+    active = sum(1 for r in RUNS.values() if r.get("proc") and r["proc"].poll() is None)
+    return {
+        "status": "ok",
+        "active_runs": active,
+        "total_runs_inmem": len(RUNS),
+        "screencast_hubs": len(SCREENCAST_HUBS),
+        "auth_enabled": API_TOKEN is not None,
+    }
+
+
 @app.get("/api/formats")
 async def list_formats():
     """Retourne les formats de sortie supportes (cache en memoire)"""

@@ -1,0 +1,208 @@
+# =======================================================================
+# DOMAutopsy - Caddyfile exemple
+# =======================================================================
+# Adapte selon ton domaine + ton mode (public Let's Encrypt / interne CA).
+# Couvre les 4 endpoints critiques :
+#  - HTTP/HTTPS standard pour l'UI principale + API
+#  - WebSocket upgrade pour /ws/logs/* et /ws/screen/* (sinon le screencast
+#    et le live log meurent silencieusement derriere un proxy mal configure)
+#  - Multipart upload sans limite trop basse pour /api/import
+#  - /health pour les sondes K8s/Caddy
+# =======================================================================
+
+{
+	order rate_limit before basicauth
+
+	# CA interne pour les domaines locaux/VPN (qaopslab.local, tailscale, etc.)
+	pki {
+		ca local {
+			intermediate_lifetime 2160h
+		}
+	}
+}
+
+# =======================================================================
+# Mode 1 : exposition publique HTTPS (Let's Encrypt auto)
+# =======================================================================
+domautopsy.example.com {
+
+	# Rate limit global (eviter les scans / DDoS basique)
+	rate_limit {
+		zone domautopsy {
+			key {http.request.remote.host}
+			events 500
+			window 1m
+		}
+	}
+
+	# Headers de securite
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		X-XSS-Protection "1; mode=block"
+		Referrer-Policy "no-referrer"
+		Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=()"
+		# CSP permissive pour Chart.js (CDN) + WebSocket self
+		Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self' wss: ws:; frame-ancestors 'self';"
+		-Server
+		-X-Powered-By
+	}
+
+	# Blocage des chemins sensibles / scans
+	@blocked {
+		path /.git/* /.env* /admin* /phpmyadmin* /wp-admin*
+		path *.py *.pyc *.db *.sqlite
+		path /runs/* /__pycache__/*
+	}
+	respond @blocked 404
+
+	# Health check Caddy + K8s
+	handle /health {
+		reverse_proxy 127.0.0.1:8000
+	}
+
+	# CRITIQUE : WebSocket upgrade pour /ws/* (sinon screencast + live log
+	# meurent en silence apres handshake)
+	@websockets {
+		path /ws/*
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	reverse_proxy @websockets 127.0.0.1:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		header_up Connection {http.request.header.Connection}
+		header_up Upgrade {http.request.header.Upgrade}
+		# WebSocket peut etre long - pas de timeout
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	# Routes API et page CI publique
+	@app {
+		path /api/*
+		path /ci/*
+		path /web/*
+		path /health
+		path /
+	}
+	reverse_proxy @app 127.0.0.1:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		# Upload script peut etre gros (max 500KB cote serveur, marge confort)
+		transport http {
+			read_buffer 4096
+			max_response_header 16384
+		}
+	}
+
+	# Log Caddy
+	log {
+		output file ./logs/caddy/domautopsy_access.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		format json
+		level INFO
+	}
+}
+
+
+# =======================================================================
+# Mode 2 : usage interne via VPN/Tailscale, CA locale, TLS 30 jours
+# =======================================================================
+qaopslab.local {
+
+	# Restreint a localhost / VPN
+	@not_local {
+		not remote_ip 127.0.0.1 ::1 100.64.0.0/10
+	}
+	respond @not_local 403 {
+		body "Access Denied - VPN/localhost only"
+		close
+	}
+
+	header {
+		Strict-Transport-Security "max-age=63072000; includeSubDomains; preload"
+		X-Frame-Options "SAMEORIGIN"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# WebSocket upgrade
+	@websockets {
+		path /ws/*
+		header Connection *Upgrade*
+		header Upgrade websocket
+	}
+	reverse_proxy @websockets 127.0.0.1:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		header_up Connection {http.request.header.Connection}
+		header_up Upgrade {http.request.header.Upgrade}
+		transport http {
+			read_timeout 0
+		}
+	}
+
+	# Reste
+	reverse_proxy 127.0.0.1:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+	}
+
+	# TLS interne 30 jours auto-renewal
+	tls {
+		issuer internal {
+			ca local
+			lifetime 720h
+		}
+		protocols tls1.3
+	}
+
+	log {
+		output file ./logs/caddy/domautopsy_internal.log {
+			roll_size 50mb
+			roll_keep 5
+		}
+		format json
+		level INFO
+	}
+}
+
+
+# =======================================================================
+# Notes deploiement :
+#
+# 1. Avant d'utiliser ce Caddyfile, configure cote DOMAutopsy :
+#    - .env :
+#        DOMAUTOPSY_API_TOKEN=<32+ chars random>  # pour bearer auth
+#        OPENAI_API_KEY=sk-...
+#        DOMAUTOPSY_SCREENCAST_EVERY_N=3          # ~10fps si bandwidth limite
+#        DOMAUTOPSY_SCREENCAST_QUALITY=50         # plus bas = plus leger
+#
+#    - python server.py --host 0.0.0.0 --port 8000   # bind sur 0.0.0.0
+#
+# 2. Caddy ecoute 80/443 et reverse-proxy vers localhost:8000 :
+#    sudo caddy run --config Caddyfile
+#
+# 3. Pour la PUBLIC exposition :
+#    - Remplace 'domautopsy.example.com' par ton vrai domaine
+#    - Caddy obtient Let's Encrypt automatiquement
+#    - Tous les WS deviennent wss:// transparemment cote client
+#
+# 4. Pour l'INTERNE (VPN/Tailscale) :
+#    - Utilise le bloc 'qaopslab.local' adapte avec ton domaine local
+#    - La CA interne signe les certs, ajoute ./caddy/data/.../ca.crt aux
+#      machines clientes (sinon warning navigateur)
+#
+# 5. Verification rapide apres demarrage :
+#    curl https://domautopsy.example.com/health
+#    -> {"status":"ok",...} = OK
+#
+#    websocat wss://domautopsy.example.com/ws/logs/<run-id>
+#    -> reception des messages JSON = WS OK
+# =======================================================================
