@@ -136,6 +136,50 @@ async function openRunCode(runId) {
   }
 }
 
+async function launchPlaywrightSuite() {
+  const projectDir = $("#pwProjectDir").value.trim();
+  const target = $("#pwTarget").value.trim() || null;
+  const argsRaw = $("#pwArgs").value.trim() || null;
+  if (!projectDir) {
+    alert("Renseigne le chemin du projet Playwright (absolu)");
+    return;
+  }
+  closeSockets();
+  logBox.textContent = "";
+  reportBtn.disabled = true;
+  codeBtn.disabled = true;
+  canvasEmpty.style.display = "block";
+  canvasEmpty.textContent = "Lancement npx playwright test...";
+  try {
+    const resp = await fetch("/api/playwright/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        project_dir: projectDir,
+        target: target,
+        args: argsRaw,
+        headless: true,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
+      throw new Error(err.detail || "Erreur");
+    }
+    const { run_id, cmd } = await resp.json();
+    currentRunId = run_id;
+    setRunActive(run_id, "—");
+    appendLog(`>> Playwright suite ${run_id}`, "ok");
+    appendLog(`>> ${cmd}`, "info");
+    logSocket = openLogSocket(run_id);
+    // Pas de screencast pour npx playwright (workers multiples)
+    canvasEmpty.textContent = "Pas de screencast pour npx playwright (workers paralleles)";
+    refreshActiveRuns();
+  } catch (e) {
+    appendLog("ERREUR Playwright suite : " + e.message, "error");
+    setRunIdle();
+  }
+}
+
 async function replayRun(sourceRunId) {
   closeSockets();
   logBox.textContent = "";
@@ -334,6 +378,9 @@ codeBtn.addEventListener("click", () => {
 });
 
 refreshHistoryBtn.addEventListener("click", loadHistory);
+
+const pwLaunchBtn = $("#pwLaunchBtn");
+if (pwLaunchBtn) pwLaunchBtn.addEventListener("click", launchPlaywrightSuite);
 
 importFile.addEventListener("change", async (ev) => {
   const file = ev.target.files[0];
