@@ -350,6 +350,108 @@ async def replay_run(run_id: str, headless: bool = True):
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
+# --- Config screencast ---
+# 1 frame sur N envoyee aux viewers (defaut 2 = ~15fps si CDP delivre 30).
+# Plus haut sur ressources contraintes (AKS pod, 10+ viewers concurrents).
+SCREENCAST_EVERY_N = int(os.getenv("DOMAUTOPSY_SCREENCAST_EVERY_N", "2"))
+SCREENCAST_QUALITY = int(os.getenv("DOMAUTOPSY_SCREENCAST_QUALITY", "60"))
+SCREENCAST_MAX_WIDTH = int(os.getenv("DOMAUTOPSY_SCREENCAST_MAX_WIDTH", "1280"))
+
+
+class ScreencastHub:
+    """1 connexion CDP screencast par run -> broadcast a N viewers WebSocket.
+    Sans ce hub, chaque viewer ouvrait sa propre session CDP -> N streams
+    Chromium = CPU saturation + bandwidth N x. Avec : 1 stream Chromium ->
+    fanout en memoire vers les viewers connectes."""
+    def __init__(self, run_id: str, cdp_port: int):
+        self.run_id = run_id
+        self.cdp_port = cdp_port
+        self.viewers: set[WebSocket] = set()
+        self.last_frame: Optional[dict] = None  # cache pour les nouveaux viewers
+        self.task: Optional[asyncio.Task] = None
+        self.stopped = False
+
+    async def add_viewer(self, ws: WebSocket):
+        self.viewers.add(ws)
+        # Envoie immediatement la derniere frame connue au nouveau viewer
+        if self.last_frame:
+            try:
+                await ws.send_json(self.last_frame)
+            except Exception:
+                pass
+        # Demarre la capture CDP au premier viewer
+        if self.task is None and not self.stopped:
+            self.task = asyncio.create_task(self._capture_loop())
+
+    async def remove_viewer(self, ws: WebSocket):
+        self.viewers.discard(ws)
+
+    async def _broadcast(self, frame_msg: dict):
+        self.last_frame = frame_msg
+        if not self.viewers:
+            return
+        dead = []
+        for ws in list(self.viewers):
+            try:
+                await ws.send_json(frame_msg)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.viewers.discard(ws)
+
+    async def _capture_loop(self):
+        """1 connexion CDP, lit screencastFrame, fan-out vers viewers."""
+        page_ws_url = await _wait_for_cdp_page(self.cdp_port, timeout=30)
+        if not page_ws_url:
+            await self._broadcast({"type": "error", "message": "Chromium CDP indisponible apres 30s"})
+            return
+        msg_id = 0
+        def next_id() -> int:
+            nonlocal msg_id
+            msg_id += 1
+            return msg_id
+
+        timeout = aiohttp.ClientTimeout(total=None)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.ws_connect(page_ws_url, max_msg_size=20 * 1024 * 1024) as cdp_ws:
+                    await cdp_ws.send_json({"id": next_id(), "method": "Page.enable"})
+                    await cdp_ws.send_json({
+                        "id": next_id(),
+                        "method": "Page.startScreencast",
+                        "params": {
+                            "format": "jpeg",
+                            "quality": SCREENCAST_QUALITY,
+                            "maxWidth": SCREENCAST_MAX_WIDTH,
+                            "maxHeight": 720,
+                            "everyNthFrame": SCREENCAST_EVERY_N,
+                        },
+                    })
+                    async for ws_msg in cdp_ws:
+                        if self.stopped:
+                            break
+                        if ws_msg.type != aiohttp.WSMsgType.TEXT:
+                            continue
+                        data = json.loads(ws_msg.data)
+                        if data.get("method") == "Page.screencastFrame":
+                            params = data["params"]
+                            await self._broadcast({
+                                "type": "frame",
+                                "data": params["data"],
+                                "metadata": params.get("metadata", {}),
+                            })
+                            await cdp_ws.send_json({
+                                "id": next_id(),
+                                "method": "Page.screencastFrameAck",
+                                "params": {"sessionId": params["sessionId"]},
+                            })
+        except Exception as e:
+            await self._broadcast({"type": "error", "message": f"Capture loop: {e}"})
+
+
+SCREENCAST_HUBS: dict[str, ScreencastHub] = {}
+
+
 # --- Auth optionnelle via Bearer token ---
 # Si DOMAUTOPSY_API_TOKEN est set dans l'env (ou .env), les endpoints qui
 # MUTENT l'etat (POST/DELETE) exigent le header 'Authorization: Bearer <token>'.
@@ -529,23 +631,47 @@ async def ws_logs(ws: WebSocket, run_id: str):
 
 @app.websocket("/ws/screen/{run_id}")
 async def ws_screen(ws: WebSocket, run_id: str):
-    """Stream les frames Chromium via CDP screencast vers le client (base64 jpeg)"""
+    """Stream les frames Chromium via le ScreencastHub (1 CDP -> N viewers)."""
     await ws.accept()
     if run_id not in RUNS:
         await ws.send_json({"type": "error", "message": f"run_id inconnu: {run_id}"})
         await ws.close()
         return
-
-    cdp_port = RUNS[run_id]["cdp_port"]
-
-    # Attendre que Chromium ouvre son endpoint CDP
-    page_ws_url = await _wait_for_cdp_page(cdp_port, timeout=30)
-    if not page_ws_url:
-        await ws.send_json({"type": "error", "message": "Chromium CDP indisponible apres 30s"})
+    cdp_port = RUNS[run_id].get("cdp_port")
+    if not cdp_port:
+        await ws.send_json({"type": "error", "message": "Ce run n'a pas de CDP (ex: playwright runner sans screencast)"})
         await ws.close()
         return
 
-    await _stream_screencast(ws, page_ws_url)
+    # Cree le hub s'il n'existe pas, l'enregistre dans le pool global
+    hub = SCREENCAST_HUBS.get(run_id)
+    if hub is None:
+        hub = ScreencastHub(run_id, cdp_port)
+        SCREENCAST_HUBS[run_id] = hub
+    await hub.add_viewer(ws)
+    try:
+        # Garde la connexion ouverte tant que le client est la (pas de message attendu)
+        while True:
+            try:
+                await asyncio.wait_for(ws.receive_text(), timeout=60)
+            except asyncio.TimeoutError:
+                # Ping keepalive
+                try:
+                    await ws.send_json({"type": "ping"})
+                except Exception:
+                    break
+            except WebSocketDisconnect:
+                break
+    except Exception:
+        pass
+    finally:
+        await hub.remove_viewer(ws)
+        # Si plus de viewers, on stoppe la capture pour liberer Chromium
+        if not hub.viewers:
+            hub.stopped = True
+            if hub.task:
+                hub.task.cancel()
+            SCREENCAST_HUBS.pop(run_id, None)
 
 
 async def _wait_for_cdp_page(cdp_port: int, timeout: float = 30) -> Optional[str]:
@@ -563,64 +689,6 @@ async def _wait_for_cdp_page(cdp_port: int, timeout: float = 30) -> Optional[str
                 pass
             await asyncio.sleep(0.5)
     return None
-
-
-async def _stream_screencast(client_ws: WebSocket, page_ws_url: str):
-    """Connecte au CDP de la page, demarre le screencast, forward chaque frame"""
-    msg_id = 0
-    def next_id() -> int:
-        nonlocal msg_id
-        msg_id += 1
-        return msg_id
-
-    timeout = aiohttp.ClientTimeout(total=None)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        try:
-            async with session.ws_connect(page_ws_url, max_msg_size=20 * 1024 * 1024) as cdp_ws:
-                await cdp_ws.send_json({"id": next_id(), "method": "Page.enable"})
-                await cdp_ws.send_json({
-                    "id": next_id(),
-                    "method": "Page.startScreencast",
-                    "params": {
-                        "format": "jpeg",
-                        "quality": 70,
-                        "maxWidth": 1280,
-                        "maxHeight": 720,
-                        "everyNthFrame": 1,
-                    },
-                })
-
-                async for msg in cdp_ws:
-                    if msg.type != aiohttp.WSMsgType.TEXT:
-                        continue
-                    data = json.loads(msg.data)
-                    if data.get("method") == "Page.screencastFrame":
-                        params = data["params"]
-                        # Forward au client
-                        try:
-                            await client_ws.send_json({
-                                "type": "frame",
-                                "data": params["data"],
-                                "metadata": params.get("metadata", {}),
-                            })
-                        except (WebSocketDisconnect, RuntimeError):
-                            break
-                        # Acquitter pour recevoir la frame suivante
-                        await cdp_ws.send_json({
-                            "id": next_id(),
-                            "method": "Page.screencastFrameAck",
-                            "params": {"sessionId": params["sessionId"]},
-                        })
-        except Exception as e:
-            try:
-                await client_ws.send_json({"type": "error", "message": f"Screencast: {e}"})
-            except Exception:
-                pass
-        finally:
-            try:
-                await client_ws.close()
-            except Exception:
-                pass
 
 
 @app.get("/api/report/{run_id}")
