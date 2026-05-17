@@ -88,8 +88,20 @@ async function loadHistory() {
           <span style="margin-left:auto;">${escapeHtml(dt)}</span>
         </div>
       `;
-      li.title = "Clic : ouvre le rapport HTML (Shift+clic : ouvre le code de test)";
+      li.title = "Clic : ouvre le rapport HTML  |  Shift+clic : code de test  |  bouton ▶ : rejoue le parcours";
+      // Bouton replay
+      const replayBtn = document.createElement("button");
+      replayBtn.className = "history-replay";
+      replayBtn.title = "Rejouer ce parcours via Playwright pur (sans LLM, deterministe)";
+      replayBtn.innerHTML = "&#9654;";
+      replayBtn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        await replayRun(r.run_id);
+      });
+      li.appendChild(replayBtn);
+
       li.addEventListener("click", async (ev) => {
+        if (ev.target === replayBtn) return;
         if (ev.shiftKey) {
           openRunCode(r.run_id);
         } else if (r.has_report) {
@@ -121,6 +133,32 @@ async function openRunCode(runId) {
     }
   } catch (e) {
     alert("Erreur : " + e.message);
+  }
+}
+
+async function replayRun(sourceRunId) {
+  closeSockets();
+  logBox.textContent = "";
+  reportBtn.disabled = true;
+  codeBtn.disabled = true;
+  canvasEmpty.style.display = "block";
+  canvasEmpty.textContent = "Replay : Chromium se lance...";
+  try {
+    const resp = await fetch(`/api/replay/${sourceRunId}?headless=true`, { method: "POST" });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
+      throw new Error(err.detail || "Erreur");
+    }
+    const { run_id, cdp_port, source_run_id } = await resp.json();
+    currentRunId = run_id;
+    setRunActive(run_id, cdp_port);
+    appendLog(`>> Replay ${run_id} (source: ${source_run_id}) sur CDP ${cdp_port} - Playwright pur, no LLM`, "ok");
+    logSocket = openLogSocket(run_id);
+    setTimeout(() => { screenSocket = openScreenSocket(run_id); }, 1500);
+    refreshActiveRuns();
+  } catch (e) {
+    appendLog("ERREUR replay : " + e.message, "error");
+    setRunIdle();
   }
 }
 

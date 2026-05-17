@@ -201,6 +201,56 @@ async def kill_run(run_id: str):
     return {"run_id": run_id, "status": "killed"}
 
 
+@app.post("/api/replay/{run_id}")
+async def replay_run(run_id: str, headless: bool = True):
+    """Rejoue un run historise via Playwright pur (qa_player.py, pas de LLM).
+    Cree un nouveau run dans runs/<ts>_replay_of_<original> et retourne son
+    replay_run_id - reutilise les memes WS /ws/logs et /ws/screen que /api/run.
+    """
+    # Trouver le dossier source
+    source_dir = _find_run_dir(run_id)
+    if source_dir is None or not source_dir.exists():
+        raise HTTPException(404, f"Run source introuvable: {run_id}")
+    if not (source_dir / "clean_steps.json").exists():
+        raise HTTPException(400, f"clean_steps.json absent dans {source_dir.name}, replay impossible")
+
+    replay_id = uuid4().hex[:12]
+    cdp_port = find_free_cdp_port()
+    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+    replay_dir = RUNS_DIR / f"{ts}_replay_{replay_id}"
+
+    args = [
+        sys.executable, "-u", str(ROOT / "qa_player.py"),
+        "--run-dir", str(source_dir),
+        "--output-dir", str(replay_dir),
+        "--port", str(cdp_port),
+    ]
+    if headless:
+        args.append("--headless")
+
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        cwd=str(ROOT), bufsize=1,
+    )
+    log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    RUNS[replay_id] = {
+        "proc": proc,
+        "cdp_port": cdp_port,
+        "log_queue": log_queue,
+        "status": "running",
+        "report_path": None,
+        "url": None,
+        "task": f"Replay of {run_id}",
+        "output_format": "replay",
+        "run_dir": str(replay_dir),
+        "timestamp": ts,
+        "source_run_id": run_id,
+        "is_replay": True,
+    }
+    asyncio.create_task(_pump_stdout(replay_id, proc, log_queue))
+    return {"run_id": replay_id, "cdp_port": cdp_port, "source_run_id": run_id, "replay_dir": replay_dir.name}
+
+
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
