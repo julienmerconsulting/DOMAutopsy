@@ -724,21 +724,102 @@ async def get_run_file(run_id: str, filename: str):
     return FileResponse(target, media_type=media_type)
 
 
-@app.get("/api/status/{run_id}")
-async def run_status(run_id: str):
-    """Retourne l'etat courant du run"""
-    if run_id not in RUNS:
+def _run_status_payload(run_id: str) -> dict:
+    """Construit le payload de statut JSON pour un run, en cherchant d'abord en
+    memoire (run actif ou recemment termine) puis sur disque (meta.json).
+    Format pense pour le polling CI (exit_code, verdict, metriques cles)."""
+    # Cas 1 : run en memoire
+    if run_id in RUNS:
+        r = RUNS[run_id]
+        proc: Optional[subprocess.Popen] = r.get("proc")
+        exit_code = None
+        if proc and proc.poll() is not None:
+            exit_code = proc.returncode
+        status = r["status"]
+        is_running = (status == "running") and (proc is None or proc.poll() is None)
+        return {
+            "run_id": run_id,
+            "status": status,
+            "is_running": is_running,
+            "exit_code": exit_code,
+            "verdict": ("success" if exit_code == 0 else ("failure" if exit_code is not None else "running")),
+            "cdp_port": r.get("cdp_port"),
+            "report_path": r.get("report_path"),
+            "url": r.get("url"),
+            "task": r.get("task"),
+            "output_format": r.get("output_format"),
+            "is_replay": r.get("is_replay", False),
+            "is_playwright_runner": r.get("is_playwright_runner", False),
+            "ci_dashboard_url": f"/ci/{run_id}",
+            "log_ws_url": f"/ws/logs/{run_id}",
+            "report_url": f"/api/report/{run_id}",
+            "source": "memory",
+        }
+    # Cas 2 : run historique - chercher meta.json sur disque
+    d = _find_run_dir(run_id)
+    if d is None:
         raise HTTPException(404, f"run_id inconnu: {run_id}")
-    r = RUNS[run_id]
+    meta_file = d / "meta.json"
+    if not meta_file.exists():
+        # Dossier existe mais pas de meta
+        return {
+            "run_id": run_id,
+            "status": "no_meta",
+            "is_running": False,
+            "verdict": "unknown",
+            "source": "disk",
+        }
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except Exception as e:
+        raise HTTPException(500, f"meta.json corrompu : {e}")
+    status = meta.get("status") or "unknown"
+    # Verdict : si "success" dans meta -> 0, sinon si failure -> 1
+    verdict = meta.get("status") if meta.get("status") in ("success", "failure", "killed") else "unknown"
     return {
         "run_id": run_id,
-        "status": r["status"],
-        "cdp_port": r["cdp_port"],
-        "report_path": r.get("report_path"),
-        "url": r.get("url"),
-        "task": r.get("task"),
-        "output_format": r.get("output_format"),
+        "status": status,
+        "is_running": False,
+        "exit_code": 0 if verdict == "success" else (1 if verdict == "failure" else None),
+        "verdict": verdict,
+        "url": meta.get("scenario_url"),
+        "scenario_name": meta.get("scenario_name"),
+        "task": meta.get("task"),
+        "output_format": meta.get("output_format"),
+        "provider": meta.get("provider"),
+        "model": meta.get("model"),
+        "agent_result": meta.get("agent_result"),
+        "raw_count": meta.get("raw_count"),
+        "deduped_count": meta.get("deduped_count"),
+        "js_errors_count": meta.get("js_errors_count"),
+        "console_errors_count": meta.get("console_errors_count"),
+        "network_count": meta.get("network_count"),
+        "network_fail_count": meta.get("network_fail_count"),
+        "coverage_pct": meta.get("coverage_pct"),
+        "perf_heap_delta_mb": meta.get("perf_heap_delta_mb"),
+        "is_replay": meta.get("is_replay", False),
+        "is_playwright_runner": meta.get("is_playwright_runner", False),
+        "started_at": meta.get("started_at"),
+        "ended_at": meta.get("ended_at"),
+        "ci_dashboard_url": f"/ci/{run_id}",
+        "report_url": f"/api/report/{run_id}",
+        "source": "disk",
     }
+
+
+@app.get("/api/runs/{run_id}")
+async def get_run(run_id: str):
+    """Endpoint REST canonique pour le polling CI.
+    Retourne is_running, exit_code, verdict, et toutes les metriques cles.
+    Marche pour les runs en cours ET historises (lecture meta.json sur disque).
+    """
+    return _run_status_payload(run_id)
+
+
+@app.get("/api/status/{run_id}")
+async def run_status(run_id: str):
+    """Alias historique de /api/runs/{run_id} (back-compat)"""
+    return _run_status_payload(run_id)
 
 
 @app.get("/ci/{run_id}", response_class=HTMLResponse)
