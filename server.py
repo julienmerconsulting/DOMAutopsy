@@ -35,7 +35,7 @@ class _QuietAccessFilter(logging.Filter):
 
 logging.getLogger("uvicorn.access").addFilter(_QuietAccessFilter())
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, UploadFile, File, Depends, Header
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -178,7 +178,7 @@ async def list_runs():
     ]
 
 
-@app.delete("/api/run/{run_id}")
+@app.delete("/api/run/{run_id}", dependencies=[Depends(require_token)])
 async def kill_run(run_id: str):
     """Tue le subprocess d'un run (cleanup quand l'utilisateur ferme l'onglet)"""
     if run_id not in RUNS:
@@ -208,7 +208,7 @@ class PlaywrightRunRequest(BaseModel):
     headless: bool = True           # par defaut headless (impose --reporter=line)
 
 
-@app.post("/api/playwright/run")
+@app.post("/api/playwright/run", dependencies=[Depends(require_token)])
 async def run_playwright(req: PlaywrightRunRequest):
     """Lance 'npx playwright test ...' dans le projet Playwright fourni.
     Stream stdout via WS /ws/logs/{run_id} comme tout autre run.
@@ -297,7 +297,7 @@ async def run_playwright(req: PlaywrightRunRequest):
     return {"run_id": run_id, "cdp_port": None, "is_playwright_runner": True, "cmd": RUNS[run_id]["cmd"]}
 
 
-@app.post("/api/replay/{run_id}")
+@app.post("/api/replay/{run_id}", dependencies=[Depends(require_token)])
 async def replay_run(run_id: str, headless: bool = True):
     """Rejoue un run historise via Playwright pur (qa_player.py, pas de LLM).
     Cree un nouveau run dans runs/<ts>_replay_of_<original> et retourne son
@@ -350,11 +350,30 @@ async def replay_run(run_id: str, headless: bool = True):
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
 
+# --- Auth optionnelle via Bearer token ---
+# Si DOMAUTOPSY_API_TOKEN est set dans l'env (ou .env), les endpoints qui
+# MUTENT l'etat (POST/DELETE) exigent le header 'Authorization: Bearer <token>'.
+# Si pas set : no-auth (mode dev/local par defaut).
+# GET endpoints + WS + /ci/{id} restent toujours ouverts pour le partage des
+# rapports et la lecture publique.
+API_TOKEN = os.getenv("DOMAUTOPSY_API_TOKEN", "").strip() or None
+
+
+async def require_token(authorization: Optional[str] = Header(None)):
+    """Dependency qui valide le Bearer token si API_TOKEN est configure."""
+    if not API_TOKEN:
+        return  # No-auth mode
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token in Authorization header")
+    token = authorization.split(None, 1)[1].strip()
+    if token != API_TOKEN:
+        raise HTTPException(403, "Invalid Bearer token")
+
 # Cache des scripts importes : {import_id: {format, original_source, parsed_actions}}
 IMPORTS: dict[str, dict] = {}
 
 
-@app.post("/api/import")
+@app.post("/api/import", dependencies=[Depends(require_token)])
 async def import_script(file: UploadFile = File(...)):
     """Recoit un script de test existant (Katalon/PW/Cypress/Selenium),
     le parse, retourne URL detectee + task NL suggeree + format detecte.
@@ -406,7 +425,7 @@ async def import_script(file: UploadFile = File(...)):
     }
 
 
-@app.post("/api/run")
+@app.post("/api/run", dependencies=[Depends(require_token)])
 async def start_run(req: RunRequest):
     """Lance qa_explorer en sous-process et retourne un run_id"""
     run_id = uuid4().hex[:12]
