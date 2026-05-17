@@ -201,6 +201,102 @@ async def kill_run(run_id: str):
     return {"run_id": run_id, "status": "killed"}
 
 
+class PlaywrightRunRequest(BaseModel):
+    project_dir: str         # chemin absolu vers le projet Playwright (contient playwright.config.*)
+    target: Optional[str] = None    # fichier/dossier specifique (ex: tests/login.spec.ts) - optionnel
+    args: Optional[str] = None      # args bruts (ex: '--workers 4 --grep login --headed')
+    headless: bool = True           # par defaut headless (impose --reporter=line)
+
+
+@app.post("/api/playwright/run")
+async def run_playwright(req: PlaywrightRunRequest):
+    """Lance 'npx playwright test ...' dans le projet Playwright fourni.
+    Stream stdout via WS /ws/logs/{run_id} comme tout autre run.
+    Pas de screencast (pas de CDP unique : npx playwright peut lancer N workers).
+    Le rapport HTML natif de Playwright (playwright-report/) reste dans le projet
+    du user - on copie aussi un meta.json + un summary dans runs/<ts>_pwtest_<id>/.
+    """
+    project_dir = Path(req.project_dir).expanduser().resolve()
+    if not project_dir.exists() or not project_dir.is_dir():
+        raise HTTPException(400, f"Repertoire de projet introuvable : {project_dir}")
+    has_config = any((project_dir / f).exists() for f in [
+        "playwright.config.ts", "playwright.config.js", "playwright.config.mjs", "playwright.config.cjs"
+    ])
+    has_pkg = (project_dir / "package.json").exists()
+    if not has_config and not has_pkg:
+        raise HTTPException(400, f"Pas de playwright.config.* ni package.json dans {project_dir}")
+
+    run_id = uuid4().hex[:12]
+    ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = RUNS_DIR / f"{ts}_pwtest_{run_id}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Build command : npx playwright test [target] [args]
+    # On force --reporter=list pour avoir un output lisible en stream.
+    # Si l'user a deja un reporter dans args, le sien est conserve (Playwright accepte plusieurs).
+    cmd = ["npx", "playwright", "test"]
+    if req.target:
+        cmd.append(req.target)
+    user_args = (req.args or "").strip().split() if req.args else []
+    cmd.extend(user_args)
+    # Headless est le default Playwright ; pour le forcer on n'ajoute pas --headed.
+    # Si l'utilisateur veut headed il met --headed dans args.
+    # On ajoute --reporter=list si aucun reporter explicite dans les args du user
+    if not any(a.startswith("--reporter") for a in user_args):
+        cmd.append("--reporter=list")
+
+    # Windows : npx est un .cmd, il faut shell=True OU passer par cmd /c.
+    # On utilise shell=True UNIQUEMENT sur Windows et avec une commande sans interpolation user shell.
+    if sys.platform == "win32":
+        cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+        proc = subprocess.Popen(
+            cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=str(project_dir), bufsize=1,
+        )
+    else:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=str(project_dir), bufsize=1,
+        )
+
+    log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
+    RUNS[run_id] = {
+        "proc": proc,
+        "cdp_port": None,
+        "log_queue": log_queue,
+        "status": "running",
+        "report_path": None,
+        "url": None,
+        "task": f"npx playwright test {req.target or '(all tests)'}",
+        "output_format": "playwright_native",
+        "run_dir": str(out_dir),
+        "timestamp": ts,
+        "is_playwright_runner": True,
+        "project_dir": str(project_dir),
+        "cmd": " ".join(cmd) if isinstance(cmd, list) else cmd,
+    }
+    asyncio.create_task(_pump_stdout(run_id, proc, log_queue))
+    # Ecrit immediatement un meta.json minimal pour l'historique
+    try:
+        (out_dir / "meta.json").write_text(json.dumps({
+            "timestamp": ts,
+            "started_at": __import__("datetime").datetime.now().isoformat(),
+            "scenario_url": None,
+            "scenario_name": f"Playwright suite: {req.target or 'all'}",
+            "task": f"npx playwright test {req.target or ''} {req.args or ''}".strip(),
+            "output_format": "playwright_native",
+            "provider": "none",
+            "model": "npx-playwright",
+            "headless": req.headless,
+            "is_playwright_runner": True,
+            "project_dir": str(project_dir),
+            "status": "running",
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[server] meta.json initial echec : {e}")
+    return {"run_id": run_id, "cdp_port": None, "is_playwright_runner": True, "cmd": RUNS[run_id]["cmd"]}
+
+
 @app.post("/api/replay/{run_id}")
 async def replay_run(run_id: str, headless: bool = True):
     """Rejoue un run historise via Playwright pur (qa_player.py, pas de LLM).
@@ -643,6 +739,21 @@ async def run_status(run_id: str):
         "task": r.get("task"),
         "output_format": r.get("output_format"),
     }
+
+
+@app.get("/ci/{run_id}", response_class=HTMLResponse)
+async def ci_dashboard(run_id: str):
+    """Page CI publique pour suivre un run en direct depuis l'exterieur.
+    Cas d'usage : GitHub Action lance un test via POST /api/playwright/run
+    sur un runner dockerise, puis colle l'URL https://host/ci/<run_id> dans
+    le job summary pour que tout le monde voie le live log + verdict final.
+    """
+    html_path = WEB_DIR / "ci.html"
+    if not html_path.exists():
+        raise HTTPException(404, "ci.html introuvable")
+    # On injecte le run_id dans la page (substitution sur le placeholder __RUN_ID__)
+    html = html_path.read_text(encoding="utf-8").replace("__RUN_ID__", run_id)
+    return HTMLResponse(html)
 
 
 # Static files (CSS / JS) - tout ce qui est dans web/

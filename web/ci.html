@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DOMAutopsy CI Live — __RUN_ID__</title>
+<link rel="stylesheet" href="/web/style.css">
+<style>
+body.ci-page { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+body.ci-page main { display: flex; flex-direction: column; height: calc(100vh - 60px); padding: 16px; gap: 12px; }
+body.ci-page .ci-status-bar { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 12px 16px; display: flex; align-items: center; gap: 16px; }
+body.ci-page .ci-status-bar h2 { margin: 0; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 1px; }
+body.ci-page .ci-status-bar code { color: var(--accent); }
+body.ci-page .verdict-badge { padding: 6px 12px; border-radius: 12px; font-size: 11px; font-weight: 600; background: var(--running); color: #0e1116; }
+body.ci-page .verdict-badge.success { background: var(--accent-2); }
+body.ci-page .verdict-badge.error { background: var(--error); }
+body.ci-page .ci-log { flex: 1; background: var(--code-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 16px; overflow-y: auto; font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; line-height: 1.5; margin: 0; }
+body.ci-page .ci-footer { background: var(--panel); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 16px; display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); }
+body.ci-page .ci-footer a { color: var(--accent); text-decoration: none; }
+body.ci-page .ci-footer a:hover { text-decoration: underline; }
+</style>
+</head>
+<body class="ci-page">
+<header>
+  <div class="brand">
+    <h1>DOMAutopsy CI Live</h1>
+    <span class="tagline">Run <code id="ciRunId">__RUN_ID__</code></span>
+  </div>
+  <div class="header-info">
+    <span class="byline">JMer Consulting</span>
+  </div>
+</header>
+<main>
+  <div class="ci-status-bar">
+    <h2>Status <span class="status-dot running" id="ciStatusDot"></span></h2>
+    <span id="ciCmd" style="color:var(--muted);font-size:12px;flex:1"></span>
+    <span class="verdict-badge" id="ciVerdict">RUNNING</span>
+  </div>
+  <pre class="ci-log" id="ciLog">Connecting to live log stream...</pre>
+  <div class="ci-footer">
+    <span>Rapport : <a href="#" id="ciReportLink" style="opacity:0.5;pointer-events:none">(disponible apres completion)</a></span>
+    <span style="flex:1"></span>
+    <span>Auto-refresh active &middot; ferme la page sans crainte, le run continue cote serveur</span>
+  </div>
+</main>
+<script>
+const runId = "__RUN_ID__";
+const log = document.getElementById("ciLog");
+const verdict = document.getElementById("ciVerdict");
+const dot = document.getElementById("ciStatusDot");
+const reportLink = document.getElementById("ciReportLink");
+const cmdLabel = document.getElementById("ciCmd");
+
+async function fetchStatus() {
+  try {
+    const resp = await fetch(`/api/status/${runId}`);
+    if (resp.ok) {
+      const s = await resp.json();
+      cmdLabel.textContent = s.task || "";
+    }
+  } catch (e) { /* ignore */ }
+}
+
+function append(line, kind) {
+  if (log.textContent === "Connecting to live log stream...") log.textContent = "";
+  log.textContent += line + "\n";
+  log.scrollTop = log.scrollHeight;
+}
+
+function setVerdict(status) {
+  if (status === "exit_0") {
+    verdict.textContent = "SUCCESS";
+    verdict.className = "verdict-badge success";
+    dot.className = "status-dot ok";
+    reportLink.style.opacity = "1";
+    reportLink.style.pointerEvents = "auto";
+    reportLink.href = `/api/report/${runId}`;
+    reportLink.textContent = "Voir le rapport HTML";
+  } else {
+    verdict.textContent = "FAILURE (" + status + ")";
+    verdict.className = "verdict-badge error";
+    dot.className = "status-dot error";
+  }
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${proto}//${location.host}/ws/logs/${runId}`);
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "log") append(msg.line);
+    else if (msg.type === "end") setVerdict(msg.status);
+    else if (msg.type === "error") append("WS ERROR: " + msg.message);
+  };
+  ws.onerror = () => append("WS deconnecte, tentative de reconnexion dans 3s...");
+  ws.onclose = () => {
+    // Si le run est deja termine, le verdict est deja set ; sinon reconnect
+    if (verdict.textContent === "RUNNING") setTimeout(connect, 3000);
+  };
+}
+
+fetchStatus();
+connect();
+</script>
+</body>
+</html>
