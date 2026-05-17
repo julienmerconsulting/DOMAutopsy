@@ -89,6 +89,65 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="DOMAutopsy Web", version="0.1.0", lifespan=lifespan)
 
+# --- Auth Bearer token : 1 master + N tokens fils generes a la demande ---
+# MASTER_TOKEN (env DOMAUTOPSY_API_TOKEN) : token immuable, donne tous les droits,
+#   sert a generer des tokens fils via POST /api/auth/token. Si non set : no-auth.
+# Tokens fils : generes a la volee, stockes en memoire avec label + expires_at,
+#   peuvent etre revoques sans redemarrer. Accepteres comme le master.
+# Persistance : in-memory uniquement. Au restart serveur les tokens fils sont
+#   perdus (le master continue de marcher). Pour persistance permanente,
+#   stocker en SQLite/Redis (V4).
+import secrets
+import time
+
+MASTER_TOKEN = os.getenv("DOMAUTOPSY_API_TOKEN", "").strip() or None
+
+# {token_value: {"label": str, "created_at": float, "expires_at": float | None, "scope": str}}
+DYNAMIC_TOKENS: dict[str, dict] = {}
+
+
+def _valid_token(token: str) -> Optional[dict]:
+    """Verifie si un token est valide (master ou fils non expire). Retourne meta ou None."""
+    if MASTER_TOKEN and token == MASTER_TOKEN:
+        return {"label": "master", "scope": "admin", "expires_at": None}
+    t = DYNAMIC_TOKENS.get(token)
+    if not t:
+        return None
+    if t.get("expires_at") and time.time() > t["expires_at"]:
+        # Expire, on le retire
+        DYNAMIC_TOKENS.pop(token, None)
+        return None
+    return t
+
+
+async def require_token(authorization: Optional[str] = Header(None)):
+    """Dependency : valide Bearer (master OU token fils non expire)."""
+    if not MASTER_TOKEN:
+        return  # No-auth mode (pas de master = pas de auth)
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token in Authorization header")
+    token = authorization.split(None, 1)[1].strip()
+    if not _valid_token(token):
+        raise HTTPException(403, "Invalid or expired Bearer token")
+
+
+async def require_master(authorization: Optional[str] = Header(None)):
+    """Dependency : exige le master token (operations d'admin sur les tokens)."""
+    if not MASTER_TOKEN:
+        raise HTTPException(503, "Master token not configured server-side (set DOMAUTOPSY_API_TOKEN env)")
+    if not authorization or not authorization.lower().startswith("bearer "):
+        raise HTTPException(401, "Missing Bearer token in Authorization header")
+    token = authorization.split(None, 1)[1].strip()
+    if token != MASTER_TOKEN:
+        raise HTTPException(403, "Master token required for token management")
+
+
+class TokenMintRequest(BaseModel):
+    label: str
+    ttl_seconds: Optional[int] = 3600   # 1h par defaut
+    scope: Optional[str] = "user"       # user | readonly (cosmetique pour l'instant)
+
+
 def find_free_cdp_port() -> int:
     """Trouve un port CDP libre dans la plage [9222, 9272]"""
     used_ports = {r["cdp_port"] for r in RUNS.values() if r.get("status") == "running"}
@@ -548,64 +607,6 @@ class ScreencastHub:
 
 SCREENCAST_HUBS: dict[str, ScreencastHub] = {}
 
-
-# --- Auth Bearer token : 1 master + N tokens fils generes a la demande ---
-# MASTER_TOKEN (env DOMAUTOPSY_API_TOKEN) : token immuable, donne tous les droits,
-#   sert a generer des tokens fils via POST /api/auth/token. Si non set : no-auth.
-# Tokens fils : generes a la volee, stockes en memoire avec label + expires_at,
-#   peuvent etre revoques sans redemarrer. Accepteres comme le master.
-# Persistance : in-memory uniquement. Au restart serveur les tokens fils sont
-#   perdus (le master continue de marcher). Pour persistance permanente,
-#   stocker en SQLite/Redis (V4).
-import secrets
-import time
-
-MASTER_TOKEN = os.getenv("DOMAUTOPSY_API_TOKEN", "").strip() or None
-
-# {token_value: {"label": str, "created_at": float, "expires_at": float | None, "scope": str}}
-DYNAMIC_TOKENS: dict[str, dict] = {}
-
-
-def _valid_token(token: str) -> Optional[dict]:
-    """Verifie si un token est valide (master ou fils non expire). Retourne meta ou None."""
-    if MASTER_TOKEN and token == MASTER_TOKEN:
-        return {"label": "master", "scope": "admin", "expires_at": None}
-    t = DYNAMIC_TOKENS.get(token)
-    if not t:
-        return None
-    if t.get("expires_at") and time.time() > t["expires_at"]:
-        # Expire, on le retire
-        DYNAMIC_TOKENS.pop(token, None)
-        return None
-    return t
-
-
-async def require_token(authorization: Optional[str] = Header(None)):
-    """Dependency : valide Bearer (master OU token fils non expire)."""
-    if not MASTER_TOKEN:
-        return  # No-auth mode (pas de master = pas de auth)
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "Missing Bearer token in Authorization header")
-    token = authorization.split(None, 1)[1].strip()
-    if not _valid_token(token):
-        raise HTTPException(403, "Invalid or expired Bearer token")
-
-
-async def require_master(authorization: Optional[str] = Header(None)):
-    """Dependency : exige le master token (operations d'admin sur les tokens)."""
-    if not MASTER_TOKEN:
-        raise HTTPException(503, "Master token not configured server-side (set DOMAUTOPSY_API_TOKEN env)")
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, "Missing Bearer token in Authorization header")
-    token = authorization.split(None, 1)[1].strip()
-    if token != MASTER_TOKEN:
-        raise HTTPException(403, "Master token required for token management")
-
-
-class TokenMintRequest(BaseModel):
-    label: str
-    ttl_seconds: Optional[int] = 3600   # 1h par defaut
-    scope: Optional[str] = "user"       # user | readonly (cosmetique pour l'instant)
 
 # Cache des scripts importes : {import_id: {format, original_source, parsed_actions}}
 IMPORTS: dict[str, dict] = {}
