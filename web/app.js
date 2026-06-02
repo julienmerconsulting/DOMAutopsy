@@ -88,8 +88,20 @@ async function loadHistory() {
           <span style="margin-left:auto;">${escapeHtml(dt)}</span>
         </div>
       `;
-      li.title = "Clic : ouvre le rapport HTML (Shift+clic : ouvre le code de test)";
+      li.title = "Clic : ouvre le rapport HTML  |  Shift+clic : code de test  |  bouton ▶ : rejoue le parcours";
+      // Bouton replay
+      const replayBtn = document.createElement("button");
+      replayBtn.className = "history-replay";
+      replayBtn.title = "Rejouer ce parcours via Playwright pur (sans LLM, deterministe)";
+      replayBtn.innerHTML = "&#9654;";
+      replayBtn.addEventListener("click", async (ev) => {
+        ev.stopPropagation();
+        await replayRun(r.run_id);
+      });
+      li.appendChild(replayBtn);
+
       li.addEventListener("click", async (ev) => {
+        if (ev.target === replayBtn) return;
         if (ev.shiftKey) {
           openRunCode(r.run_id);
         } else if (r.has_report) {
@@ -121,6 +133,76 @@ async function openRunCode(runId) {
     }
   } catch (e) {
     alert("Erreur : " + e.message);
+  }
+}
+
+async function launchPlaywrightSuite() {
+  const projectDir = $("#pwProjectDir").value.trim();
+  const target = $("#pwTarget").value.trim() || null;
+  const argsRaw = $("#pwArgs").value.trim() || null;
+  if (!projectDir) {
+    alert("Renseigne le chemin du projet Playwright (absolu)");
+    return;
+  }
+  closeSockets();
+  logBox.textContent = "";
+  reportBtn.disabled = true;
+  codeBtn.disabled = true;
+  canvasEmpty.style.display = "block";
+  canvasEmpty.textContent = "Lancement npx playwright test...";
+  try {
+    const resp = await fetch("/api/playwright/run", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        project_dir: projectDir,
+        target: target,
+        args: argsRaw,
+        headless: true,
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
+      throw new Error(err.detail || "Erreur");
+    }
+    const { run_id, cmd } = await resp.json();
+    currentRunId = run_id;
+    setRunActive(run_id, "—");
+    appendLog(`>> Playwright suite ${run_id}`, "ok");
+    appendLog(`>> ${cmd}`, "info");
+    logSocket = openLogSocket(run_id);
+    // Pas de screencast pour npx playwright (workers multiples)
+    canvasEmpty.textContent = "Pas de screencast pour npx playwright (workers paralleles)";
+    refreshActiveRuns();
+  } catch (e) {
+    appendLog("ERREUR Playwright suite : " + e.message, "error");
+    setRunIdle();
+  }
+}
+
+async function replayRun(sourceRunId) {
+  closeSockets();
+  logBox.textContent = "";
+  reportBtn.disabled = true;
+  codeBtn.disabled = true;
+  canvasEmpty.style.display = "block";
+  canvasEmpty.textContent = "Replay : Chromium se lance...";
+  try {
+    const resp = await fetch(`/api/replay/${sourceRunId}?headless=true`, { method: "POST" });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
+      throw new Error(err.detail || "Erreur");
+    }
+    const { run_id, cdp_port, source_run_id } = await resp.json();
+    currentRunId = run_id;
+    setRunActive(run_id, cdp_port);
+    appendLog(`>> Replay ${run_id} (source: ${source_run_id}) sur CDP ${cdp_port} - Playwright pur, no LLM`, "ok");
+    logSocket = openLogSocket(run_id);
+    setTimeout(() => { screenSocket = openScreenSocket(run_id); }, 1500);
+    refreshActiveRuns();
+  } catch (e) {
+    appendLog("ERREUR replay : " + e.message, "error");
+    setRunIdle();
   }
 }
 
@@ -296,6 +378,9 @@ codeBtn.addEventListener("click", () => {
 });
 
 refreshHistoryBtn.addEventListener("click", loadHistory);
+
+const pwLaunchBtn = $("#pwLaunchBtn");
+if (pwLaunchBtn) pwLaunchBtn.addEventListener("click", launchPlaywrightSuite);
 
 importFile.addEventListener("change", async (ev) => {
   const file = ev.target.files[0];

@@ -87,6 +87,21 @@
       </div>
     </form>
 
+    <details class="pw-suite-block">
+      <summary>Lancer une suite Playwright native</summary>
+      <p class="pw-hint">Exécute <code>npx playwright test</code> dans un projet Playwright existant. Le serveur doit avoir <code>node</code> + <code>npx</code> installés.</p>
+      <label>Chemin du projet Playwright (absolu)
+        <input type="text" id="pwProjectDir" placeholder="/workspace/my-app ou C:\\dev\\my-app">
+      </label>
+      <label>Target <small>(optionnel : fichier ou dossier relatif)</small>
+        <input type="text" id="pwTarget" placeholder="tests/login.spec.ts">
+      </label>
+      <label>Args bruts <small>(optionnel)</small>
+        <input type="text" id="pwArgs" placeholder="--workers 1 --grep happy-path">
+      </label>
+      <button type="button" id="pwLaunchBtn">Lancer suite Playwright</button>
+    </details>
+
     <div class="history-block">
       <div class="history-header">
         <h3>Historique</h3>
