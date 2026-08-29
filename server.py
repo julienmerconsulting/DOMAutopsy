@@ -456,9 +456,22 @@ async def run_playwright(req: PlaywrightRunRequest):
 
 @app.post("/api/replay/{run_id}", dependencies=[Depends(require_token)])
 async def replay_run(run_id: str, headless: bool = True):
-    """Rejoue un run historise via Playwright pur (qa_player.py, pas de LLM).
-    Cree un nouveau run dans runs/<ts>_replay_of_<original> et retourne son
-    replay_run_id - reutilise les memes WS /ws/logs et /ws/screen que /api/run.
+    """Rejoue un run historique. Deux moteurs :
+
+    - PRIMAIRE : `npx playwright test <spec-relative> --workers=1 --reporter=list`
+      quand test_playwright.spec.ts est present dans le dossier source. C'est
+      le format canonique produit systematiquement par qa_explorer (schema
+      v1.0). Ce chemin est le moteur normal a partir du refactor Aout 2026.
+
+    - LEGACY FALLBACK : qa_player.py (Playwright pur Python, click+input
+      seulement) uniquement pour les anciens runs qui n'ont pas encore de
+      TS genere. Signale explicitement `engine: qa_player_legacy` dans le
+      meta.json et log un WARNING clair.
+
+    Reponse au cahier : "Pour les anciens runs qui ne possedent pas de
+    TypeScript genere, conserve provisoirement qa_player.py comme fallback
+    legacy ou genere leur TypeScript a la volee. Le fallback doit etre
+    explicitement indique dans les logs et dans meta.json."
     """
     # Trouver le dossier source
     source_dir = _find_run_dir(run_id)
@@ -468,40 +481,140 @@ async def replay_run(run_id: str, headless: bool = True):
         raise HTTPException(400, f"clean_steps.json absent dans {source_dir.name}, replay impossible")
 
     replay_id = uuid4().hex[:12]
-    cdp_port = find_free_cdp_port()
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")
     replay_dir = RUNS_DIR / f"{ts}_replay_{replay_id}"
+    replay_dir.mkdir(parents=True, exist_ok=True)
 
-    args = [
-        sys.executable, "-u", str(ROOT / "qa_player.py"),
-        "--run-dir", str(source_dir),
-        "--output-dir", str(replay_dir),
-        "--port", str(cdp_port),
-    ]
-    if headless:
-        args.append("--headless")
+    spec_file = source_dir / "test_playwright.spec.ts"
+    use_playwright_ts = spec_file.exists()
 
-    proc = subprocess.Popen(
-        args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        cwd=str(ROOT), bufsize=1,
-    )
+    proc: subprocess.Popen
+    engine: str
+    cmd_repr: str
+    fallback_reason: Optional[str] = None
+    cdp_port_alloc: Optional[int] = None
+
+    if use_playwright_ts:
+        # --- MOTEUR PRIMAIRE : npx playwright test sur le TS canonique ---
+        # Chemin RELATIF au repo (Playwright interprete un chemin absolu
+        # Windows type "C:\..." comme une expression de filtrage a cause du
+        # ":" et des antislashs).
+        try:
+            spec_rel = spec_file.relative_to(ROOT).as_posix()
+        except ValueError:
+            # source_dir est en dehors du repo (cas theorique, on tombe en
+            # fallback plutot que passer un chemin absolu risque)
+            spec_rel = None
+
+        if spec_rel is None:
+            use_playwright_ts = False
+            fallback_reason = "spec en dehors du repo, impossible de passer un chemin relatif a `npx playwright test`"
+        else:
+            # Un seul worker pour un replay deterministe, reporter list pour
+            # que le stdout ligne-a-ligne soit exploitable en streaming, et
+            # --output isole les artefacts (traces, videos) dans le run dir.
+            output_rel = replay_dir.relative_to(ROOT).as_posix()
+            cmd = [
+                "npx", "playwright", "test", spec_rel,
+                "--workers=1",
+                "--reporter=list",
+                f"--output={output_rel}",
+            ]
+            engine = "playwright_ts"
+            cmd_repr = " ".join(cmd)
+            # Windows : npx est un .cmd, il faut passer par shell=True avec
+            # une commande sans interpolation user. Meme pattern que
+            # /api/playwright/run. Args : venant tous d'un chemin serveur
+            # controle (pas de user input direct) donc pas d'injection.
+            if sys.platform == "win32":
+                cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+                proc = subprocess.Popen(
+                    cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cwd=str(ROOT), bufsize=1,
+                )
+            else:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    cwd=str(ROOT), bufsize=1,
+                )
+
+    if not use_playwright_ts:
+        # --- FALLBACK LEGACY : qa_player.py ---
+        cdp_port_alloc = find_free_cdp_port()
+        args = [
+            sys.executable, "-u", str(ROOT / "qa_player.py"),
+            "--run-dir", str(source_dir),
+            "--output-dir", str(replay_dir),
+            "--port", str(cdp_port_alloc),
+        ]
+        if headless:
+            args.append("--headless")
+        engine = "qa_player_legacy"
+        fallback_reason = fallback_reason or (
+            "test_playwright.spec.ts absent dans le run source "
+            "(run pre-refactor Aout 2026)"
+        )
+        cmd_repr = " ".join(args)
+        proc = subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=str(ROOT), bufsize=1,
+        )
+
+    # meta.json initial (le detail final est ecrit par le subprocess)
+    try:
+        (replay_dir / "meta.json").write_text(json.dumps({
+            "timestamp": ts,
+            "started_at": __import__("datetime").datetime.now().isoformat(),
+            "scenario_url": None,
+            "scenario_name": f"Replay of {run_id}",
+            "task": f"Replay run {run_id} via {engine}",
+            "output_format": "replay",
+            "provider": "none",
+            "model": ("npx-playwright" if engine == "playwright_ts" else "playwright-python-pure"),
+            "headless": headless,
+            "is_replay": True,
+            "source_run_id": run_id,
+            "engine": engine,
+            "legacy_fallback": engine == "qa_player_legacy",
+            "legacy_fallback_reason": fallback_reason,
+            "cmd": cmd_repr,
+            "status": "running",
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[server] meta.json initial replay echec : {e}")
+
     log_queue: asyncio.Queue[Optional[str]] = asyncio.Queue()
     RUNS[replay_id] = {
         "proc": proc,
-        "cdp_port": cdp_port,
+        "cdp_port": cdp_port_alloc,   # None si engine=playwright_ts (pas de CDP unique)
         "log_queue": log_queue,
         "status": "running",
         "report_path": None,
         "url": None,
-        "task": f"Replay of {run_id}",
+        "task": f"Replay of {run_id} via {engine}",
         "output_format": "replay",
         "run_dir": str(replay_dir),
         "timestamp": ts,
         "source_run_id": run_id,
         "is_replay": True,
+        "engine": engine,
+        "legacy_fallback": engine == "qa_player_legacy",
+        "cmd": cmd_repr,
     }
     asyncio.create_task(_pump_stdout(replay_id, proc, log_queue))
-    return {"run_id": replay_id, "cdp_port": cdp_port, "source_run_id": run_id, "replay_dir": replay_dir.name}
+
+    if fallback_reason:
+        print(f"[server] /api/replay/{run_id} -> FALLBACK LEGACY qa_player.py : {fallback_reason}")
+
+    return {
+        "run_id": replay_id,
+        "cdp_port": cdp_port_alloc,
+        "source_run_id": run_id,
+        "replay_dir": replay_dir.name,
+        "engine": engine,
+        "legacy_fallback": engine == "qa_player_legacy",
+        "legacy_fallback_reason": fallback_reason,
+    }
 
 
 RUNS_DIR = ROOT / "runs"
