@@ -157,6 +157,70 @@ def test_upload_emits_setInputFiles(out_dir):
     assert 'setInputFiles("/tmp/f.txt")' in body
 
 
+def test_switch_tab_uses_context_pages_index(out_dir):
+    """switch_tab -> page.context().pages()[N] + bringToFront. Deterministe
+    par ORDRE DE CREATION (pas tab_id opaque BU)."""
+    cs = _wrap([Step(id="step-0001", step=1, action="switch_tab", value="2")])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert "page.context().pages()" in body
+    assert "_pages[2]" in body
+    assert "bringToFront" in body
+
+
+def test_switch_tab_throws_when_index_missing(out_dir):
+    """Guard runtime : si l'onglet cible n'existe pas, throw explicite
+    plutot que crash silencieux."""
+    cs = _wrap([Step(id="step-0001", step=1, action="switch_tab", value="5")])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert "throw new Error" in body
+    assert "5" in body
+
+
+def test_close_tab_current_when_no_value(out_dir):
+    """close_tab sans value -> ferme la page courante et repointe sur pages()[0]."""
+    cs = _wrap([Step(id="step-0001", step=1, action="close_tab")])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert "await page.close()" in body
+    assert "_pages[0]" in body
+
+
+def test_close_tab_by_index_when_value_given(out_dir):
+    """close_tab avec value -> ferme _pages[index] + repointe sur restant[0]."""
+    cs = _wrap([Step(id="step-0001", step=1, action="close_tab", value="1")])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert "_pages[1].close()" in body
+    assert "_remaining" in body
+
+
+def test_extract_emitter_throws_explicit_error(out_dir):
+    """extract garde-fou : si un step extract arrive included_in_replay=True,
+    le TS leve un throw explicite (pas un no-op silencieux)."""
+    cs = _wrap([Step(
+        id="step-0001", step=1, action="extract",
+        description="Lit le titre",
+        included_in_replay=True,  # cas anormal - devrait etre False
+    )])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert "throw new Error" in body
+    assert "non rejouable" in body
+
+
+def test_extract_marked_not_replayable_is_skipped_in_ts(out_dir):
+    """Cas normal : extract avec included_in_replay=False -> SKIPPED
+    commentaire dans le TS, pas de code exécutable."""
+    cs = _wrap([Step(
+        id="step-0001", step=1, action="extract",
+        description="Lit le titre",
+        included_in_replay=False,
+        cleanup_reason="action extract non rejouable",
+    )])
+    r = generate_playwright_ts(cs, out_dir / "t.spec.ts")
+    body = Path(r["path"]).read_text()
+    assert "// SKIPPED [step-0001]" in body
+    assert "throw new Error" not in body
+    assert r["skipped_count"] == 1
+
+
 def test_go_back_reload_open_tab(out_dir):
     steps = [
         Step(id="step-0001", step=1, action="go_back"),

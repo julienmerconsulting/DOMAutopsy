@@ -94,7 +94,7 @@ cp .env.example .env
 
 ```bash
 python -m pip install pytest httpx     # deps de dev, isolees de requirements.txt
-python -m pytest tests/                # 50 tests, dont 1 E2E reel via npx playwright
+python -m pytest tests/                # 103 tests, dont 1 E2E reel via npx playwright
 ```
 
 ### Installation autonome (optionnel — pour prod / distribution)

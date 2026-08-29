@@ -263,11 +263,11 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     sel = _dom_selector_to_pydantic(entry.get("selector"))
     val = entry.get("value")
     is_sensitive = bool(entry.get("sensitive"))
-    # Normalisation timestamp : Date.now() est deja en ms int
+    # DOM listener produit Date.now() JS = int ms depuis epoch (toujours).
+    # On accepte n'importe quel int/float comme etant DEJA en ms - jamais
+    # de conversion sec->ms qui casserait un test avec de petits ts.
     ts_raw = entry.get("timestamp")
-    ts_ms = int(ts_raw) if isinstance(ts_raw, (int, float)) and ts_raw > 1e12 else (
-        int(ts_raw * 1000) if isinstance(ts_raw, (int, float)) else None
-    )
+    ts_ms = int(ts_raw) if isinstance(ts_raw, (int, float)) else None
     step = Step(
         id=f"step-{index:04d}",
         step=index,
@@ -547,13 +547,11 @@ def build_pre_cleanup_steps(
     # ============================================================
     # 1. Normalise les DOM entries en list ordonnee par timestamp ms.
     #    dom_consumed[i]=True quand une entree a ete rattachee a un BU step.
+    #    DOM listener JS produit Date.now() en ms deja - on accepte tel quel.
     dom_entries = []
     for e in (dom_log or []):
         ts_raw = e.get("timestamp")
-        if isinstance(ts_raw, (int, float)):
-            ts_ms = int(ts_raw) if ts_raw > 1e12 else int(ts_raw * 1000)
-        else:
-            ts_ms = None
+        ts_ms = int(ts_raw) if isinstance(ts_raw, (int, float)) else None
         dom_entries.append({"ts_ms": ts_ms, "entry": e})
     dom_entries.sort(key=lambda x: x["ts_ms"] or 0)
     dom_consumed = [False] * len(dom_entries)
