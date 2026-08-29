@@ -501,6 +501,13 @@ def _step_from_bu_action(
             "go_forward": "Avance",
             "reload": "Recharge la page",
         }[normalized]
+    elif normalized == "evaluate":
+        # Execution JS brute (workaround click BU quand selecteur ambigu).
+        # Preserve le code JS pour l'emitter TS qui le passera a page.evaluate().
+        # Rejouable = true : c'est une vraie interaction (peut modifier le DOM).
+        code = params.get("code") or params.get("script") or params.get("js")
+        step.description = f"Evaluate JS : {(code or '')[:80]}"
+        step.value = code
     elif normalized == "extract":
         # Extract est une lecture LLM (extraire un texte/donnee depuis
         # le DOM pour raisonner). Aucune interaction user, NON rejouable.
@@ -511,9 +518,7 @@ def _step_from_bu_action(
         step.cleanup_reason = "action extract (lecture LLM only, pas d'interaction utilisateur reproductible)"
     elif normalized in ("click", "input", "select", "scroll", "hover"):
         # Actions interactives BU sans correspondance DOM listener.
-        # interacted_element a peut-etre fourni le selecteur. Sinon :
-        # valeur/description best-effort, anomalie signalee au niveau
-        # global (via _link_bu_dom_signal_anomalies).
+        # interacted_element a peut-etre fourni le selecteur.
         if normalized == "input":
             step.value = params.get("text") or params.get("value")
         elif normalized == "select":
@@ -522,6 +527,19 @@ def _step_from_bu_action(
             step.direction = "down" if (params.get("direction") in (None, "down", "bas")) else "up"
             step.deltaY = params.get("amount") or params.get("delta") or 650
         step.description = f"{normalized.capitalize()} (BU-only, sans DOM event)"
+        # Regle cahier : "action sans selecteur conservee comme anomalie".
+        # Le step est GARDE dans le JSON (tracabilite) mais marque
+        # included_in_replay=False + cleanup_reason quand aucun selecteur
+        # n'a pu etre extrait (ni DOM ni interacted_element BU). Le TS
+        # emit un commentaire SKIPPED, pas un throw fatal.
+        if step.selector is None or (
+            hasattr(step.selector, "value") and not step.selector.value
+        ):
+            step.included_in_replay = False
+            step.cleanup_reason = (
+                f"action {normalized} sans selecteur (BU sans interacted_element "
+                f"ni correspondance DOM listener)"
+            )
     else:
         step.action = "unknown"
         step.description = f"Action browser-use non standard : {action_name}"
@@ -621,10 +639,22 @@ def _normalize_bu_action_name(name: str) -> str | None:
         "scroll": "scroll",
         "scroll_down": "scroll",
         "scroll_up": "scroll",
-        # Lecture DOM - BU 0.12.9 utilise extract (pas extract_content)
-        # Garde dans le JSON, marquera included_in_replay=False + reason
+        # Lectures DOM read-only - BU utilise plusieurs noms selon version
+        # (extract 0.12, extract_content 0.11, find_elements 0.13). Toutes
+        # sont marquees included_in_replay=False + cleanup_reason (aucune
+        # interaction utilisateur reproductible, valeur = lecture LLM only).
         "extract": "extract",
         "extract_content": "extract",
+        "find_elements": "extract",
+        "find_element": "extract",
+        "get_dom_state": "extract",
+        "query_selector": "extract",
+        # BU 0.13 evaluate : execution JS brute (workaround click quand
+        # selecteur ambigu ou element hors-flow). Rejouable en TS via
+        # page.evaluate() - c'est une vraie interaction reproductible.
+        "evaluate": "evaluate",
+        "execute_javascript": "evaluate",
+        "run_js": "evaluate",
     }
     return MAP.get(n, n if n in KNOWN_ACTIONS else "unknown")
 

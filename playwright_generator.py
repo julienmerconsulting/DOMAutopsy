@@ -341,6 +341,29 @@ def _emit_close_tab(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     ]
 
 
+def _emit_evaluate(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
+    """evaluate : execution JS brute via page.evaluate(). BU 0.13 utilise
+    cette action pour les workaround clicks quand un selecteur est
+    ambigu (ex: document.querySelectorAll('.toggle')[1].click()). Le JS
+    original est stocke dans raw_payload.evaluate.code."""
+    raw = step.raw_payload or {}
+    code = None
+    if isinstance(raw, dict):
+        for k in ("evaluate", "execute_javascript", "run_js"):
+            v = raw.get(k)
+            if isinstance(v, dict):
+                code = v.get("code") or v.get("script") or v.get("js")
+                if code:
+                    break
+    if not code:
+        code = step.value or ""
+    if not code:
+        raise UnsupportedAction(step, "evaluate sans code JS")
+    # Escape backticks pour template literal TS
+    safe = code.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    return [f"    await page.evaluate(`{safe}`);"]
+
+
 def _emit_extract(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     """extract est une lecture LLM (extraire un texte/donnee pour raisonner),
     aucune interaction reproductible. Normalement, extract steps sont
@@ -390,6 +413,7 @@ EMITTERS = {
     "switch_tab": _emit_switch_tab,
     "close_tab": _emit_close_tab,
     "extract": _emit_extract,   # garde-fou : leve si included_in_replay=True
+    "evaluate": _emit_evaluate,
     # input et screenshot ont une signature enrichie (index)
 }
 
