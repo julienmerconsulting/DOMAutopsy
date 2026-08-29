@@ -13,7 +13,7 @@
     "test:python": "python -m pytest tests/"
   },
   "devDependencies": {
-    "@playwright/test": "^1.49.0",
-    "typescript": "^5.5.0"
+    "@playwright/test": "1.57.0",
+    "typescript": "5.5.4"
   }
 }
