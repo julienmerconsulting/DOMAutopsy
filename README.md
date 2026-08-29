@@ -97,9 +97,9 @@ python -m pip install pytest httpx     # deps de dev, isolees de requirements.tx
 python -m pytest tests/                # 50 tests, dont 1 E2E reel via npx playwright
 ```
 
-### Installation autonome (optionnel — pour prod / air-gap)
+### Installation autonome (optionnel — pour prod / distribution)
 
-Le mode DEV utilise le `npx` global + le cache Chromium partagé de Playwright Python. Pour un déploiement **sans dépendance système** (installateur, Docker, air-gap), provisionner un runtime isolé dans `runtime/` :
+Le mode DEV utilise le `npx` global + le cache Chromium partagé de Playwright Python. Pour un déploiement **sans dépendance système** (installateur, Docker, machine sans Node), provisionner un runtime isolé dans `runtime/`. À noter : le provisionnement lui-même télécharge Node + Chromium depuis Internet — c'est l'**exécution** post-install qui est autonome, pas l'install.
 
 ```bash
 python domautopsy_cli.py runtime install    # télécharge Node LTS + @playwright/test + Chromium

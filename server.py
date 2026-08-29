@@ -529,7 +529,7 @@ async def replay_run(run_id: str, headless: bool = True):
             env = dict(os.environ)
             env["DOMAUTOPSY_REPLAY_JSON"] = str(replay_json_path)
 
-            # Runtime resolution : embarque (autonome, air-gap) vs dev (npx global)
+            # Runtime resolution : embarque (autonome a l'execution) vs dev (npx global du PATH)
             rt = _resolve_embedded_runtime()
             if rt:
                 # Mode embarque : node.exe local + cli.js Playwright + browsers/
