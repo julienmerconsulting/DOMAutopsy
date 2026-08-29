@@ -335,27 +335,121 @@ async def list_runs():
     ]
 
 
+def _kill_process_tree(pid: int, timeout: float = 3.0) -> dict:
+    """R7 : tue le processus ET tous ses descendants (Chromium, Playwright,
+    browser-use spawn plusieurs enfants qui survivent au kill du parent).
+
+    Sequence : SIGTERM parent + enfants -> attend timeout -> SIGKILL survivants.
+    Utilise psutil (deja installe via browser-use) : cross-OS Windows/Linux/Mac.
+
+    Retourne {killed_pids, still_alive} pour audit.
+    """
+    try:
+        import psutil
+    except ImportError:
+        # Fallback : plate-forme sans psutil, on kill juste le parent
+        try:
+            import os as _os, signal as _sig
+            _os.kill(pid, _sig.SIGKILL if hasattr(_sig, "SIGKILL") else _sig.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        return {"killed_pids": [pid], "still_alive": [], "psutil": False}
+
+    killed: list[int] = []
+    still_alive: list[int] = []
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return {"killed_pids": [], "still_alive": [], "psutil": True}
+
+    # 1. Collecte l'arbre AVANT terminate (enfants disparaissent au parent kill)
+    try:
+        children = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+
+    all_procs = children + [parent]
+
+    # 2. Terminate propre d'abord (arret gracieux)
+    for p in all_procs:
+        try:
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    # 3. Attend jusqu'a timeout
+    gone, alive = psutil.wait_procs(all_procs, timeout=timeout)
+    killed.extend(p.pid for p in gone)
+
+    # 4. Kill dur pour les survivants
+    for p in alive:
+        try:
+            p.kill()
+            killed.append(p.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            still_alive.append(p.pid)
+
+    return {"killed_pids": killed, "still_alive": still_alive, "psutil": True}
+
+
+def _mark_run_stopped_on_disk(run_dir_str: str | None) -> None:
+    """Ecrit status="stopped" dans meta.json du run stoppe (fix R7).
+    Sans ca, /api/history continuerait a afficher le run comme actif."""
+    if not run_dir_str:
+        return
+    p = Path(run_dir_str) / "meta.json"
+    try:
+        if p.exists():
+            data = json.loads(p.read_text(encoding="utf-8"))
+        else:
+            data = {}
+        data["status"] = "stopped"
+        data["stopped_at"] = __import__("datetime").datetime.now().isoformat()
+        data.setdefault("pipeline_status", "interrupted")
+        data.setdefault("agent_status", "interrupted")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print(f"[server] _mark_run_stopped_on_disk({run_dir_str}) : {e}")
+
+
 @app.delete("/api/run/{run_id}", dependencies=[Depends(require_token)])
 async def kill_run(run_id: str):
-    """Tue le subprocess d'un run (cleanup quand l'utilisateur ferme l'onglet)"""
+    """Tue COMPLETEMENT un run : subprocess Python + descendants Chromium/
+    browser-use, WS+screencast, met a jour meta.json status=stopped.
+    R7 fix : ancien code faisait juste proc.terminate() qui laissait les
+    enfants Chromium vivants indefiniment sur Windows."""
     if run_id not in RUNS:
         raise HTTPException(404, f"run_id inconnu: {run_id}")
     r = RUNS[run_id]
     proc: subprocess.Popen = r["proc"]
     loop = asyncio.get_running_loop()
-    if proc.poll() is None:  # encore en vie
+    tree_report = {"killed_pids": [], "still_alive": []}
+    if proc.poll() is None:
+        tree_report = await loop.run_in_executor(None, _kill_process_tree, proc.pid, 3.0)
         try:
-            proc.terminate()
-            try:
-                # wait via executor + timeout
-                await asyncio.wait_for(loop.run_in_executor(None, proc.wait), timeout=3)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await loop.run_in_executor(None, proc.wait)
-        except ProcessLookupError:
+            await asyncio.wait_for(loop.run_in_executor(None, proc.wait), timeout=2)
+        except (asyncio.TimeoutError, Exception):
             pass
-    r["status"] = "killed"
-    return {"run_id": run_id, "status": "killed"}
+
+    # Ferme le hub screencast s'il tourne encore pour ce run
+    hub = SCREENCAST_HUBS.pop(run_id, None)
+    if hub is not None:
+        hub.stopped = True
+        if hub.task:
+            hub.task.cancel()
+
+    # meta.json status=stopped (R7)
+    _mark_run_stopped_on_disk(r.get("run_dir"))
+
+    r["status"] = "stopped"
+    r["stop_report"] = tree_report
+    return {
+        "run_id": run_id,
+        "status": "stopped",
+        "killed_pids": tree_report.get("killed_pids", []),
+        "still_alive": tree_report.get("still_alive", []),
+    }
 
 
 class PlaywrightRunRequest(BaseModel):

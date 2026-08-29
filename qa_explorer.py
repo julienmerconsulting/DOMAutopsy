@@ -1544,8 +1544,35 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "clean_steps_filtered": sum(1 for s in clean_steps.steps if not s.included_in_replay) if 'clean_steps' in locals() and clean_steps else 0,
                 "sensitive_env_vars": sensitive_env_vars if 'sensitive_env_vars' in locals() else [],
                 "playwright_spec_present": (output_dir / "test_playwright.spec.ts").exists(),
-                "status": "success",
             }
+            # R6 : statuts DISTINCTS agent vs pipeline (review round 2).
+            # agent_status : verdict fonctionnel de l'agent BU (a-t-il
+            #   reussi le scenario ? ex: SUCCESS/FAIL/INTERRUPTED dans
+            #   final_result). Un agent qui retourne FAIL ne doit JAMAIS
+            #   apparaitre comme success meme si le pipeline a bien tourne.
+            # pipeline_status : capture + generation artifacts ont-elles
+            #   reussi ? On est arrive jusqu'ici sans exception non-catche,
+            #   donc "success" (les erreurs partielles sont dans warnings).
+            # status : overall = worst(agent, pipeline)
+            agent_result_str = str(meta.get("agent_result") or "").upper()
+            if "SUCCESS" in agent_result_str:
+                agent_status = "success"
+            elif "FAIL" in agent_result_str or "ERROR" in agent_result_str:
+                agent_status = "fail"
+            elif "INTERRUPT" in agent_result_str or "STOP" in agent_result_str:
+                agent_status = "interrupted"
+            else:
+                agent_status = "unknown"
+            pipeline_status = "success"
+            if agent_status == "fail":
+                overall = "failure"
+            elif agent_status == "interrupted":
+                overall = "interrupted"
+            else:
+                overall = "success"
+            meta["agent_status"] = agent_status
+            meta["pipeline_status"] = pipeline_status
+            meta["status"] = overall
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
         except Exception as e:
             print(f"  [WARN] Impossible d'ecrire meta.json: {e}")
