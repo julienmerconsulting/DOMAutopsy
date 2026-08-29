@@ -764,4 +764,141 @@ Le serveur garde uniquement le screencast (forwarding pur, pas de logique métie
 
 ---
 
-*Document maintenu à jour à chaque commit majeur. Dernière maj : 2026-05-10 (post-history feature).*
+---
+
+## 15. Refactor Août 2026 — unification du replay sur Playwright TS
+
+### 15.1 Motivation
+
+Avant ce refactor, deux moteurs d'exécution coexistaient sans converger :
+
+- `qa_explorer.py` produisait un `test_<format>.<ext>` (via LLM, format demandé par l'utilisateur) — utilisé comme livrable
+- `/api/replay/{run_id}` lançait `qa_player.py` — un runner Python-Playwright limité à `click` + `input`, qui **ignorait** ce `test_*.ts` généré et réimplémentait un moteur à côté
+
+Résultat : le format généré n'était jamais exécuté en interne, `qa_player.py` divergeait fonctionnellement (support partiel), et la roadmap V3+ risquait de dériver en maintenant les deux.
+
+### 15.2 Décision : `test_playwright.spec.ts` = format canonique interne
+
+Depuis le refactor :
+- **Toujours généré** par `qa_explorer` (même si l'export livrable demandé est Katalon/Cypress/Selenium)
+- **Rejoué directement** par `/api/replay/{run_id}` via `npx playwright test <spec-relatif> --workers=1`
+- **Format canonique interne**, indépendant du choix d'export utilisateur (l'export livrable reste géré séparément par le LLM)
+
+### 15.3 Nouveaux modules
+
+| Fichier | Rôle |
+|---|---|
+| `schemas.py` | Modèles Pydantic v2 versionnés (`schema_version="1.0"`), 25+ champs par step, migration transparente des anciens JSON |
+| `clean_steps_builder.py` | Pipeline unifié : `extract_browser_use_history` (3 fallbacks défensifs) → fusion multi-sources (scenario + BU history + DOM listener + network) → détection sensitive → **classification LLM** (le LLM annote `included_in_replay`, il ne construit plus les steps) |
+| `playwright_generator.py` | Traduction **déterministe** JSON→TS (15 actions, encapsulation `test.step("[step-XXXX] ...")` pour rapprochement rapport, sensitive→`process.env`, action inconnue→`throw`) |
+| `replay_reporter.py` | Rapport HTML self-contained pour les runs replay (rapproche `[step-XXXX]` du JSON reporter Playwright avec les données du `clean_steps.json` source) |
+
+### 15.4 Nouveau pipeline `qa_explorer.run()`
+
+```
+1. Chromium + CDP + DOM listener (identique)
+2. agent.run() (identique)
+3. extract_browser_use_history(agent, result)   # NOUVEAU : 3 fallbacks API BU
+   -> browser_use_history.json
+4. build_clean_steps(scenario, bu_history, dom_log, network)   # NOUVEAU
+   -> CleanSteps Pydantic v1.0 → clean_steps.json (toutes actions)
+5. generate_playwright_ts(clean_steps, spec.ts)   # NOUVEAU : toujours
+   -> test_playwright.spec.ts (format canonique)
+6. generate_export_code(...)   # NOUVEAU : si output_format != playwright
+   -> test_<format>.<ext> (Katalon / Cypress / Selenium via LLM)
+7. generate_report(clean_data_dict, ...)   # étendu : all actions + Rejoué col
+   -> qa_report_<ts>.html
+8. meta.json enrichi : schema_version, bu_history_count, sensitive_env_vars,
+   clean_steps_included/filtered, playwright_spec_present
+```
+
+### 15.5 Nouveau flow `/api/replay/{run_id}`
+
+```
+Détection : test_playwright.spec.ts présent dans le run source ?
+│
+├─ OUI (moteur PRIMAIRE - playwright_ts) :
+│    spec_rel = spec.relative_to(ROOT).as_posix()   # RELATIF, jamais absolu Windows
+│    DOMAUTOPSY_REPLAY_JSON = <replay_dir>/replay_results.json
+│    subprocess.Popen(npx playwright test <spec_rel> --workers=1 --output=<dir>)
+│    Windows : shell=True + quoting (npx est un .cmd)
+│    Streaming logs via WebSocket (reporter=list dans config)
+│    JSON reporter dans le fichier via env var → post-processing
+│    
+├─ NON (fallback LEGACY - qa_player_legacy) :
+│    print("[server] /api/replay/... -> FALLBACK LEGACY qa_player.py")
+│    meta.json : engine=qa_player_legacy, legacy_fallback=true, reason=...
+│    subprocess.Popen(python qa_player.py --run-dir ... --output-dir ...)
+│
+└─ Post-fin subprocess (via _pump_stdout hook) :
+     _postprocess_replay(run_id, replay_dir)
+     ├─ resolve source_run_dir via source_run_id
+     ├─ generate_replay_report(replay_dir, source_run_dir)
+     │    → replay_report.html (rapproche [step-XXXX] au clean_steps source)
+     └─ update_replay_meta_with_verdict(replay_dir)
+          → meta.json enrichi : replay_passed/failed/skipped/duration_ms
+     (SECONDAIRE : un échec ici ne transforme pas un test passé en fail)
+```
+
+### 15.6 Sécurité + cross-OS
+
+- **Sensitive values** : `sensitive: true` dans le JSON déclenche `env_var = "DOMAUTOPSY_STEP_XXXX"`. Le TS émet `process.env.DOMAUTOPSY_STEP_XXXX` avec `throw new Error` explicit si la var est absente. Jamais la valeur en clair dans le TS, le JSON, les logs ou le rapport.
+- **Chemin spec RELATIF** : `spec.relative_to(ROOT).as_posix()` évite d'interpréter `C:\...` comme expression de filtrage Playwright.
+- **`shell=True` cross-OS** : uniquement sur Windows, uniquement pour `npx` (qui est un `.cmd`), sans interpolation utilisateur — mêmes garanties que `/api/playwright/run` déjà en place.
+- **`channel: 'chromium'`** dans `playwright.config.ts` : réutilise le Chromium classique déjà en cache de Playwright Python (`ms-playwright/chromium-XXXX`), évite de télécharger le nouveau `chromium_headless_shell-XXXX` séparé introduit en Playwright JS 1.49+.
+
+### 15.7 Fallback legacy — dépréciation en cours
+
+`qa_player.py` :
+- Reste utilisé pour les runs pré-refactor sans `test_playwright.spec.ts`
+- **Ne doit plus évoluer** — toute nouvelle action passe par `playwright_generator`
+- Docstring + banner runtime marqués LEGACY FALLBACK
+- Réponse `/api/replay` expose `legacy_fallback: true` + `legacy_fallback_reason` pour que le CLI/UI signale à l'utilisateur
+
+### 15.8 Roadmap runtime autonome (V+1, hors scope refactor Août 2026)
+
+Le refactor actuel unifie correctement le pipeline pour le **développement** et pour un déploiement où Node + un cache Playwright Python déjà rempli sont disponibles. Il **dépend cependant** de :
+
+- `npx` trouvé dans le `PATH` système
+- `@playwright/test` installé via `npm ci`
+- Le cache Chromium partagé de Playwright Python (`~/AppData/Local/ms-playwright/chromium-XXXX` sur Windows, réutilisé via `channel: 'chromium'`)
+
+Pour un **produit final autonome** (distribution sans prérequis machine, air-gap), la V+1 doit embarquer son propre runtime :
+
+```
+DOMAutopsy/
+└── runtime/
+    ├── node/node.exe                       # Node local, jamais celui du PATH
+    ├── node_modules/@playwright/test/      # version verrouillee associee
+    └── browsers/chromium-XXXX/             # binaire embarque
+```
+
+Ajustements à faire dans `server.py::/api/replay` :
+
+- Appeler `runtime/node/node.exe` directement, jamais `npx` global
+- Positionner `PLAYWRIGHT_BROWSERS_PATH=runtime/browsers` dans l'env du subprocess
+- Utiliser la version exacte de Playwright associée au Chromium embarqué
+- Doit fonctionner **sans Node système** et **sans connexion Internet**
+
+**Critère d'acceptation** : lancer DOMAutopsy sur une machine sans Node installé et avec un cache Playwright utilisateur vide. Si le replay TypeScript fonctionne, l'installation est réellement autonome. Même logique que pour OculiX : le produit maîtrise entièrement son runtime.
+
+Ce chantier ne fait PAS partie du refactor Août 2026 (qui reste dev-mode) — il est capturé ici pour la roadmap.
+
+### 15.9 Tests couverture cahier des charges
+
+Suite `tests/` — 50 tests, 12.6s de run, dont 1 E2E réel :
+
+| Fichier | Items cahier | Nb tests |
+|---|---|---|
+| `test_schemas.py` | #5 validation JSON, #6 unknown actions, #11 legacy compat | 8 |
+| `test_playwright_generator.py` | #7 génération TS per-action, #8 exclusion parasites, #9 sensitive protection | 16 |
+| `test_clean_steps_builder.py` | #1 scrolls, #2 clicks dedup, #3 inputs consolidation, #4 autres actions, #6 unknown, #9 env_var | 15 |
+| `test_replay_routing.py` | #12 npx PW test, #13 no qa_player, #14 fallback legacy, #15 chemin relatif | 8 |
+| `test_report_generator.py` | #10 all actions rendered + FILTRE with reason | 2 |
+| `test_e2e_integration.py` | #16 scénario multi-action, exécution réelle Chromium via `npx playwright test` sur page HTTP locale | 1 |
+
+Lancement : `python -m pytest tests/` (deps : `pytest`, `httpx` dans `requirements-dev.txt`).
+
+---
+
+*Document maintenu à jour à chaque commit majeur. Dernière maj : 2026-08-29 (refactor unification Playwright TS).*

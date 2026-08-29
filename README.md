@@ -41,7 +41,7 @@ Et depuis la v0.5, c'est un **serveur web async multi-run** : tu lances N runs e
 | Multi-run parallèle | ❌ | ❌ | ❌ | **✅ 50 simultanés, port CDP unique chacun** |
 | Live screencast web | ❌ | ❌ | ❌ | **✅ WebSocket CDP, 1 capture → N viewers** |
 | Mode CI + CLI | ❌ | ⚠️ | ⚠️ | **✅ Bearer token TTL + dashboard partageable** |
-| Replay sans LLM | ❌ | ❌ | ❌ | **✅ `qa_player.py` Playwright pur** |
+| Replay sans LLM | ❌ | ❌ | ❌ | **✅ `test_playwright.spec.ts` généré + `npx playwright test`** |
 | Import scripts existants | ❌ | ❌ | ❌ | **✅ parse Katalon/PW/Cy/Sel → NL task** |
 | Prix | Gratuit | Gratuit | Gratuit | **0€** |
 
@@ -60,10 +60,41 @@ Et depuis la v0.5, c'est un **serveur web async multi-run** : tu lances N runs e
 ```bash
 git clone https://github.com/julienmerconsulting/DOMAutopsy
 cd DOMAutopsy
+
+# 1. Python (browser-use + playwright + fastapi + openai + le reste)
 pip install -r requirements.txt
-playwright install chromium
+python -m playwright install chromium   # cache: ~/AppData/Local/ms-playwright/chromium-XXXX
+
+# 2. Node/Playwright TS (pour le nouveau replay via `npx playwright test`)
+#    Depuis le refactor Aout 2026, /api/replay execute le TS canonique
+#    genere. Le cache Chromium Python (chromium-XXXX) est reutilise via
+#    `channel: 'chromium'` dans playwright.config.ts - pas besoin de
+#    re-telecharger.
+#
+#    IMPORTANT : `npm ci` (pas `npm install`). Le lockfile fige
+#    @playwright/test a la version testee compatible avec le Chromium
+#    Python en cache. Un `npm install` peut resoudre une version plus
+#    recente et casser cette compatibilite.
+npm ci
+
+# Ou tout en une commande (utilise les scripts npm) :
+#   npm run setup
+
+# ATTENTION : ne pas lancer `pip install --upgrade` sur browser-use,
+# playwright, ou toute autre lib versionnee `==` dans requirements.txt.
+# L'API browser-use bouge entre versions (les fallbacks defensifs de
+# extract_browser_use_history sont testes contre 0.12.9). Un upgrade
+# non teste peut casser silencieusement l'extraction d'historique.
+
 cp .env.example .env
 # édite .env : remplis OPENAI_API_KEY (ou GROQ_API_KEY)
+```
+
+### Lancer les tests (verification setup)
+
+```bash
+python -m pip install pytest httpx     # deps de dev, isolees de requirements.txt
+python -m pytest tests/                # 50 tests, dont 1 E2E reel via npx playwright
 ```
 
 ### Lancer le serveur
@@ -195,7 +226,7 @@ Le serveur appelle `npx playwright test` dans ton `project-dir`, force `--report
 
 ### Mode 4 — Replay d'un run historique (zéro LLM)
 
-Tu as un run validé hier ? Tu veux le rejouer aujourd'hui pour vérifier que rien n'a cassé ? `/api/replay/{run_id}` utilise `qa_player.py` (Playwright pur, pas d'agent IA) pour rejouer les `clean_steps.json` du run source :
+Tu as un run validé hier ? Tu veux le rejouer aujourd'hui pour vérifier que rien n'a cassé ? `/api/replay/{run_id}` lance **`npx playwright test`** sur le `test_playwright.spec.ts` généré systématiquement par `qa_explorer` (format canonique interne). Zéro LLM, déterministe.
 
 ```bash
 python domautopsy_cli.py replay \
@@ -204,7 +235,13 @@ python domautopsy_cli.py replay \
   --wait
 ```
 
-Pas de coût LLM, déterministe, idéal en monitoring de régression.
+**Sous le capot** (depuis le refactor Août 2026) :
+- Chaque capture produit toujours un `test_playwright.spec.ts` complet (toutes actions du Scenario Builder + natives browser-use + fallback `unknown`), avec chaque étape encapsulée dans `test.step('[step-XXXX] ...')` pour le rapprochement du rapport.
+- Le replay lance `npx playwright test <spec-relative> --workers=1` avec deux reporters (list stream pour le WebSocket, JSON pour le rapport HTML final consommé par `replay_reporter.py`).
+- Un `replay_report.html` self-contained est généré à la fin, rapproché avec le `clean_steps.json` du run source (action + sélecteur + expected/actual + réseau associé).
+- Les valeurs sensibles (`sensitive: true` dans le JSON) sont substituées par des variables d'environnement `DOMAUTOPSY_STEP_XXXX` dans le TS — jamais en clair. À positionner avant `/api/replay`.
+
+**Fallback legacy** : pour les runs pré-refactor sans TS canonique, `qa_player.py` reste utilisé mais avec un warning explicite dans les logs + `engine: "qa_player_legacy"` dans le `meta.json`. Il ne supporte que `click` et `input` et ne sera plus étendu.
 
 ### Bonus — Import d'un script existant
 
@@ -330,12 +367,26 @@ python domautopsy_cli.py auth revoke --token $MASTER_TOKEN --suffix abc12345
 
 ```
 runs/<YYYYMMDD_HHMMSS>_<runid>/
-├── locator_log.json       # capture brute du listener
-├── locator_dedup.json     # après dédup (clics consécutifs, dernière valeur input)
-├── clean_steps.json       # nettoyé par IA + anomalies + code généré
-├── test_<format>.<ext>    # code rejouable : .groovy / .ts / .js / .py
-├── qa_report_<ts>.html    # rapport self-contained (Chart.js, dark theme)
-└── meta.json              # metadata (timestamp, status, counts, verdict)
+├── locator_log.json           # capture brute du listener
+├── locator_dedup.json         # après dédup (clics consécutifs, dernière valeur input)
+├── browser_use_history.json   # historique complet des actions BU (nouveau v0.6)
+├── clean_steps.json           # schéma v1.0 (Pydantic-validé), toutes actions,
+│                              # marquage included_in_replay + cleanup_reason
+├── test_playwright.spec.ts    # TOUJOURS généré : format canonique de replay
+├── test_<format>.<ext>        # export livrable optionnel : .groovy / .cy.js / .py
+├── qa_report_<ts>.html        # rapport self-contained (Chart.js, dark theme)
+├── network_log.json           # trafic HTTP filtré (Fetch/XHR/Document/WS)
+├── js_errors.json             # Runtime.exceptionThrown captures
+├── console_messages.json      # Console.messageAdded captures
+└── meta.json                  # metadata + counts + schema_version + engine
+```
+
+**Runs de replay** (dans `runs/<ts>_replay_<id>/`) :
+```
+├── replay_results.json        # JSON reporter Playwright (verdict per test.step)
+├── replay_report.html         # rapport self-contained enrichi source_run
+├── stdout.log / stderr.log    # trace complète du subprocess
+└── meta.json                  # engine (playwright_ts | qa_player_legacy)
 ```
 
 ### Le rapport HTML (`qa_report_*.html`)

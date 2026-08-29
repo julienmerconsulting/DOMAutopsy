@@ -5,8 +5,12 @@
   "description": "Runtime Playwright TypeScript pour rejouer les captures DOMAutopsy generees dans runs/*/test_playwright.spec.ts",
   "scripts": {
     "install-browsers": "playwright install chromium",
+    "setup:python": "python -m pip install -r requirements.txt && python -m playwright install chromium",
+    "setup:node": "npm ci",
+    "setup": "npm run setup:python && npm run setup:node",
     "test": "playwright test",
-    "test:run": "playwright test --reporter=list --workers=1"
+    "test:run": "playwright test --workers=1",
+    "test:python": "python -m pytest tests/"
   },
   "devDependencies": {
     "@playwright/test": "^1.49.0",
