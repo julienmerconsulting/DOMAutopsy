@@ -88,11 +88,14 @@ async function loadHistory() {
           <span style="margin-left:auto;">${escapeHtml(dt)}</span>
         </div>
       `;
-      li.title = "Clic : ouvre le rapport HTML  |  Shift+clic : code de test  |  bouton ▶ : rejoue le parcours";
-      // Bouton replay
+      li.title = "Clic : ouvre le rapport HTML  |  Shift+clic : code de test  |  bouton ▶ : rejoue le test Playwright TypeScript genere";
+      // Bouton replay : lance `npx playwright test` sur le test_playwright.spec.ts
+      // genere pour ce run (fallback qa_player.py si le run est ancien et n'a
+      // pas encore de TS). C'est distinct du bouton "Lancer suite Playwright"
+      // du form principal qui pointe vers un projet Playwright utilisateur.
       const replayBtn = document.createElement("button");
       replayBtn.className = "history-replay";
-      replayBtn.title = "Rejouer ce parcours via Playwright pur (sans LLM, deterministe)";
+      replayBtn.title = "Rejouer ce parcours via le test Playwright TypeScript genere (npx playwright test)";
       replayBtn.innerHTML = "&#9654;";
       replayBtn.addEventListener("click", async (ev) => {
         ev.stopPropagation();
@@ -193,10 +196,16 @@ async function replayRun(sourceRunId) {
       const err = await resp.json().catch(() => ({detail: `HTTP ${resp.status}`}));
       throw new Error(err.detail || "Erreur");
     }
-    const { run_id, cdp_port, source_run_id } = await resp.json();
+    const { run_id, cdp_port, source_run_id, engine, legacy_fallback, legacy_fallback_reason } = await resp.json();
     currentRunId = run_id;
     setRunActive(run_id, cdp_port);
-    appendLog(`>> Replay ${run_id} (source: ${source_run_id}) sur CDP ${cdp_port} - Playwright pur, no LLM`, "ok");
+    if (legacy_fallback) {
+      appendLog(`>> Replay ${run_id} (source: ${source_run_id}) - FALLBACK LEGACY qa_player.py`, "warn");
+      appendLog(`   Raison : ${legacy_fallback_reason}`, "warn");
+      appendLog(`   Ce run n'a pas de test_playwright.spec.ts (capture pre-refactor).`, "warn");
+    } else {
+      appendLog(`>> Replay ${run_id} (source: ${source_run_id}) via ${engine} - npx playwright test`, "ok");
+    }
     logSocket = openLogSocket(run_id);
     setTimeout(() => { screenSocket = openScreenSocket(run_id); }, 1500);
     refreshActiveRuns();
