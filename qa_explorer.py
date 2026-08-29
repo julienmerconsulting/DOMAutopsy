@@ -1142,6 +1142,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             "llm": llm,
             "browser_session": browser_session,
             "use_vision": use_vision,
+            "max_actions_per_step": 10,
         }
         try:
             agent = Agent(**agent_kwargs)
