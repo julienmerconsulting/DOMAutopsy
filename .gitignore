@@ -31,3 +31,10 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Node / Playwright runtime (installes localement par npm install)
+# package-lock.json est INTENTIONNELLEMENT versionne : garantit npm ci reproductible.
+node_modules/
+playwright-report/
+test-results/
+.playwright/
