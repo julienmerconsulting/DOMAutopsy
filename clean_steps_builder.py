@@ -375,17 +375,23 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     # de conversion sec->ms qui casserait un test avec de petits ts.
     ts_raw = entry.get("timestamp")
     ts_ms = int(ts_raw) if isinstance(ts_raw, (int, float)) else None
+    # parentLabel : contexte capture par le DOM listener pour les
+    # change events sur checkbox/radio (permet la desambiguisation
+    # ulterieure dans les listes type TodoMVC).
+    raw = {}
+    if entry.get("parentLabel"):
+        raw["parentLabel"] = entry["parentLabel"]
     step = Step(
         id=f"step-{index:04d}",
         step=index,
         action=action,
-        description=entry.get("text") or None,
+        description=entry.get("text") or entry.get("parentLabel") or None,
         page=entry.get("url"),
         url=entry.get("url"),
         timestamp=ts_ms,
         selector=sel,
         selectorType=("xpath" if sel and sel.value and sel.value.startswith("//") else ("window" if action == "scroll" else "css")),
-        target=entry.get("text"),
+        target=entry.get("text") or entry.get("parentLabel"),
         unique=(sel.unique if sel else None),
         matchCount=(sel.matchCount if sel else None),
         inShadowDOM=bool(entry.get("inShadowDOM")),
@@ -396,6 +402,7 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
         scrollY=entry.get("scrollY"),
         source="dom_listener",
         included_in_replay=True,  # sera potentiellement passe a false par ai_classify_steps
+        raw_payload=raw or None,
     )
     return step
 
@@ -649,6 +656,9 @@ def _normalize_bu_action_name(name: str) -> str | None:
         "find_element": "extract",
         "get_dom_state": "extract",
         "query_selector": "extract",
+        "search_page": "extract",
+        "read_dom": "extract",
+        "get_page_content": "extract",
         # BU 0.13 evaluate : execution JS brute (workaround click quand
         # selecteur ambigu ou element hors-flow). Rejouable en TS via
         # page.evaluate() - c'est une vraie interaction reproductible.
@@ -772,7 +782,10 @@ def build_pre_cleanup_steps(
             per_action_element = na.get("interacted_element")
 
             step: Step | None = None
-            if normalized in ("click", "input", "scroll", "select", "hover"):
+            # keyboard/check/uncheck ajoutes : le DOM listener capture ces
+            # events aussi (keydown Enter/Tab, change checkbox) - on doit
+            # dedup contre le BU pour ne pas emit 2 fois la meme action.
+            if normalized in ("click", "input", "scroll", "select", "hover", "keyboard", "check", "uncheck"):
                 matched_idx = _find_matching_dom(normalized, window_start, window_end)
                 if matched_idx is not None:
                     dom_consumed[matched_idx] = True
@@ -848,6 +861,14 @@ def build_pre_cleanup_steps(
     ))
     steps = [s for _, s in steps_indexed]
 
+    # 5bis. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
+    # arrivent proches sur la meme famille selecteur, ces 3 sources
+    # observent UNE SEULE interaction utilisateur. Le change porte la
+    # semantique (checked bool) + parentLabel, on le garde comme step
+    # canonique. Le click et l'evaluate sont marques included_in_replay=
+    # False + raw_payload.fused_sources trace les preuves fusionnees.
+    _fuse_checkbox_interactions(steps)
+
     # 6. Rapprochement network
     if network_log:
         _link_network_to_steps(steps, network_log)
@@ -858,6 +879,87 @@ def build_pre_cleanup_steps(
         s.step = i
 
     return steps
+
+
+def _step_selector_value(step: Step) -> str | None:
+    sel = step.selector
+    if sel is None:
+        return None
+    if isinstance(sel, str):
+        return sel
+    return getattr(sel, "value", None)
+
+
+def _fuse_checkbox_interactions(steps: list[Step]) -> None:
+    """Fusion des observations multiples d'une SEULE interaction checkbox.
+
+    Contexte : un toggle checkbox produit dans le brut :
+      - 1 DOM click (parfois sur selecteur ambigu ex [aria-label="Toggle Todo"])
+      - 1 DOM change (avec checked bool + parentLabel + accessibleName)
+      - eventuellement 1 BU evaluate (workaround JS si le click direct BU
+        n'a rien fait a cause de l'ambiguite)
+
+    Ces trois sources decrivent LA MEME action. Rejouer les trois donne
+    des double-clicks / triple toggles imprevisibles. Le nettoyage doit
+    produire UN SEUL step canonique.
+
+    Strategie :
+      - Le step 'check' ou 'uncheck' (issu du DOM change) est canonique :
+        il porte la semantique reelle (checked bool) + parentLabel +
+        accessibleName + selecteur exact. C'est celui qu'on rejoue.
+      - Le click DOM avec selecteur identique dans une fenetre FUSE_WINDOW_MS
+        est fusionne : included_in_replay=False + cleanup_reason.
+      - L'evaluate BU avec code JS qui manipule .toggle/.checked/.click()
+        dans la meme fenetre est fusionne aussi.
+      - raw_payload.fused_sources trace les IDs des steps fusionnes pour
+        audit et rapport.
+    """
+    FUSE_WINDOW_MS = 2000
+    for i, canonical in enumerate(steps):
+        if canonical.action not in ("check", "uncheck"):
+            continue
+        ts = canonical.timestamp
+        if ts is None:
+            continue
+        canonical_sel = _step_selector_value(canonical)
+        fused = []
+        for j, other in enumerate(steps):
+            if j == i or other.timestamp is None:
+                continue
+            if not other.included_in_replay:
+                continue
+            if abs(other.timestamp - ts) > FUSE_WINDOW_MS:
+                continue
+            # DOM click sur meme selecteur ou dans le meme sous-arbre
+            if other.action == "click":
+                other_sel = _step_selector_value(other)
+                if other_sel and canonical_sel and (
+                    other_sel == canonical_sel
+                    or other_sel in canonical_sel
+                    or canonical_sel in other_sel
+                ):
+                    other.included_in_replay = False
+                    other.cleanup_reason = (
+                        f"fusionne dans {canonical.id} (canonique check/uncheck "
+                        f"avec semantique checked + parentLabel)"
+                    )
+                    fused.append(other.id)
+            # BU evaluate qui touche a un toggle/checkbox
+            elif other.action == "evaluate":
+                code = ((other.value or "") + " " + (other.description or "")).lower()
+                if any(kw in code for kw in (".toggle", ".checked", "checkbox", "querySelectorAll".lower())):
+                    if ".click()" in code or ".checked" in code:
+                        other.included_in_replay = False
+                        other.cleanup_reason = (
+                            f"fusionne dans {canonical.id} (workaround JS "
+                            f"pour la meme interaction, deja capturee par le change)"
+                        )
+                        fused.append(other.id)
+        if fused:
+            raw = canonical.raw_payload or {}
+            if isinstance(raw, dict):
+                raw["fused_sources"] = fused
+                canonical.raw_payload = raw
 
 
 def _link_network_to_steps(steps: list[Step], network_log: list[dict[str, Any]]) -> None:

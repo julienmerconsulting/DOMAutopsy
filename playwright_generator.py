@@ -141,6 +141,19 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     if not loc:
         raise UnsupportedAction(step, "click sans selecteur")
+    # Desambiguisation via parentLabel : si le DOM listener a capture le
+    # texte du parent <li> autour de l'element clique, on utilise le
+    # pattern getByRole('listitem').filter({hasText}).locator(sel) pour
+    # cibler le bon element parmi plusieurs matches (ex: [aria-label=
+    # 'Toggle Todo'] apparait 4 fois dans TodoMVC, mais un seul est dans
+    # le <li> contenant 'Verifier les selecteurs').
+    raw = step.raw_payload or {}
+    parent_label = raw.get("parentLabel") if isinstance(raw, dict) else None
+    if parent_label:
+        sel_v, _ = _selector_value_and_type(step)
+        pl = _ts_string(parent_label)
+        sv = _ts_string(sel_v or "")
+        return [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
     # PAS de .first() : Playwright en mode strict crashe sur selecteur
     # ambigu, ce qui est le comportement voulu (faire echouer plutot que
     # cliquer silencieusement sur le mauvais element). Le .first() ne
@@ -341,6 +354,36 @@ def _emit_close_tab(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     ]
 
 
+def _emit_check_uncheck(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
+    """Canonique : locator.setChecked(true/false) - impose l'etat capture
+    au lieu de le toggle. IDEMPOTENT : rejouer 2 fois donne le meme etat,
+    contrairement a check()+click() qui inverserait.
+
+    Pattern preferre quand le DOM listener a capture le contexte parent
+    (parentLabel) - typique TodoMVC :
+        page.getByRole('listitem').filter({hasText: label})
+            .getByRole('checkbox').setChecked(bool)
+    Cette forme est UNIQUE meme quand [aria-label='Toggle Todo'] matche
+    4 elements (strict mode Playwright content).
+
+    Fallback sans parentLabel : locator classique .setChecked(bool).
+    """
+    checked_bool = "true" if step.action == "check" else "false"
+    raw = step.raw_payload or {}
+    parent_label = None
+    if isinstance(raw, dict):
+        parent_label = raw.get("parentLabel")
+    if parent_label:
+        pl_escaped = _ts_string(parent_label)
+        return [
+            f"    await page.getByRole('listitem').filter({{ hasText: {pl_escaped} }}).getByRole('checkbox').setChecked({checked_bool});"
+        ]
+    loc = _locator_expr(step)
+    if not loc:
+        raise UnsupportedAction(step, f"{step.action} sans selecteur ni parentLabel")
+    return [f"    await {loc}.setChecked({checked_bool});"]
+
+
 def _emit_evaluate(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     """evaluate : execution JS brute via page.evaluate(). BU 0.13 utilise
     cette action pour les workaround clicks quand un selecteur est
@@ -414,6 +457,8 @@ EMITTERS = {
     "close_tab": _emit_close_tab,
     "extract": _emit_extract,   # garde-fou : leve si included_in_replay=True
     "evaluate": _emit_evaluate,
+    "check": _emit_check_uncheck,
+    "uncheck": _emit_check_uncheck,
     # input et screenshot ont une signature enrichie (index)
 }
 

@@ -289,11 +289,24 @@
         let el = getRealTarget(e);
         let sel = getBestSelector(el);
         let text = (el.innerText || el.textContent || '').trim().substring(0, 80);
+        // Contexte parent li (TodoMVC-like) : si le click est dans un
+        // <li>, on capture le texte du label pour permettre la
+        // desambiguisation dans le TS via getByRole('listitem').filter()
+        // On garde le click (pas de skip meme sur checkbox) : le change
+        // event le complete avec la semantique on/off, mais le click
+        // reste l'action canonique de reference.
+        let parentLabel = null;
+        let li = el.closest ? el.closest('li') : null;
+        if (li) {
+            let labelEl = li.querySelector('label');
+            if (labelEl) parentLabel = (labelEl.innerText || labelEl.textContent || '').trim().substring(0, 200);
+        }
         saveEntry({
             action: 'click',
             timestamp: Date.now(),
             tag: el.tagName,
             text: text,
+            parentLabel: parentLabel,
             selector: sel,
             url: location.href,
             inShadowDOM: sel.inShadowDOM,
@@ -310,8 +323,17 @@
         });
     }, true);
 
+    // -- INPUT LISTENER (fix cahier R9 : les checkbox/radio ne sont PAS
+    // des inputs texte, filter pour ne pas produire de setText("on")
+    // parasite qui fait des saisies fantomes). Le vrai toggle est
+    // capture par le click listener (ou par l'evaluate BU).
     document.addEventListener('input', (e) => {
         let el = getRealTarget(e);
+        // Skip checkbox/radio : leur "input" event = toggle, capturable
+        // via 'change' ou via le click deja capture. Value=="on" par defaut
+        // n'a aucun sens en saisie texte.
+        const elType = (el && el.getAttribute && (el.getAttribute('type') || '').toLowerCase()) || '';
+        if (elType === 'checkbox' || elType === 'radio') return;
         let sel = getBestSelector(el);
         let sensitive = isSensitiveField(el);
         saveEntry({
@@ -329,6 +351,63 @@
                 type: el.getAttribute ? el.getAttribute('type') : null,
                 placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
                 'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
+                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
+            }
+        });
+    }, true);
+
+    // -- CHANGE LISTENER dedie aux checkbox/radio.
+    // Produit une action SEMANTIQUE 'check' ou 'uncheck' avec tout le
+    // contexte necessaire au replay TS deterministe :
+    //   - checked (bool) : etat cible reel apres la modification
+    //   - matchCount : nb elements que le selecteur matche (permet au
+    //     replay de savoir qu'il y a ambiguite meme sans .first())
+    //   - accessibleName : aria-label ou label associe (fallback textuel)
+    //   - parentLabel : texte du <li> parent (pattern TodoMVC-like)
+    //   - parentSelector : css_short du parent li pour construire
+    //     getByRole('listitem').filter({hasText: parentLabel}).locator(sel)
+    //   - timestamp precis
+    document.addEventListener('change', (e) => {
+        let el = getRealTarget(e);
+        const elType = (el && el.getAttribute && (el.getAttribute('type') || '').toLowerCase()) || '';
+        if (elType !== 'checkbox' && elType !== 'radio') return;
+        let sel = getBestSelector(el);
+        // Contexte parent li (TodoMVC) pour desambiguisation
+        let parentLabel = null;
+        let parentSelector = null;
+        let li = el.closest ? el.closest('li') : null;
+        if (li) {
+            let labelEl = li.querySelector('label');
+            if (labelEl) parentLabel = (labelEl.innerText || labelEl.textContent || '').trim().substring(0, 200);
+            parentSelector = getQuickSelector(li);
+        }
+        // Accessible name : aria-label, label associe ou nearest text
+        let accessibleName = null;
+        if (el.getAttribute && el.getAttribute('aria-label')) {
+            accessibleName = el.getAttribute('aria-label');
+        } else if (el.id) {
+            try {
+                let lbl = document.querySelector('label[for="' + attrValue(el.id) + '"]');
+                if (lbl) accessibleName = (lbl.innerText || lbl.textContent || '').trim().substring(0, 100);
+            } catch(_e) {}
+        }
+        saveEntry({
+            action: el.checked ? 'check' : 'uncheck',
+            timestamp: Date.now(),
+            tag: el.tagName,
+            checked: !!el.checked,        // etat cible boolean explicite
+            value: el.checked ? 'true' : 'false',
+            selector: sel,
+            matchCount: sel.matchCount,   // exposition explicite (deja dans sel mais duplication utile)
+            url: location.href,
+            inShadowDOM: sel.inShadowDOM,
+            parentLabel: parentLabel,
+            parentSelector: parentSelector,
+            accessibleName: accessibleName,
+            attributes: {
+                id: el.id || null,
+                name: el.getAttribute ? el.getAttribute('name') : null,
+                type: elType,
                 'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
             }
         });
