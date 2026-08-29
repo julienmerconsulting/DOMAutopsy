@@ -458,10 +458,15 @@ async def run_playwright(req: PlaywrightRunRequest):
 async def replay_run(run_id: str, headless: bool = True):
     """Rejoue un run historique. Deux moteurs :
 
-    - PRIMAIRE : `npx playwright test <spec-relative> --workers=1 --reporter=list`
-      quand test_playwright.spec.ts est present dans le dossier source. C'est
-      le format canonique produit systematiquement par qa_explorer (schema
-      v1.0). Ce chemin est le moteur normal a partir du refactor Aout 2026.
+    - PRIMAIRE : `npx playwright test <spec-relative> --workers=1
+      --output=<replay_dir>` quand test_playwright.spec.ts est present dans
+      le dossier source. Les 2 reporters (list stream + json fichier) sont
+      declares dans playwright.config.ts, pas en CLI (sinon --reporter=list
+      remplacerait tout et le JSON ne serait pas produit). Le fichier JSON
+      atterrit dans <replay_dir>/replay_results.json via l'env var
+      DOMAUTOPSY_REPLAY_JSON. C'est le format canonique produit
+      systematiquement par qa_explorer (schema v1.0). Ce chemin est le
+      moteur normal a partir du refactor Aout 2026.
 
     - LEGACY FALLBACK : qa_player.py (Playwright pur Python, click+input
       seulement) uniquement pour les anciens runs qui n'ont pas encore de

@@ -1,6 +1,8 @@
 // DOMAutopsy — configuration Playwright pour rejouer les tests generes.
 // Le runner est appele par /api/replay/{run_id} qui invoque
-//    npx playwright test <chemin-absolu-du-spec> --workers=1 --reporter=list
+//    npx playwright test <chemin-RELATIF-au-repo> --workers=1 --output=<dir>
+// (surtout pas de --reporter en CLI : ca ecraserait la config ci-dessous
+// et le reporter JSON ne serait plus produit)
 // Le TS genere par playwright_generator.py est agnostique de ce fichier
 // (il embarque son propre test.step() sans depender de fixtures custom),
 // mais on garde une config minimale pour standardiser retries, timeouts

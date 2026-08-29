@@ -102,7 +102,8 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     chart_data = list(strategy_counts.values())
     chart_colors = [strategy_colors.get(s, '#95a5a6') for s in chart_labels]
 
-    # Actions chart
+    # Actions chart - couvre les 10 actions du Scenario Builder + les natives
+    # browser-use (navigate, keyboard, upload, tabs, go_back...) + unknown.
     action_labels = list(action_counts.keys())
     action_data = list(action_counts.values())
     action_colors = {
@@ -112,6 +113,22 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         'select': '#9b59b6',
         'hover': '#1abc9c',
         'dom_unstable': '#e74c3c',
+        'navigate': '#0ea5e9',
+        'verify': '#a3e635',
+        'wait': '#facc15',
+        'screenshot': '#f472b6',
+        'cookie': '#fbbf24',
+        'keyboard': '#c084fc',
+        'key_press': '#c084fc',
+        'upload': '#38bdf8',
+        'file_upload': '#38bdf8',
+        'go_back': '#94a3b8',
+        'go_forward': '#94a3b8',
+        'reload': '#94a3b8',
+        'open_tab': '#5eead4',
+        'switch_tab': '#5eead4',
+        'close_tab': '#5eead4',
+        'unknown': '#64748b',
     }
     action_chart_colors = [action_colors.get(a, '#95a5a6') for a in action_labels]
 
@@ -127,31 +144,72 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     }
 
     # --- Generation HTML ---
+    # Le schema v1.0 (post-refactor Aout 2026) stocke selector comme dict
+    # {value, strategy, unique, matchCount, ...}. Les anciens JSON avaient
+    # selector comme string simple. On gere les deux via _extract_selector().
+    def _extract_selector(s):
+        sel = s.get('selector')
+        if isinstance(sel, dict):
+            return sel.get('value') or sel.get('playwrightSelector') or '?', sel
+        return (sel or '?'), None
+
     steps_rows = ""
     for s in steps:
-        action = s.get('action', '?')
-        desc = s.get('description', '?')
-        selector = s.get('selector', '?')
-        sel_type = s.get('selectorType', '?')
-        unique = s.get('unique', False)
-        value = s.get('value', '')
+        action = (s.get('action') or '?').lower()
+        desc = s.get('description') or ''
+        sel_value, sel_dict = _extract_selector(s)
+        sel_type = s.get('selectorType') or (sel_dict.get('strategy') if sel_dict else '?')
+        # unique peut vivre au top-level (post-refactor) ou dans selector dict
+        unique = s.get('unique')
+        if unique is None and sel_dict:
+            unique = sel_dict.get('unique')
+        value = s.get('value') or ''
+        included = s.get('included_in_replay', True)
+        cleanup_reason = s.get('cleanup_reason') or ''
+        sensitive = bool(s.get('sensitive'))
 
-        unique_badge = (
-            '<span class="badge badge-ok">UNIQUE</span>' if unique 
-            else '<span class="badge badge-warn">NON-UNIQUE</span>'
-        )
-        value_cell = f'<code>{value}</code>' if value else '<span class="text-muted">—</span>'
+        # Badge unicite : ok/warn/muted si absent (les actions sans selecteur
+        # comme navigate/wait n'ont pas de matchCount et ne doivent pas
+        # apparaitre en NON-UNIQUE par defaut faux-negatif)
+        if unique is True:
+            unique_badge = '<span class="badge badge-ok">UNIQUE</span>'
+        elif unique is False:
+            unique_badge = '<span class="badge badge-warn">NON-UNIQUE</span>'
+        else:
+            unique_badge = '<span class="text-muted">&mdash;</span>'
+
+        # Badge replay : INCLUS (vert) ou FILTRE (orange + tooltip raison)
+        if included:
+            replay_badge = '<span class="badge badge-ok">INCLUS</span>'
+        else:
+            safe_reason = (cleanup_reason or 'filtre par le nettoyage IA').replace('"', '&quot;')
+            replay_badge = f'<span class="badge badge-warn" title="{safe_reason}">FILTRE</span>'
+
+        # Valeur : masquee si sensitive
+        if sensitive:
+            value_cell = '<span class="badge badge-sensitive" title="valeur masquee, sera injectee via var d\'env au replay">SENSITIVE</span>'
+        elif value:
+            value_cell = f'<code>{value}</code>'
+        else:
+            value_cell = '<span class="text-muted">&mdash;</span>'
+
+        # Ligne visuellement demarquee si skippee
+        row_class = ' class="step-skipped"' if not included else ''
+        reason_row = ''
+        if not included and cleanup_reason:
+            reason_row = f'<tr class="step-skipped-reason"><td></td><td colspan="7" class="cleanup-reason">Raison filtrage : {cleanup_reason}</td></tr>'
 
         steps_rows += f"""
-        <tr>
+        <tr{row_class}>
             <td class="step-num">{s.get('step', '?')}</td>
             <td><span class="action-tag action-{action}">{action.upper()}</span></td>
             <td>{desc}</td>
-            <td><code class="selector">{selector}</code></td>
+            <td><code class="selector">{sel_value}</code></td>
             <td><span class="sel-type">{sel_type}</span></td>
             <td>{unique_badge}</td>
             <td>{value_cell}</td>
-        </tr>"""
+            <td>{replay_badge}</td>
+        </tr>{reason_row}"""
 
     anomalies_html = ""
     if anomalies:
@@ -700,6 +758,32 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         .action-select {{ background: #3b0764; color: #d8b4fe; }}
         .action-hover {{ background: #134e4a; color: #5eead4; }}
         .action-verify {{ background: #365314; color: #bef264; }}
+        .action-navigate {{ background: #0c4a6e; color: #7dd3fc; }}
+        .action-wait {{ background: #713f12; color: #fde68a; }}
+        .action-screenshot {{ background: #831843; color: #f9a8d4; }}
+        .action-cookie {{ background: #78350f; color: #fcd34d; }}
+        .action-keyboard {{ background: #4c1d95; color: #c4b5fd; }}
+        .action-key_press {{ background: #4c1d95; color: #c4b5fd; }}
+        .action-upload {{ background: #075985; color: #7dd3fc; }}
+        .action-file_upload {{ background: #075985; color: #7dd3fc; }}
+        .action-go_back {{ background: #1f2937; color: #cbd5e1; }}
+        .action-go_forward {{ background: #1f2937; color: #cbd5e1; }}
+        .action-reload {{ background: #1f2937; color: #cbd5e1; }}
+        .action-open_tab {{ background: #134e4a; color: #5eead4; }}
+        .action-switch_tab {{ background: #134e4a; color: #5eead4; }}
+        .action-close_tab {{ background: #134e4a; color: #5eead4; }}
+        .action-unknown {{ background: #292524; color: #a8a29e; }}
+
+        /* Steps filtres par le nettoyage IA : conserves pour tracabilite */
+        .step-skipped td {{ opacity: 0.55; }}
+        .step-skipped-reason td.cleanup-reason {{
+            padding: 4px 12px 12px 12px;
+            font-size: 12px;
+            color: #fbbf24;
+            font-style: italic;
+            border-bottom: 1px solid #1e293b;
+        }}
+        .badge-sensitive {{ background: #0e7490; color: #a5f3fc; }}
 
         /* Selector type */
         .sel-type {{
@@ -852,6 +936,12 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         <!-- Parcours nettoye -->
         <div class="card">
             <h2>Parcours nettoye ({total_steps} steps)</h2>
+            <p style="color:#8b949e;font-size:13px;margin-bottom:16px">
+                Les steps marques <span class="badge badge-warn">FILTRE</span> sont
+                conserves pour la tracabilite mais NE SONT PAS rejoues par
+                <code>test_playwright.spec.ts</code>. La raison du filtrage est
+                affichee sous chaque ligne concernee.
+            </p>
             <table>
                 <thead>
                     <tr>
@@ -862,6 +952,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
                         <th>Type</th>
                         <th>Unique</th>
                         <th>Valeur</th>
+                        <th>Rejoue</th>
                     </tr>
                 </thead>
                 <tbody>
