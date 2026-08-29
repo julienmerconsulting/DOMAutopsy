@@ -22,12 +22,12 @@
 # Core - browser-use tire toutes ses transitives via ses Requires-Dist
 # strictes (34 packages). On epingle explicitement ce qui est important
 # pour DOMAutopsy et qu'on utilise directement.
-browser-use==0.12.9
+browser-use==0.13.8
 playwright==1.57.0
 openai==2.16.0
 python-dotenv==1.2.2
 pydantic==2.12.5
-aiohttp==3.13.4
+aiohttp==3.14.3
 PySide6==6.10.1
 
 # Web UI (server.py)
