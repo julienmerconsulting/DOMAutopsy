@@ -40,3 +40,8 @@ node_modules/
 playwright-report/
 test-results/
 .playwright/
+
+# Runtime autonome telecharge par `python domautopsy_cli.py runtime install`
+# (Node.exe + @playwright/test + Chromium ~200MB au total, JAMAIS committes).
+# Le code d'install lui-meme (runtime_installer.py) reste versionne.
+runtime/

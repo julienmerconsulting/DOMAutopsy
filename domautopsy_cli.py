@@ -246,6 +246,46 @@ def cmd_auth_genkey(args):
         print(token)
 
 
+def cmd_install_runtime(args):
+    """Telecharge Node + @playwright/test + Chromium dans runtime/.
+    Pas de connexion serveur : execution locale pure."""
+    from runtime_installer import install
+    try:
+        st = install(force=args.force)
+        sys.exit(0 if st.get("complete") else 1)
+    except Exception as e:
+        print(f"[domautopsy-cli] Install runtime echec : {e}", file=sys.stderr)
+        sys.exit(2)
+
+
+def cmd_runtime_status(args):
+    """Affiche l'etat du runtime autonome en JSON. Exit code 0 si complet,
+    1 si incomplet - utile pour un check CI."""
+    from runtime_installer import status
+    st = status()
+    if args.json:
+        print(json.dumps(st, indent=2, ensure_ascii=False))
+    else:
+        complete = st.get("complete")
+        print(f"Runtime : {'COMPLET' if complete else 'INCOMPLET'}")
+        node = st.get("node") or {}
+        pwt = st.get("playwright_test") or {}
+        chr_ = st.get("chromium") or {}
+        print(f"  Node          : {'OK' if node.get('installed') else 'ABSENT'} "
+              f"(installe: {node.get('version') or '-'}, cible: {node.get('target') or '-'})")
+        print(f"  @playwright/test : {'OK' if pwt.get('installed') else 'ABSENT'} "
+              f"(v{pwt.get('version') or '-'})")
+        chromiums = chr_.get("installed_versions") or []
+        print(f"  Chromium      : {len(chromiums)} version(s) : {', '.join(chromiums) if chromiums else 'AUCUNE'}")
+        if complete:
+            print(f"\nActiver dans .env :")
+            for k, v in (st.get("recommended_env_vars") or {}).items():
+                print(f"  {k}={v}")
+        else:
+            print(f"\nLancer : python domautopsy_cli.py runtime install")
+    sys.exit(0 if st.get("complete") else 1)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DOMAutopsy CLI : trigger des runs a distance, polling CI ou tail live"
@@ -319,6 +359,18 @@ def main():
     p_genkey.add_argument("--bytes", type=int, default=32, help="Nombre d'octets (defaut: 32 = 64 chars hex = 256 bits)")
     p_genkey.add_argument("--env", action="store_true", help="Sortie au format 'DOMAUTOPSY_API_TOKEN=...' pour append direct a .env")
     p_genkey.set_defaults(func=cmd_auth_genkey)
+
+    # runtime : sous-commandes install / status pour le runtime autonome
+    p_runtime = sub.add_parser("runtime", help="Gere le runtime autonome (Node + Playwright + Chromium dans runtime/)")
+    rt_sub = p_runtime.add_subparsers(dest="runtime_cmd", required=True)
+
+    p_rt_install = rt_sub.add_parser("install", help="Telecharge Node + @playwright/test + Chromium dans runtime/ (idempotent)")
+    p_rt_install.add_argument("--force", action="store_true", help="Re-telecharge meme si deja present")
+    p_rt_install.set_defaults(func=cmd_install_runtime)
+
+    p_rt_status = rt_sub.add_parser("status", help="Affiche l'etat du runtime autonome (exit 0 si complet, 1 sinon)")
+    p_rt_status.add_argument("--json", action="store_true", help="Sortie JSON complete au lieu du resume texte")
+    p_rt_status.set_defaults(func=cmd_runtime_status)
 
     args = parser.parse_args()
     args.func(args)
