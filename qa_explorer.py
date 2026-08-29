@@ -1386,21 +1386,36 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     print(f"    [ATTENTION] {u['step_id']} ({u['action']}) : {u['reason']}")
 
             # -- ETAPE 9b : Si le format demande n'est pas playwright, generer
-            # aussi l'export livrable (Katalon/Cypress/Selenium) via IA.
+            # aussi l'export livrable (Katalon/Cypress/Selenium) DETERMINISTIQUEMENT
+            # (fix R5 : ancien code utilisait le LLM qui pouvait reordonner /
+            # ajouter / supprimer des actions - ex: 74 Enter alors que le
+            # JSON n'en contient que 46). Nouveau : les exporters partent
+            # strictement de clean_steps.json et produisent 1 statement par
+            # step included_in_replay=True. Validation automatique en sortie.
             if output_format != "playwright":
-                export_code = generate_export_code(
-                    clean_steps=clean_steps,
-                    output_format=output_format,
-                    model=model,
-                    base_url=base_url,
-                    api_key=api_key,
-                    output_formats_map=OUTPUT_FORMATS,
-                )
-                if export_code:
+                from deterministic_exporters import EXPORTERS, validate_export_counts
+                exporter = EXPORTERS.get(output_format)
+                if exporter is not None:
+                    export_code = exporter(clean_steps)
                     fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
                     code_file = output_dir / f"test_{output_format}{fmt_info['extension']}"
                     code_file.write_text(export_code, encoding="utf-8")
-                    print(f"  Code {fmt_info['label']} (export) -> {code_file}")
+                    print(f"  Code {fmt_info['label']} (export DETERMINISTE) -> {code_file}")
+
+                    # Validation coherence export vs clean_steps
+                    export_anomalies = validate_export_counts(clean_steps, export_code, output_format)
+                    if export_anomalies:
+                        print(f"  [ATTENTION] {len(export_anomalies)} anomalies validation export {output_format} :")
+                        for a in export_anomalies:
+                            print(f"    - {a}")
+                        # Ajoute aux anomalies globales du clean_steps + reecrit
+                        clean_steps.anomalies.extend(export_anomalies)
+                        clean_file.write_text(
+                            clean_steps.model_dump_json(indent=2, exclude_none=True),
+                            encoding="utf-8",
+                        )
+                else:
+                    print(f"  [WARN] Aucun exporter deterministe pour '{output_format}'")
 
             # -- ETAPE 10 : Generer le rapport HTML --
             # On serialise clean_steps en dict pour rester compatible avec la
