@@ -49,9 +49,10 @@ def test_dedup_removes_only_truly_consecutive_identical_clicks():
     assert [e["selector"]["value"] for e in out] == ["#a", "#b", "#a"]
 
 
-def test_dedup_consolidates_inputs_keeping_last_value():
-    """#3 : les inputs successifs sur le meme champ+URL sont consolides
-    en gardant la derniere valeur."""
+def test_dedup_consolidates_consecutive_inputs_same_field():
+    """#3 : les inputs successifs SUR LE MEME CHAMP sans autre event entre
+    sont consolides en gardant la derniere valeur (chaque frappe clavier
+    = 1 event input, on garde l'etat final du champ)."""
     log = [
         {"action": "input", "timestamp": 1, "selector": _sel("#email"),
          "url": "u", "value": "j"},
@@ -64,6 +65,64 @@ def test_dedup_consolidates_inputs_keeping_last_value():
     inputs = [e for e in out if e["action"] == "input"]
     assert len(inputs) == 1
     assert inputs[0]["value"] == "user@example.com"
+
+
+def test_dedup_does_not_consolidate_inputs_separated_by_keyboard():
+    """R3 CRITIQUE : "4 saisies + 4 Enter" pattern TodoMVC. Chaque Enter
+    separe 2 cycles input. Consequence : 4 inputs distincts + 4 keyboard,
+    pas 1 input global (bug ancien)."""
+    log = []
+    for i, todo in enumerate(["Preparer QA", "Verifier selecteurs", "Controler reseau", "Valider replay"]):
+        log.append({"action": "input", "timestamp": i * 10,
+                    "selector": _sel("input.new-todo"), "url": "u", "value": todo})
+        log.append({"action": "keyboard", "timestamp": i * 10 + 1,
+                    "selector": _sel("input.new-todo"), "url": "u", "value": "Enter"})
+    out = dedup_log(log)
+    inputs = [e for e in out if e["action"] == "input"]
+    keyboards = [e for e in out if e["action"] == "keyboard"]
+    assert len(inputs) == 4, f"Attendu 4 inputs distincts, obtenu {len(inputs)}"
+    assert len(keyboards) == 4
+    # Ordre preserve
+    assert inputs[0]["value"] == "Preparer QA"
+    assert inputs[3]["value"] == "Valider replay"
+
+
+def test_dedup_does_not_consolidate_inputs_on_different_fields():
+    """Inputs consecutifs sur DIFFERENTS champs -> conserves separement."""
+    log = [
+        {"action": "input", "timestamp": 1, "selector": _sel("#email"),
+         "url": "u", "value": "a@b.c"},
+        {"action": "input", "timestamp": 2, "selector": _sel("#password"),
+         "url": "u", "value": "secret"},
+    ]
+    out = dedup_log(log)
+    assert len(out) == 2
+
+
+def test_dedup_click_between_inputs_breaks_consolidation():
+    """input#A + click#X + input#A -> 3 entrees (click coupe la sequence)."""
+    log = [
+        {"action": "input", "timestamp": 1, "selector": _sel("#field"),
+         "url": "u", "value": "first"},
+        {"action": "click", "timestamp": 2, "selector": _sel("#btn"), "url": "u"},
+        {"action": "input", "timestamp": 3, "selector": _sel("#field"),
+         "url": "u", "value": "second"},
+    ]
+    out = dedup_log(log)
+    assert len(out) == 3
+    assert out[0]["value"] == "first"
+    assert out[2]["value"] == "second"
+
+
+def test_dedup_keyboard_events_always_preserved():
+    """Enter/Tab/Escape -> jamais deduplique, chaque event conserve."""
+    log = [
+        {"action": "keyboard", "timestamp": 1, "value": "Enter", "url": "u", "selector": _sel("body")},
+        {"action": "keyboard", "timestamp": 2, "value": "Enter", "url": "u", "selector": _sel("body")},
+        {"action": "keyboard", "timestamp": 3, "value": "Enter", "url": "u", "selector": _sel("body")},
+    ]
+    out = dedup_log(log)
+    assert len(out) == 3
 
 
 # --------------------------------------------------------------------

@@ -334,6 +334,34 @@
         });
     }, true);
 
+    // -- KEYDOWN LISTENER (fix R3 : separateurs input->cycle input suivant)
+    // Sans capture Enter/Tab, une sequence "input A + Enter + input B" ou
+    // Enter n'est PAS un event input, apparait comme "input A -> input B"
+    // consecutifs cote listener -> dedup_log les consolide en 1 seul. Fix :
+    // on emet un event 'keyboard' pour les touches qui changent l'etat
+    // (Enter valide un formulaire/todo, Tab change focus, Escape ferme).
+    // Le playwright_generator._emit_keyboard traduit en page.keyboard.press().
+    const CAPTURED_KEYS = new Set(['Enter', 'Tab', 'Escape']);
+    document.addEventListener('keydown', (e) => {
+        if (!CAPTURED_KEYS.has(e.key)) return;
+        let el = getRealTarget(e);
+        let sel = getBestSelector(el);
+        saveEntry({
+            action: 'keyboard',
+            timestamp: Date.now(),
+            tag: el.tagName,
+            value: e.key,
+            selector: sel,
+            url: location.href,
+            inShadowDOM: sel.inShadowDOM,
+            attributes: {
+                id: el.id || null,
+                name: el.getAttribute ? el.getAttribute('name') : null,
+                type: el.getAttribute ? el.getAttribute('type') : null,
+            }
+        });
+    }, true);
+
     // -- SCROLL LISTENER (debounced) --
     let scrollTimer = null;
     let scrollStartY = window.scrollY;

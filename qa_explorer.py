@@ -560,35 +560,52 @@ DOM_LISTENER_JS = (Path(__file__).parent / "dom_listener.js").read_text(encoding
 
 def dedup_log(raw_log):
     """
-    Deduplique le log brut :
-    - Clics : supprime les clics consecutifs sur le meme selecteur (meme URL)
-    - Scrolls : gardes tels quels
-    - Inputs : garde uniquement la derniere valeur par selecteur + URL
+    Deduplique le log brut de facon STRICTEMENT LOCALE (fix R3 review) :
+    - Clics : skip UNIQUEMENT si le PRECEDENT immediat est un clic identique
+      sur meme selecteur+URL
+    - Scrolls : gardes tels quels, jamais dedupliques
+    - Inputs : ecrase le PRECEDENT immediat SI meme selecteur+URL (l'utilisateur
+      tape lettre par lettre - chaque frappe = 1 event input, on garde le dernier
+      etat du champ). Toute autre action DOM entre 2 inputs (click, scroll,
+      keyboard, meme un input sur un autre champ) coupe la sequence : le nouvel
+      input est traite comme un NOUVEAU cycle et conserve independamment.
+    - Keyboard : gardes tels quels (Enter, Tab, Escape - separateurs naturels
+      des cycles input, essentiels pour scenarios type TodoMVC "12 saisies +
+      12 Enter" qui doivent produire 24 steps distincts, pas 1 seul).
+    - Autres actions (hover, etc.) : gardes tels quels.
+
+    L'ancien code consolidait GLOBALEMENT tous les inputs sur (selector, url)
+    quelle que soit la distance temporelle. Consequence sur TodoMVC : 12
+    saisies successives sur input.new-todo etaient consolidees en 1 seule
+    (garde la derniere). Fix : consolidation LOCALE uniquement sur inputs
+    strictement adjacents.
     """
     clean = []
-    last_input = {}
-
     for entry in raw_log:
-        if entry['action'] == 'click':
-            # Verifier si le clic precedent etait sur le meme selecteur + meme URL
+        action = entry.get('action')
+        if action == 'click':
             if clean:
                 prev = clean[-1]
-                if (prev['action'] == 'click' 
-                    and prev['selector']['value'] == entry['selector']['value']
-                    and prev.get('url', '') == entry.get('url', '')):
-                    # Doublon consecutif, on skip
+                if (prev.get('action') == 'click'
+                        and prev.get('selector', {}).get('value') == entry.get('selector', {}).get('value')
+                        and prev.get('url', '') == entry.get('url', '')):
+                    continue  # doublon strictement consecutif
+            clean.append(entry)
+        elif action == 'input':
+            # Consolidation LOCALE : ecrase l'entree precedente UNIQUEMENT si
+            # c'est un input consecutif sur le meme champ (meme selecteur + url).
+            # Toute autre action entre 2 inputs coupe la sequence.
+            if clean:
+                prev = clean[-1]
+                if (prev.get('action') == 'input'
+                        and prev.get('selector', {}).get('value') == entry.get('selector', {}).get('value')
+                        and prev.get('url', '') == entry.get('url', '')):
+                    clean[-1] = entry  # meme champ, on met a jour la valeur
                     continue
             clean.append(entry)
-        elif entry['action'] == 'scroll':
+        else:
+            # scroll, keyboard, hover, ... : jamais deduplique
             clean.append(entry)
-        elif entry['action'] == 'input':
-            key = (entry['selector']['value'], entry.get('url', ''))
-            if key in last_input:
-                clean[last_input[key]] = entry
-            else:
-                last_input[key] = len(clean)
-                clean.append(entry)
-
     return clean
 
 
