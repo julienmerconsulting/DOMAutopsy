@@ -56,14 +56,14 @@ def test_dedup_consolidates_inputs_keeping_last_value():
         {"action": "input", "timestamp": 1, "selector": _sel("#email"),
          "url": "u", "value": "j"},
         {"action": "input", "timestamp": 2, "selector": _sel("#email"),
-         "url": "u", "value": "julien"},
+         "url": "u", "value": "testuser"},
         {"action": "input", "timestamp": 3, "selector": _sel("#email"),
-         "url": "u", "value": "julien.mer@ex.com"},
+         "url": "u", "value": "user@example.com"},
     ]
     out = dedup_log(log)
     inputs = [e for e in out if e["action"] == "input"]
     assert len(inputs) == 1
-    assert inputs[0]["value"] == "julien.mer@ex.com"
+    assert inputs[0]["value"] == "user@example.com"
 
 
 # --------------------------------------------------------------------
