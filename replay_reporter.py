@@ -274,10 +274,19 @@ code {{ background:#0d1117; padding:2px 6px; border-radius:4px; color:#58a6ff; f
     return out_path
 
 
-def update_replay_meta_with_verdict(replay_dir: Path) -> dict[str, Any] | None:
+def update_replay_meta_with_verdict(
+    replay_dir: Path,
+    subprocess_returncode: int | None = None,
+) -> dict[str, Any] | None:
     """Enrichit le meta.json d'un replay avec le verdict et les counts extraits
     du JSON reporter Playwright. Utile pour /api/runs/{id} qui expose ces
-    valeurs au CLI/dashboard."""
+    valeurs au CLI/dashboard.
+
+    subprocess_returncode : exit code du subprocess Playwright, permet de
+    detecter le cas ou Playwright crashe AVANT d'avoir produit
+    replay_results.json (autrement le meta.json resterait status:"running"
+    a jamais, bug D6 souleve en review).
+    """
     replay_dir = Path(replay_dir)
     meta_path = replay_dir / "meta.json"
     results_path = replay_dir / "replay_results.json"
@@ -287,6 +296,7 @@ def update_replay_meta_with_verdict(replay_dir: Path) -> dict[str, Any] | None:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
     if results_path.exists():
         try:
             pw = json.loads(results_path.read_text(encoding="utf-8"))
@@ -301,8 +311,25 @@ def update_replay_meta_with_verdict(replay_dir: Path) -> dict[str, Any] | None:
             })
         except Exception as e:
             meta["replay_parse_error"] = f"{type(e).__name__}: {e}"
+            # results.json corrompu mais present : fallback sur returncode
+            meta["status"] = "success" if subprocess_returncode == 0 else "failure"
     else:
-        meta.setdefault("status", "unknown")
+        # PAS de results.json = Playwright a crashe avant meme de reporter.
+        # Ne JAMAIS laisser status="running" (bug D6 : meta bloque a jamais).
+        # Determine le verdict depuis le returncode subprocess.
+        if subprocess_returncode is None:
+            meta["status"] = "crashed"
+            meta["replay_error"] = "Playwright n'a jamais produit replay_results.json et le returncode subprocess est inconnu"
+        elif subprocess_returncode == 0:
+            # Exit 0 mais pas de JSON : cas theorique (Playwright a vraiment
+            # rien detecte). Reste unknown pour signaler la bizarrerie.
+            meta["status"] = "unknown"
+            meta["replay_error"] = "subprocess a exit 0 mais replay_results.json est absent"
+        else:
+            meta["status"] = "crashed"
+            meta["replay_error"] = f"Playwright a exit avec code {subprocess_returncode} avant de produire replay_results.json (crash browser, config, permissions...)"
+        meta["replay_exit_code"] = subprocess_returncode
+
     meta["report"] = "replay_report.html"
     meta_path.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
     return meta

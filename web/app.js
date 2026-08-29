@@ -207,7 +207,15 @@ async function replayRun(sourceRunId) {
       appendLog(`>> Replay ${run_id} (source: ${source_run_id}) via ${engine} - npx playwright test`, "ok");
     }
     logSocket = openLogSocket(run_id);
-    setTimeout(() => { screenSocket = openScreenSocket(run_id); }, 1500);
+    // D9 : Le moteur playwright_ts n'expose aucun port CDP (npx spawn
+    // ses propres workers, pas d'attache CDP unique). Ouvrir un WS
+    // screencast dans ce cas garantit un warning cote server + canvas
+    // vide inutile. On skip proprement.
+    if (cdp_port !== null && cdp_port !== undefined) {
+      setTimeout(() => { screenSocket = openScreenSocket(run_id); }, 1500);
+    } else {
+      canvasEmpty.textContent = "Replay Playwright TS : pas de screencast (pas de CDP unique)";
+    }
     refreshActiveRuns();
   } catch (e) {
     appendLog("ERREUR replay : " + e.message, "error");
@@ -284,7 +292,13 @@ function openLogSocket(runId) {
       const ok = msg.status === "exit_0";
       setStatus(logStatus, ok ? "ok" : "error");
       appendLog(`\n--- Run termine (${msg.status}) ---`, ok ? "ok" : "error");
-      reportBtn.disabled = !ok;
+      // D7 : rapport toujours activable, meme sur echec. Un rapport
+      // d'echec (screenshots, erreurs, stack trace, network requests)
+      // est SOUVENT plus informatif qu'un rapport de succes - on ne
+      // peut pas debloquer un test sans acces a ces donnees. Le code
+      // genere par contre reste desactive sur fail (rejouer un test
+      // deja cassse ne serait pas utile).
+      reportBtn.disabled = false;
       codeBtn.disabled = !ok;
       setRunIdle();
       // Rafraichir l'historique au moindre run termine

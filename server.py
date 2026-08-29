@@ -531,12 +531,16 @@ async def replay_run(run_id: str, headless: bool = True):
 
             # Runtime resolution : embarque (autonome a l'execution) vs dev (npx global du PATH)
             rt = _resolve_embedded_runtime()
+            # D8 : headless=False -> --headed. Auparavant le flag arrivait dans
+            # la request mais etait ignore par npx (default Playwright = headless).
+            extra_flags = [] if headless else ["--headed"]
             if rt:
                 # Mode embarque : node.exe local + cli.js Playwright + browsers/
                 cmd = [
                     rt["node"], rt["cli"], "test", spec_rel,
                     "--workers=1",
                     f"--output={output_rel}",
+                    *extra_flags,
                 ]
                 env["PLAYWRIGHT_BROWSERS_PATH"] = rt["browsers"]
                 runtime_mode = "embedded"
@@ -551,6 +555,7 @@ async def replay_run(run_id: str, headless: bool = True):
                     "npx", "playwright", "test", spec_rel,
                     "--workers=1",
                     f"--output={output_rel}",
+                    *extra_flags,
                 ]
                 runtime_mode = "system_npx"
                 # Windows : npx est un .cmd, il faut passer par shell=True avec
@@ -943,10 +948,16 @@ def _postprocess_replay(run_id: str, replay_dir: Path) -> None:
     on log un warning mais on ne transforme jamais un test Playwright
     reussi en echec.
     """
+    # Extract subprocess returncode AVANT le try/except pour garantir que
+    # update_replay_meta_with_verdict le reçoit meme si generate_replay_report
+    # crashe (fix D6 : meta.json ne doit jamais rester "running" bloque).
+    r = RUNS.get(run_id) or {}
+    proc = r.get("proc")
+    returncode = proc.returncode if proc and proc.poll() is not None else None
+
     try:
         from replay_reporter import generate_replay_report, update_replay_meta_with_verdict
         source_dir = None
-        r = RUNS.get(run_id) or {}
         source_run_id = r.get("source_run_id")
         if source_run_id:
             source_dir = _find_run_dir(source_run_id)
@@ -956,10 +967,17 @@ def _postprocess_replay(run_id: str, replay_dir: Path) -> None:
                 RUNS[run_id]["report_path"] = str(report_path.relative_to(ROOT))
             except ValueError:
                 RUNS[run_id]["report_path"] = str(report_path)
-        update_replay_meta_with_verdict(replay_dir)
+        update_replay_meta_with_verdict(replay_dir, subprocess_returncode=returncode)
     except Exception as e:
-        # Warning uniquement - n'affecte pas le verdict du test Playwright
+        # Warning uniquement - n'affecte pas le verdict du test Playwright.
+        # MAIS on doit quand meme mettre a jour meta.json sinon status reste
+        # "running" a jamais (bug D6). On retente update seule (sans le report).
         print(f"[server] _postprocess_replay({run_id}) WARNING : {e}")
+        try:
+            from replay_reporter import update_replay_meta_with_verdict
+            update_replay_meta_with_verdict(replay_dir, subprocess_returncode=returncode)
+        except Exception as e2:
+            print(f"[server] _postprocess_replay({run_id}) meta update ALSO failed : {e2}")
 
 
 @app.websocket("/ws/logs/{run_id}")
@@ -1047,7 +1065,11 @@ async def _wait_for_cdp_page(cdp_port: int, timeout: float = 30) -> Optional[str
 
 @app.get("/api/report/{run_id}")
 async def get_report(run_id: str):
-    """Retourne le rapport HTML genere par qa_explorer pour ce run (en cours OU historique)"""
+    """Retourne le rapport HTML pour ce run (en cours OU historique).
+    Supporte 3 formats de rapport :
+      - qa_report_<ts>.html  : runs de capture (qa_explorer)
+      - replay_report.html   : runs replay via `npx playwright test` (nouveau)
+      - qa_replay_report_<ts>.html : runs replay legacy via qa_player.py"""
     # Cas 1 : run en memoire (in-memory)
     if run_id in RUNS:
         report_path = RUNS[run_id].get("report_path")
@@ -1055,13 +1077,19 @@ async def get_report(run_id: str):
             abs_path = (ROOT / report_path).resolve() if not Path(report_path).is_absolute() else Path(report_path)
             if abs_path.exists():
                 return FileResponse(abs_path, media_type="text/html")
-    # Cas 2 : run historique (dans runs/ folder, on cherche le dossier qui finit par _{run_id})
+    # Cas 2 : run historique (dans runs/ folder)
     candidate = _find_run_dir(run_id)
     if candidate:
-        # Trouve le fichier qa_report_*.html dedans
-        reports = list(candidate.glob("qa_report_*.html"))
-        if reports:
-            return FileResponse(reports[0], media_type="text/html")
+        # Ordre de priorite : replay_report (nouveau moteur) -> qa_report
+        # (capture) -> qa_replay_report (legacy qa_player). L'ordre couvre
+        # tous les runs, indifferemment de leur type.
+        replay_direct = candidate / "replay_report.html"
+        if replay_direct.exists():
+            return FileResponse(replay_direct, media_type="text/html")
+        for pattern in ("qa_report_*.html", "qa_replay_report_*.html"):
+            reports = list(candidate.glob(pattern))
+            if reports:
+                return FileResponse(reports[0], media_type="text/html")
     raise HTTPException(404, f"Rapport introuvable pour run_id={run_id}")
 
 
@@ -1096,10 +1124,16 @@ async def list_history(limit: int = 50):
             dir_run_id = parts[2]
         else:
             dir_run_id = d.name   # fallback : nom du dossier complet
+        # has_report couvre les 3 formats : qa_report (capture), replay_report
+        # (nouveau moteur), qa_replay_report (legacy qa_player). Sans cet
+        # elargissement, la sidebar UI ignore les rapports de replay.
+        has_qa_report = any(d.glob("qa_report_*.html"))
+        has_replay_report = (d / "replay_report.html").exists()
+        has_legacy_replay = any(d.glob("qa_replay_report_*.html"))
         entry = {
             "run_id": dir_run_id,
             "dir_name": d.name,
-            "has_report": any(d.glob("qa_report_*.html")),
+            "has_report": has_qa_report or has_replay_report or has_legacy_replay,
         }
         if meta_file.exists():
             try:

@@ -144,6 +144,26 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     }
 
     # --- Generation HTML ---
+    # SECURITE : toutes les valeurs user-controlled (descriptions, selecteurs,
+    # values, cleanup_reason, action, etc.) proviennent du DOM d'une page
+    # externe. Elles PEUVENT contenir <script>, <img onerror=...>, ou tout
+    # autre payload XSS. Le rapport HTML est ouvert dans le navigateur du
+    # QA : sans echappement, une page testee peut executer du JS dans la
+    # session du QA. Tout doit passer par _esc_text() (attribut) ou
+    # _esc_attr() (attribut HTML).
+    def _esc_text(v):
+        """Echappe pour insertion dans un contenu HTML (<td>foo</td>)."""
+        return (str(v) if v is not None else "").replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+    def _esc_attr(v):
+        """Echappe pour insertion dans un attribut HTML (title="...")."""
+        return _esc_text(v).replace('"', '&quot;').replace("'", '&#39;')
+
+    def _esc_class(v):
+        """Echappe pour un nom de classe CSS - restreint aux alphanum + _-."""
+        import re as _re
+        return _re.sub(r'[^A-Za-z0-9_-]', '_', str(v or 'unknown'))
+
     # Le schema v2.0 (post-refactor Aout 2026) stocke selector comme dict
     # {value, strategy, unique, matchCount, ...}. Les anciens JSON avaient
     # selector comme string simple. On gere les deux via _extract_selector().
@@ -182,14 +202,14 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         if included:
             replay_badge = '<span class="badge badge-ok">INCLUS</span>'
         else:
-            safe_reason = (cleanup_reason or 'filtre par le nettoyage IA').replace('"', '&quot;')
-            replay_badge = f'<span class="badge badge-warn" title="{safe_reason}">FILTRE</span>'
+            reason_attr = _esc_attr(cleanup_reason or 'filtre par le nettoyage IA')
+            replay_badge = f'<span class="badge badge-warn" title="{reason_attr}">FILTRE</span>'
 
         # Valeur : masquee si sensitive
         if sensitive:
             value_cell = '<span class="badge badge-sensitive" title="valeur masquee, sera injectee via var d\'env au replay">SENSITIVE</span>'
         elif value:
-            value_cell = f'<code>{value}</code>'
+            value_cell = f'<code>{_esc_text(value)}</code>'
         else:
             value_cell = '<span class="text-muted">&mdash;</span>'
 
@@ -197,15 +217,15 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         row_class = ' class="step-skipped"' if not included else ''
         reason_row = ''
         if not included and cleanup_reason:
-            reason_row = f'<tr class="step-skipped-reason"><td></td><td colspan="7" class="cleanup-reason">Raison filtrage : {cleanup_reason}</td></tr>'
+            reason_row = f'<tr class="step-skipped-reason"><td></td><td colspan="7" class="cleanup-reason">Raison filtrage : {_esc_text(cleanup_reason)}</td></tr>'
 
         steps_rows += f"""
         <tr{row_class}>
-            <td class="step-num">{s.get('step', '?')}</td>
-            <td><span class="action-tag action-{action}">{action.upper()}</span></td>
-            <td>{desc}</td>
-            <td><code class="selector">{sel_value}</code></td>
-            <td><span class="sel-type">{sel_type}</span></td>
+            <td class="step-num">{_esc_text(s.get('step', '?'))}</td>
+            <td><span class="action-tag action-{_esc_class(action)}">{_esc_text(action.upper())}</span></td>
+            <td>{_esc_text(desc)}</td>
+            <td><code class="selector">{_esc_text(sel_value)}</code></td>
+            <td><span class="sel-type">{_esc_text(sel_type)}</span></td>
             <td>{unique_badge}</td>
             <td>{value_cell}</td>
             <td>{replay_badge}</td>
@@ -213,7 +233,12 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
 
     anomalies_html = ""
     if anomalies:
-        anomalies_items = "".join(f'<li>{a}</li>' for a in anomalies)
+        # Anomalies peuvent contenir texte issu du DOM (selecteur, message
+        # d'erreur, description user-controlled) - escape obligatoire.
+        anomalies_items = "".join(
+            f'<li>{_esc_text(a if not isinstance(a, dict) else a.get("message", str(a)))}</li>'
+            for a in anomalies
+        )
         anomalies_html = f"""
         <div class="card anomalies">
             <h2>Anomalies detectees ({len(anomalies)})</h2>
@@ -553,14 +578,18 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
         )
         shadow_badge = ' <span class="badge badge-shadow">SHADOW</span>' if in_shadow else ''
 
+        # SECURITE : selector, text, strategy sont user-controlled (viennent
+        # du DOM d'une page externe). Toutes ces valeurs passent par _esc_text
+        # / _esc_class pour empecher tout XSS lorsqu'un site testee tenterait
+        # d'injecter <script> ou <img onerror=...>.
         log_rows += f"""
         <tr>
             <td class="step-num">{i+1}</td>
-            <td><span class="action-tag action-{action}">{action.upper()}</span>{shadow_badge}</td>
-            <td><span class="tier-badge tier-{tier.lower().replace(' ', '-')}">{tier}</span> {strategy}</td>
-            <td><code class="selector">{sel_value}</code></td>
-            <td>{unique_badge} ({match_count})</td>
-            <td>{text}</td>
+            <td><span class="action-tag action-{_esc_class(action)}">{_esc_text(action.upper())}</span>{shadow_badge}</td>
+            <td><span class="tier-badge tier-{_esc_class(tier.lower().replace(' ', '-'))}">{_esc_text(tier)}</span> {_esc_text(strategy)}</td>
+            <td><code class="selector">{_esc_text(sel_value)}</code></td>
+            <td>{unique_badge} ({_esc_text(match_count)})</td>
+            <td>{_esc_text(text)}</td>
         </tr>"""
 
     # --- Status banner ---
