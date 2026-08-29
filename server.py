@@ -525,31 +525,50 @@ async def replay_run(run_id: str, headless: bool = True):
             # pour que le fichier atterrisse dans le replay_dir et soit
             # exploitable par report_generator pour rapprocher chaque
             # test.step('[step-XXXX] ...') a son verdict Playwright.
-            cmd = [
-                "npx", "playwright", "test", spec_rel,
-                "--workers=1",
-                f"--output={output_rel}",
-            ]
-            engine = "playwright_ts"
-            cmd_repr = " ".join(cmd)
             replay_json_path = replay_dir / "replay_results.json"
             env = dict(os.environ)
             env["DOMAUTOPSY_REPLAY_JSON"] = str(replay_json_path)
-            # Windows : npx est un .cmd, il faut passer par shell=True avec
-            # une commande sans interpolation user. Meme pattern que
-            # /api/playwright/run. Args : venant tous d'un chemin serveur
-            # controle (pas de user input direct) donc pas d'injection.
-            if sys.platform == "win32":
-                cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
-                proc = subprocess.Popen(
-                    cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    cwd=str(ROOT), bufsize=1, env=env,
-                )
-            else:
+
+            # Runtime resolution : embarque (autonome, air-gap) vs dev (npx global)
+            rt = _resolve_embedded_runtime()
+            if rt:
+                # Mode embarque : node.exe local + cli.js Playwright + browsers/
+                cmd = [
+                    rt["node"], rt["cli"], "test", spec_rel,
+                    "--workers=1",
+                    f"--output={output_rel}",
+                ]
+                env["PLAYWRIGHT_BROWSERS_PATH"] = rt["browsers"]
+                runtime_mode = "embedded"
+                # Pas besoin de shell=True : node.exe est un vrai exe
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                     cwd=str(ROOT), bufsize=1, env=env,
                 )
+            else:
+                # Mode dev : fallback npx global + cache Playwright utilisateur
+                cmd = [
+                    "npx", "playwright", "test", spec_rel,
+                    "--workers=1",
+                    f"--output={output_rel}",
+                ]
+                runtime_mode = "system_npx"
+                # Windows : npx est un .cmd, il faut passer par shell=True avec
+                # une commande sans interpolation user. Meme pattern que
+                # /api/playwright/run.
+                if sys.platform == "win32":
+                    cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
+                    proc = subprocess.Popen(
+                        cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        cwd=str(ROOT), bufsize=1, env=env,
+                    )
+                else:
+                    proc = subprocess.Popen(
+                        cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        cwd=str(ROOT), bufsize=1, env=env,
+                    )
+            engine = "playwright_ts"
+            cmd_repr = " ".join(str(c) for c in cmd)
 
     if not use_playwright_ts:
         # --- FALLBACK LEGACY : qa_player.py ---
@@ -575,6 +594,13 @@ async def replay_run(run_id: str, headless: bool = True):
 
     # meta.json initial (le detail final est ecrit par le subprocess)
     try:
+        meta_engine_details = {
+            "engine": engine,
+            "legacy_fallback": engine == "qa_player_legacy",
+            "legacy_fallback_reason": fallback_reason,
+        }
+        if engine == "playwright_ts":
+            meta_engine_details["runtime_mode"] = runtime_mode  # "embedded" | "system_npx"
         (replay_dir / "meta.json").write_text(json.dumps({
             "timestamp": ts,
             "started_at": __import__("datetime").datetime.now().isoformat(),
@@ -587,11 +613,9 @@ async def replay_run(run_id: str, headless: bool = True):
             "headless": headless,
             "is_replay": True,
             "source_run_id": run_id,
-            "engine": engine,
-            "legacy_fallback": engine == "qa_player_legacy",
-            "legacy_fallback_reason": fallback_reason,
             "cmd": cmd_repr,
             "status": "running",
+            **meta_engine_details,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
         print(f"[server] meta.json initial replay echec : {e}")
@@ -632,6 +656,32 @@ async def replay_run(run_id: str, headless: bool = True):
 
 RUNS_DIR = ROOT / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
+
+
+# --- Resolveur runtime embarque (autonome vs dev) ---
+# Trois chemins optionnels dans .env, resolus RELATIVEMENT a ROOT (le repo).
+# Si les 3 sont set ET pointent sur des fichiers/dossiers existants,
+# /api/replay lance directement `node.exe playwright/cli.js test <spec>` +
+# PLAYWRIGHT_BROWSERS_PATH pointe sur les browsers embarques.
+# Sinon fallback DEV sur `npx playwright test` global + cache utilisateur.
+def _resolve_embedded_runtime() -> Optional[dict]:
+    """Retourne {node, cli, browsers, mode="embedded"} si le runtime autonome
+    est present et complet, None sinon (le caller fallback sur npx)."""
+    node_env = os.getenv("DOMAUTOPSY_NODE_PATH")
+    cli_env = os.getenv("DOMAUTOPSY_PLAYWRIGHT_CLI")
+    browsers_env = os.getenv("DOMAUTOPSY_BROWSERS_PATH")
+    if not (node_env and cli_env and browsers_env):
+        return None
+    node = (ROOT / node_env).resolve() if not Path(node_env).is_absolute() else Path(node_env)
+    cli = (ROOT / cli_env).resolve() if not Path(cli_env).is_absolute() else Path(cli_env)
+    browsers = (ROOT / browsers_env).resolve() if not Path(browsers_env).is_absolute() else Path(browsers_env)
+    if not (node.exists() and cli.exists() and browsers.exists()):
+        # Config presente mais fichiers manquants -> log + fallback dev
+        print(f"[server] Runtime embarque configure mais fichiers manquants "
+              f"(node={node.exists()}, cli={cli.exists()}, browsers={browsers.exists()}) "
+              f"-> fallback npx global")
+        return None
+    return {"node": str(node), "cli": str(cli), "browsers": str(browsers), "mode": "embedded"}
 
 # --- Config screencast ---
 # 1 frame sur N envoyee aux viewers (defaut 2 = ~15fps si CDP delivre 30).
