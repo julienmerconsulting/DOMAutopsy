@@ -29,8 +29,19 @@ export default defineConfig({
     timeout: 10 * 1000,
   },
 
-  // Reporter par defaut ; le serveur force --reporter=list pour le streaming.
-  reporter: [['list']],
+  // Deux reporters en parallele :
+  //  - 'list' sur stdout : streame en direct via WebSocket vers l'UI
+  //  - 'json' sur fichier : produit un resultat structure per-test/per-step
+  //    consomme par report_generator pour rapprocher chaque test.step()
+  //    ([step-XXXX]) au step JSON correspondant.
+  // Le chemin du JSON est pilote par l'env var DOMAUTOPSY_REPLAY_JSON,
+  // positionnee par server.py::/api/replay pour ecrire dans le replay_dir.
+  reporter: [
+    ['list'],
+    ['json', {
+      outputFile: process.env.DOMAUTOPSY_REPLAY_JSON ?? 'test-results/replay_results.json',
+    }],
+  ],
 
   use: {
     // Trace et screenshot sont produits explicitement dans le TS genere

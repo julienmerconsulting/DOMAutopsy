@@ -1,9 +1,16 @@
 """
-QA Player - Replay deterministe d'un parcours capture
-=====================================================
-Prend un dossier runs/<id>/ existant, lit son clean_steps.json (parcours
-nettoye par l'IA), et le rejoue via Playwright pur. Aucun LLM, aucun
-browser-use : juste les selecteurs et les actions structures.
+QA Player - Replay LEGACY FALLBACK (deprecation-en-cours)
+=========================================================
+Depuis le refactor Aout 2026, le moteur de replay canonique est
+`npx playwright test <spec>` sur le test_playwright.spec.ts genere
+systematiquement par qa_explorer. Ce module reste UNIQUEMENT en
+fallback pour les runs pre-refactor qui ne possedent pas encore
+de TS canonique. Il ne supporte que click et input, et NE DOIT PAS
+etre etendu pour couvrir les nouvelles actions.
+
+Le serveur (server.py::/api/replay) le selectionne automatiquement
+quand test_playwright.spec.ts est absent du run source et log un
+WARNING explicite + meta.json.engine = "qa_player_legacy".
 
 Cas d'usage :
 - Verifier que les selecteurs d'un parcours capture sont encore valides
@@ -149,7 +156,12 @@ async def play(run_dir: Path, output_dir: Path, cdp_port: int = 9222,
         print("ERREUR : URL de depart introuvable (ni meta.json ni step[0].page)")
         return 2
 
-    _print_header(f"REPLAY : {clean_data.get('parcours', run_dir.name)}")
+    _print_header(f"REPLAY [LEGACY FALLBACK] : {clean_data.get('parcours', run_dir.name)}")
+    print(f"  WARNING : ce moteur est le fallback LEGACY (click+input seulement).")
+    print(f"            Le moteur canonique est `npx playwright test` sur")
+    print(f"            test_playwright.spec.ts. Ce run source n'en a pas.")
+    print(f"            Considere relancer une capture qa_explorer pour")
+    print(f"            beneficier du replay complet.")
     print(f"  Source     : {run_dir}")
     print(f"  Output     : {output_dir}")
     print(f"  URL        : {start_url}")

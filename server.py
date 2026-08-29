@@ -514,14 +514,22 @@ async def replay_run(run_id: str, headless: bool = True):
             # que le stdout ligne-a-ligne soit exploitable en streaming, et
             # --output isole les artefacts (traces, videos) dans le run dir.
             output_rel = replay_dir.relative_to(ROOT).as_posix()
+            # Pas de --reporter en CLI : les deux reporters (list + json)
+            # sont declares dans playwright.config.ts. On pilote juste le
+            # chemin du reporter json via l'env var DOMAUTOPSY_REPLAY_JSON
+            # pour que le fichier atterrisse dans le replay_dir et soit
+            # exploitable par report_generator pour rapprocher chaque
+            # test.step('[step-XXXX] ...') a son verdict Playwright.
             cmd = [
                 "npx", "playwright", "test", spec_rel,
                 "--workers=1",
-                "--reporter=list",
                 f"--output={output_rel}",
             ]
             engine = "playwright_ts"
             cmd_repr = " ".join(cmd)
+            replay_json_path = replay_dir / "replay_results.json"
+            env = dict(os.environ)
+            env["DOMAUTOPSY_REPLAY_JSON"] = str(replay_json_path)
             # Windows : npx est un .cmd, il faut passer par shell=True avec
             # une commande sans interpolation user. Meme pattern que
             # /api/playwright/run. Args : venant tous d'un chemin serveur
@@ -530,12 +538,12 @@ async def replay_run(run_id: str, headless: bool = True):
                 cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
                 proc = subprocess.Popen(
                     cmd_str, shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    cwd=str(ROOT), bufsize=1,
+                    cwd=str(ROOT), bufsize=1, env=env,
                 )
             else:
                 proc = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                    cwd=str(ROOT), bufsize=1,
+                    cwd=str(ROOT), bufsize=1, env=env,
                 )
 
     if not use_playwright_ts:
