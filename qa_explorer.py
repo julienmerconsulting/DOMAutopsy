@@ -1393,7 +1393,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             # strictement de clean_steps.json et produisent 1 statement par
             # step included_in_replay=True. Validation automatique en sortie.
             if output_format != "playwright":
-                from deterministic_exporters import EXPORTERS, validate_export_counts
+                from deterministic_exporters import (
+                    EXPORTERS, validate_export_counts, validate_export_by_action_type,
+                )
                 exporter = EXPORTERS.get(output_format)
                 if exporter is not None:
                     export_code = exporter(clean_steps)
@@ -1402,8 +1404,13 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                     code_file.write_text(export_code, encoding="utf-8")
                     print(f"  Code {fmt_info['label']} (export DETERMINISTE) -> {code_file}")
 
-                    # Validation coherence export vs clean_steps
-                    export_anomalies = validate_export_counts(clean_steps, export_code, output_format)
+                    # Validation coherence export vs clean_steps :
+                    # counts + ordre + fantomes + fuites, PUIS
+                    # semantique par action_type (setText/click/etc.)
+                    export_anomalies = (
+                        validate_export_counts(clean_steps, export_code, output_format)
+                        + validate_export_by_action_type(clean_steps, export_code, output_format)
+                    )
                     if export_anomalies:
                         print(f"  [ATTENTION] {len(export_anomalies)} anomalies validation export {output_format} :")
                         for a in export_anomalies:

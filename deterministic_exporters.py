@@ -87,11 +87,20 @@ def export_katalon(clean_steps: CleanSteps) -> str:
         "",
         "WebUI.openBrowser('')",
     ]
-    if clean_steps.scenario_url:
+    # Emit navigateToUrl initial UNIQUEMENT si aucun step navigate ne
+    # va couvrir l'URL scenario en tete (evite le doublon navigate qui
+    # casse la validation semantique).
+    replayables = _replayable_steps(clean_steps)
+    first_step_is_matching_nav = (
+        replayables
+        and replayables[0].action == "navigate"
+        and (replayables[0].url or replayables[0].value) == clean_steps.scenario_url
+    )
+    if clean_steps.scenario_url and not first_step_is_matching_nav:
         lines.append(f"WebUI.navigateToUrl('{clean_steps.scenario_url}')")
     lines.append("")
 
-    for i, step in enumerate(_replayable_steps(clean_steps), start=1):
+    for i, step in enumerate(replayables, start=1):
         lines.extend(_katalon_step(step, i))
         lines.append("")
 
@@ -195,7 +204,10 @@ def export_cypress(clean_steps: CleanSteps) -> str:
         f"describe('{(clean_steps.parcours or 'DOMAutopsy replay').replace(chr(39), chr(92) + chr(39))}', () => {{",
         "  it('runs the captured scenario', () => {",
     ]
-    if clean_steps.scenario_url:
+    replayables = _replayable_steps(clean_steps)
+    first_is_nav = (replayables and replayables[0].action == "navigate"
+                    and (replayables[0].url or replayables[0].value) == clean_steps.scenario_url)
+    if clean_steps.scenario_url and not first_is_nav:
         lines.append(f"    cy.visit('{clean_steps.scenario_url}');")
     for i, step in enumerate(_replayable_steps(clean_steps), start=1):
         lines.extend("    " + l for l in _cypress_step(step, i))
@@ -301,7 +313,10 @@ def export_selenium(clean_steps: CleanSteps) -> str:
         "driver = webdriver.Chrome()",
         "wait = WebDriverWait(driver, 10)",
     ]
-    if clean_steps.scenario_url:
+    replayables = _replayable_steps(clean_steps)
+    first_is_nav = (replayables and replayables[0].action == "navigate"
+                    and (replayables[0].url or replayables[0].value) == clean_steps.scenario_url)
+    if clean_steps.scenario_url and not first_is_nav:
         lines.append(f'driver.get("{clean_steps.scenario_url}")')
     lines.append("")
     for i, step in enumerate(_replayable_steps(clean_steps), start=1):
@@ -402,35 +417,149 @@ def _selenium_step(step: Step, index: int) -> list[str]:
 def validate_export_counts(clean_steps: CleanSteps, export_output: str,
                            format_name: str) -> list[str]:
     """Verifie que l'export contient EXACTEMENT autant d'actions par type
-    que le clean_steps included_in_replay. Retourne la liste des anomalies
-    detectees (vide si tout OK).
+    que le clean_steps included_in_replay, dans le MEME ORDRE. Retourne
+    la liste des anomalies detectees (vide si tout OK).
 
     Regle R5 : "echec explicite si un export ajoute, retire ou reordonne
-    une action sans justification prevue par le format".
+    une action sans justification prevue par le format". Verifications :
+      1. Chaque step included_in_replay a son marqueur [step-XXXX]
+      2. Nombre de headers step == nombre de rejouables
+      3. ORDRE des [step-XXXX] dans l'export == ordre dans clean_steps
+      4. Aucun [step-XXXX] fantome dans l'export (pas dans clean_steps)
+      5. Aucun step FILTRE (included_in_replay=False) ne doit apparaitre
     """
+    import re
     anomalies: list[str] = []
     replayable = _replayable_steps(clean_steps)
-    expected_counts = Counter(s.action for s in replayable)
+    filtered = [s for s in clean_steps.steps if not s.included_in_replay]
 
-    # Chaque step included_in_replay doit avoir son marqueur [step-XXXX]
-    # dans l'export (les headers ci-dessus en produisent 1 par step).
+    # 1. Chaque step rejouable est present
     for s in replayable:
         sid = s.id or ""
         if sid and sid not in export_output:
             anomalies.append(
-                f"[{format_name}] step {sid} absent de l'export (attendu 1 statement pour cette action {s.action})"
+                f"[{format_name}] step {sid} absent de l'export "
+                f"(attendu 1 statement pour cette action {s.action})"
             )
 
-    # Compte les headers step dans l'export
-    import re
+    # 2. Nombre de headers step
     exported_ids = re.findall(r'\[step-\d{4,}\]', export_output)
+    exported_ids_clean = [x.strip('[]') for x in exported_ids]
     if len(exported_ids) != len(replayable):
         anomalies.append(
             f"[{format_name}] nombre de steps exportes ({len(exported_ids)}) != "
             f"nombre de steps rejouables ({len(replayable)})"
         )
 
+    # 3. Ordre preserve
+    expected_order = [s.id for s in replayable if s.id]
+    if exported_ids_clean != expected_order:
+        # Trouve la premiere divergence pour un message utile
+        first_diff = None
+        for i, (exp, got) in enumerate(zip(expected_order, exported_ids_clean)):
+            if exp != got:
+                first_diff = (i, exp, got)
+                break
+        if first_diff:
+            i, exp, got = first_diff
+            anomalies.append(
+                f"[{format_name}] ORDRE des steps casse a la position {i} : "
+                f"attendu '{exp}', obtenu '{got}'. Un export ne doit jamais "
+                f"reordonner les actions."
+            )
+        else:
+            anomalies.append(
+                f"[{format_name}] ordre des steps different : "
+                f"attendu {expected_order[:5]}..., obtenu {exported_ids_clean[:5]}..."
+            )
+
+    # 4. Aucun fantome
+    expected_set = set(expected_order)
+    ghosts = [sid for sid in exported_ids_clean if sid not in expected_set]
+    if ghosts:
+        anomalies.append(
+            f"[{format_name}] {len(ghosts)} step(s) fantome(s) dans l'export "
+            f"(pas dans clean_steps) : {ghosts[:5]}"
+        )
+
+    # 5. Aucun step filtre ne doit apparaitre comme statement executable
+    #    (ils peuvent apparaitre en commentaire // SKIPPED, mais pas en
+    #    header actif [step-XXXX])
+    filtered_ids = {s.id for s in filtered if s.id}
+    exported_set = set(exported_ids_clean)
+    leaked_filtered = filtered_ids & exported_set
+    if leaked_filtered:
+        anomalies.append(
+            f"[{format_name}] {len(leaked_filtered)} step(s) filtre(s) presents "
+            f"dans l'export comme actifs : {list(leaked_filtered)[:5]}"
+        )
+
     return anomalies
+
+
+def validate_export_by_action_type(clean_steps: CleanSteps, export_output: str,
+                                   format_name: str,
+                                   type_markers: dict[str, list[str]] | None = None) -> list[str]:
+    """Verifie la SEMANTIQUE : pour chaque action_type, le nombre de
+    marqueurs specifiques dans l'export matche le count attendu depuis
+    clean_steps. Ex Katalon : action=input rejouable N fois -> N appels
+    a WebUI.setText, N action=keyboard Enter -> N Keys.ENTER.
+
+    type_markers : dict {action_name: [marker_strings_a_chercher]}. Si None,
+    utilise le mapping par defaut pour chaque format connu."""
+    if type_markers is None:
+        type_markers = _DEFAULT_TYPE_MARKERS.get(format_name, {})
+    if not type_markers:
+        return []
+    anomalies: list[str] = []
+    replayable = _replayable_steps(clean_steps)
+    expected_counts = Counter(s.action for s in replayable)
+    for action_name, markers in type_markers.items():
+        expected = expected_counts.get(action_name, 0)
+        actual = sum(export_output.count(m) for m in markers)
+        if actual != expected:
+            anomalies.append(
+                f"[{format_name}] action '{action_name}' : "
+                f"clean_steps attend {expected} occurrence(s) mais l'export "
+                f"contient {actual} marqueur(s) parmi {markers}. Divergence "
+                f"semantique - l'export a possiblement ajoute/retire des "
+                f"actions par rapport au JSON canonique."
+            )
+    return anomalies
+
+
+_DEFAULT_TYPE_MARKERS: dict[str, dict[str, list[str]]] = {
+    "katalon": {
+        "input": ["WebUI.setText"],
+        "click": ["WebUI.click("],
+        "select": ["WebUI.selectOptionByLabel"],
+        "navigate": ["WebUI.navigateToUrl"],
+        "keyboard": ["WebUI.sendKeys"],
+        "hover": ["WebUI.mouseOver"],
+        "upload": ["WebUI.uploadFile"],
+        "reload": ["WebUI.refresh()"],
+        "go_back": ["WebUI.back()"],
+    },
+    "cypress": {
+        "input": [".clear().type("],
+        "click": [".click();"],
+        "select": [".select("],
+        "navigate": ["cy.visit("],
+        "keyboard": ["cy.get('body').type("],
+        "hover": [".trigger('mouseover'"],
+        "reload": ["cy.reload()"],
+        "go_back": ["cy.go('back')"],
+    },
+    "selenium": {
+        "input": ["send_keys(\""],
+        "click": [".click()"],
+        "select": ["select_by_visible_text"],
+        "navigate": ["driver.get("],
+        "keyboard": ["ActionChains(driver).send_keys("],
+        "reload": ["driver.refresh()"],
+        "go_back": ["driver.back()"],
+    },
+}
 
 
 EXPORTERS: dict[str, Callable[[CleanSteps], str]] = {

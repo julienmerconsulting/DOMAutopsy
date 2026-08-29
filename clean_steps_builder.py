@@ -869,6 +869,11 @@ def build_pre_cleanup_steps(
     # False + raw_payload.fused_sources trace les preuves fusionnees.
     _fuse_checkbox_interactions(steps)
 
+    # 5ter. FUSION GENERIQUE : les evaluate JS BU qui font click()/type()
+    # sur un element deja capture par le DOM listener (workaround agent
+    # apres echec du click direct). Rejouer les 2 = double action.
+    _fuse_evaluate_workarounds(steps)
+
     # 6. Rapprochement network
     if network_log:
         _link_network_to_steps(steps, network_log)
@@ -960,6 +965,64 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
             if isinstance(raw, dict):
                 raw["fused_sources"] = fused
                 canonical.raw_payload = raw
+
+
+def _fuse_evaluate_workarounds(steps: list[Step]) -> None:
+    """Fusion generique : un evaluate BU qui manipule un element (via
+    .click(), .value=, .checked=, .dispatchEvent...) alors qu'un DOM
+    click/input/check/uncheck adjacent dans la meme fenetre a deja
+    capture l'interaction reelle -> l'evaluate est le WORKAROUND du meme
+    intent user. Le rejouer PLUS le DOM canonique = double action.
+
+    Regle : garder le DOM canonique (source riche, selecteur validee
+    runtime), marquer l'evaluate included_in_replay=False + reason.
+
+    Ne s'applique QUE si l'evaluate n'a pas deja ete fusionne par le
+    passe checkbox (car le pattern _fuse_checkbox_interactions est plus
+    strict avec le contexte parentLabel).
+    """
+    FUSE_WINDOW_MS = 3000
+    for i, ev in enumerate(steps):
+        if ev.action != "evaluate":
+            continue
+        if not ev.included_in_replay:
+            continue  # deja fusionne par le passe checkbox
+        ts = ev.timestamp
+        if ts is None:
+            continue
+        code = ((ev.value or "") + " " + (ev.description or "")).lower()
+        # Heuristique : l'evaluate manipule un element interactif
+        touches_dom = (
+            ".click()" in code or ".value" in code or ".checked" in code
+            or ".dispatchevent" in code or ".submit()" in code or ".focus()" in code
+        )
+        if not touches_dom:
+            continue
+        # Cherche un step DOM canonique (click/input/check/uncheck)
+        # dans la fenetre temporelle qui refleterait le meme intent
+        for j, other in enumerate(steps):
+            if j == i or not other.included_in_replay:
+                continue
+            if other.timestamp is None or abs(other.timestamp - ts) > FUSE_WINDOW_MS:
+                continue
+            # Source riche : DOM listener direct ou BU+DOM fusionne
+            if other.source not in ("dom_listener", "bu+dom"):
+                continue
+            if other.action in ("click", "input", "check", "uncheck", "select"):
+                ev.included_in_replay = False
+                ev.cleanup_reason = (
+                    f"fusionne avec {other.id} (evaluate JS workaround dont "
+                    f"l'intent est deja capture par un {other.action} canonique)"
+                )
+                # Trace inverse sur le canonique
+                raw = other.raw_payload or {}
+                if isinstance(raw, dict):
+                    fused = list(raw.get("fused_sources") or [])
+                    if ev.id not in fused:
+                        fused.append(ev.id)
+                    raw["fused_sources"] = fused
+                    other.raw_payload = raw
+                break
 
 
 def _link_network_to_steps(steps: list[Step], network_log: list[dict[str, Any]]) -> None:

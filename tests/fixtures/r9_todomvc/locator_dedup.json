@@ -1,0 +1,334 @@
+[
+  {
+    "action": "input",
+    "timestamp": 1788045682482,
+    "tag": "INPUT",
+    "value": "Preparer le rapport QA",
+    "sensitive": false,
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "placeholder": "What needs to be done?",
+      "data-testid": null,
+      "aria-label": null
+    }
+  },
+  {
+    "action": "keyboard",
+    "timestamp": 1788045682663,
+    "tag": "INPUT",
+    "value": "Enter",
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null
+    }
+  },
+  {
+    "action": "input",
+    "timestamp": 1788045683623,
+    "tag": "INPUT",
+    "value": "Verifier les selecteurs",
+    "sensitive": false,
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "placeholder": "What needs to be done?",
+      "data-testid": null,
+      "aria-label": null
+    }
+  },
+  {
+    "action": "keyboard",
+    "timestamp": 1788045683796,
+    "tag": "INPUT",
+    "value": "Enter",
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null
+    }
+  },
+  {
+    "action": "input",
+    "timestamp": 1788045684955,
+    "tag": "INPUT",
+    "value": "Controler les requetes reseau",
+    "sensitive": false,
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "placeholder": "What needs to be done?",
+      "data-testid": null,
+      "aria-label": null
+    }
+  },
+  {
+    "action": "keyboard",
+    "timestamp": 1788045685126,
+    "tag": "INPUT",
+    "value": "Enter",
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null
+    }
+  },
+  {
+    "action": "input",
+    "timestamp": 1788045685914,
+    "tag": "INPUT",
+    "value": "Valider le replay",
+    "sensitive": false,
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "placeholder": "What needs to be done?",
+      "data-testid": null,
+      "aria-label": null
+    }
+  },
+  {
+    "action": "keyboard",
+    "timestamp": 1788045686106,
+    "tag": "INPUT",
+    "value": "Enter",
+    "selector": {
+      "strategy": "placeholder",
+      "value": "input[placeholder=\"What needs to be done?\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null
+    }
+  },
+  {
+    "action": "click",
+    "timestamp": 1788045885747,
+    "tag": "INPUT",
+    "text": "",
+    "parentLabel": "Verifier les selecteurs",
+    "selector": {
+      "strategy": "aria-label",
+      "value": "[aria-label=\"Toggle Todo\"]",
+      "inShadowDOM": false,
+      "unique": false,
+      "matchCount": 4
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": "checkbox",
+      "class": "toggle",
+      "href": null,
+      "data-testid": null,
+      "aria-label": "Toggle Todo",
+      "role": null
+    }
+  },
+  {
+    "action": "check",
+    "timestamp": 1788045885753,
+    "tag": "INPUT",
+    "checked": true,
+    "value": "true",
+    "selector": {
+      "strategy": "aria-label",
+      "value": "[aria-label=\"Toggle Todo\"]",
+      "inShadowDOM": false,
+      "unique": false,
+      "matchCount": 4
+    },
+    "matchCount": 4,
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "parentLabel": "Verifier les selecteurs",
+    "parentSelector": "[data-testid=\"todo-item\"]",
+    "accessibleName": "Toggle Todo",
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": "checkbox",
+      "aria-label": "Toggle Todo"
+    }
+  },
+  {
+    "action": "click",
+    "timestamp": 1788045898673,
+    "tag": "A",
+    "text": "Active",
+    "parentLabel": null,
+    "selector": {
+      "strategy": "href",
+      "value": "a[href=\"#/active\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "class": "",
+      "href": "#/active",
+      "data-testid": null,
+      "aria-label": null,
+      "role": null
+    }
+  },
+  {
+    "action": "click",
+    "timestamp": 1788045917412,
+    "tag": "A",
+    "text": "Completed",
+    "parentLabel": null,
+    "selector": {
+      "strategy": "href",
+      "value": "a[href=\"#/completed\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/active",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "class": "",
+      "href": "#/completed",
+      "data-testid": null,
+      "aria-label": null,
+      "role": null
+    }
+  },
+  {
+    "action": "click",
+    "timestamp": 1788045935697,
+    "tag": "A",
+    "text": "All",
+    "parentLabel": null,
+    "selector": {
+      "strategy": "href",
+      "value": "a[href=\"#/\"]",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/completed",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "class": "",
+      "href": "#/",
+      "data-testid": null,
+      "aria-label": null,
+      "role": null
+    }
+  },
+  {
+    "action": "click",
+    "timestamp": 1788045948792,
+    "tag": "BUTTON",
+    "text": "Clear completed",
+    "parentLabel": null,
+    "selector": {
+      "strategy": "css-short",
+      "value": "button.clear-completed",
+      "inShadowDOM": false,
+      "unique": true,
+      "matchCount": 1
+    },
+    "url": "https://demo.playwright.dev/todomvc/#/",
+    "inShadowDOM": false,
+    "attributes": {
+      "id": null,
+      "name": null,
+      "type": null,
+      "class": "clear-completed",
+      "href": null,
+      "data-testid": null,
+      "aria-label": null,
+      "role": null
+    }
+  }
+]

@@ -1,0 +1,22 @@
+[
+  {
+    "requestId": "683CEE4E3779D7E979787AB0BA4541C6",
+    "type": "Document",
+    "method": "GET",
+    "url": "https://demo.playwright.dev/todomvc/",
+    "timestamp": 259001.196336,
+    "wallTime": 1788045671.023877,
+    "headers": {
+      "Upgrade-Insecure-Requests": "1",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/143.0.7499.4 Safari/537.36",
+      "sec-ch-ua": "\"HeadlessChrome\";v=\"143\", \"Chromium\";v=\"143\", \"Not A(Brand\";v=\"24\"",
+      "sec-ch-ua-mobile": "?0",
+      "sec-ch-ua-platform": "\"Windows\""
+    },
+    "postData": null,
+    "status": 200,
+    "statusText": "",
+    "responseType": "text/html",
+    "duration_ms": 89.6
+  }
+]

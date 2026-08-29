@@ -88,6 +88,70 @@ def test_validate_flags_missing_step_id():
     assert any("step-0002" in a for a in anomalies_bad)
 
 
+def test_validate_flags_out_of_order():
+    """L'ordre des steps doit etre preserve : une inversion doit
+    remonter une anomalie ORDRE explicite."""
+    cs = _cs(
+        Step(id="step-0001", step=1, action="click",
+             selector=Selector(value="#a", strategy="id")),
+        Step(id="step-0002", step=2, action="click",
+             selector=Selector(value="#b", strategy="id")),
+    )
+    # Inverse les 2 headers dans l'export
+    export_ok = export_katalon(cs)
+    export_swapped = export_ok.replace("[step-0001]", "TMPA").replace("[step-0002]", "[step-0001]").replace("TMPA", "[step-0002]")
+    anomalies = validate_export_counts(cs, export_swapped, "katalon")
+    assert any("ORDRE" in a for a in anomalies)
+
+
+def test_validate_flags_ghost_step_in_export():
+    """Un step-XXXX qui n'existe pas dans clean_steps doit lever une
+    anomalie fantome."""
+    cs = _cs(Step(id="step-0001", step=1, action="click",
+                  selector=Selector(value="#a", strategy="id")))
+    export = export_katalon(cs) + "\n// [step-9999] injected ghost"
+    anomalies = validate_export_counts(cs, export, "katalon")
+    assert any("fantome" in a for a in anomalies)
+
+
+def test_validate_semantic_by_action_type_katalon():
+    """R5 : la semantique par action_type doit matcher. Si clean_steps a
+    2 inputs + 1 click + 1 navigate, l'export Katalon doit avoir
+    exactement 2 WebUI.setText + 1 WebUI.click + 1 WebUI.navigateToUrl."""
+    from deterministic_exporters import validate_export_by_action_type
+    cs = CleanSteps(
+        parcours="test", scenario_url="https://example.com",
+        total_steps=4,
+        steps=[
+            # navigate initial explicite pour matcher le navigateToUrl que
+            # Katalon emet toujours en tete depuis scenario_url
+            Step(id="step-0001", step=1, action="navigate", url="https://example.com"),
+            Step(id="step-0002", step=2, action="input",
+                 selector=Selector(value="#a", strategy="id"), value="v1"),
+            Step(id="step-0003", step=3, action="input",
+                 selector=Selector(value="#b", strategy="id"), value="v2"),
+            Step(id="step-0004", step=4, action="click",
+                 selector=Selector(value="#btn", strategy="id")),
+        ],
+    )
+    ok = export_katalon(cs)
+    anomalies = validate_export_by_action_type(cs, ok, "katalon")
+    assert anomalies == [], f"Katalon coherent devrait retourner [], got: {anomalies}"
+
+
+def test_validate_semantic_detects_injection():
+    """Si un exporter injecte un statement en trop (setText fantome),
+    la validation semantique le detecte."""
+    from deterministic_exporters import validate_export_by_action_type
+    cs = _cs(
+        Step(id="step-0001", step=1, action="input",
+             selector=Selector(value="#a", strategy="id"), value="hello"),
+    )
+    tampered = export_katalon(cs) + "\nWebUI.setText(injected, 'fantome')\n"
+    anomalies = validate_export_by_action_type(cs, tampered, "katalon")
+    assert any("input" in a.lower() for a in anomalies)
+
+
 def test_validate_flags_count_mismatch():
     """Si l'export contient un nombre different de step markers -> anomalie."""
     cs = _cs(
