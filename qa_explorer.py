@@ -47,6 +47,15 @@ import argparse
 from datetime import datetime
 from pathlib import Path
 
+# Modules refactor Aout 2026 : pipeline unifie autour de test_playwright.spec.ts
+from schemas import CURRENT_SCHEMA_VERSION
+from clean_steps_builder import (
+    extract_browser_use_history,
+    build_clean_steps,
+    generate_export_code,
+)
+from playwright_generator import generate_playwright_ts
+
 # Charger les variables du .env (OPENAI_API_KEY notamment)
 load_dotenv()
 
@@ -1296,29 +1305,94 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         # -- ETAPE 7 : Afficher le log deduplique --
         print_raw_log(deduped)
 
-        # -- ETAPE 8 : Nettoyage IA --
-        if len(deduped) > 0:
-            clean_data = ai_cleanup(deduped, scenario_steps=scenario_steps, model=model, base_url=base_url, api_key=api_key, output_format=output_format, network_log=network_log if 'network_log' in locals() else None)
+        # -- ETAPE 7bis : Extraire l'historique complet browser-use --
+        # Sans ca on ne connait que result.final_result() (string plate) et on
+        # perd les actions non captees par le DOM listener (navigate, wait,
+        # keyboard, upload, tabs, go_back, ...).
+        bu_history = extract_browser_use_history(agent, result)
+        bu_history_file = output_dir / "browser_use_history.json"
+        try:
+            bu_history_file.write_text(
+                json.dumps(bu_history, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(f"  Historique browser-use ({len(bu_history)} steps) -> {bu_history_file}")
+        except Exception as e:
+            print(f"  [WARN] Ecriture browser_use_history.json echouee : {e}")
+
+        # -- ETAPE 8 : Construction du clean_steps.json enrichi (schema v1.0) --
+        # Nouveau pipeline unifie : fusion multi-sources (scenario + BU history +
+        # DOM listener + network) -> classification LLM (included_in_replay +
+        # anomalies, PAS de construction de selecteurs) -> validation Pydantic.
+        clean_steps = None
+        sensitive_env_vars: list[str] = []
+        if len(deduped) > 0 or bu_history:
+            clean_steps, sensitive_env_vars = build_clean_steps(
+                scenario_name=scenario_name,
+                scenario_url=scenario_url,
+                scenario_steps=scenario_steps,
+                bu_history=bu_history,
+                dom_log=deduped,
+                network_log=network_log if 'network_log' in locals() else None,
+                model=model,
+                base_url=base_url,
+                api_key=api_key,
+            )
 
             clean_file = output_dir / "clean_steps.json"
-            clean_file.write_text(json.dumps(clean_data, indent=2, ensure_ascii=False), encoding="utf-8")
-            print(f"\n  Parcours nettoye -> {clean_file}")
+            clean_file.write_text(
+                clean_steps.model_dump_json(indent=2, exclude_none=True),
+                encoding="utf-8",
+            )
+            print(f"\n  Parcours nettoye (schema {CURRENT_SCHEMA_VERSION}) -> {clean_file}")
+            included = sum(1 for s in clean_steps.steps if s.included_in_replay)
+            skipped = len(clean_steps.steps) - included
+            print(f"  Steps : {len(clean_steps.steps)} total, {included} rejouables, {skipped} filtres")
+            if sensitive_env_vars:
+                print(f"  Vars sensibles a positionner avant replay : {', '.join(sensitive_env_vars)}")
 
-            print_clean_steps(clean_data)
+            # -- ETAPE 9a : Generer TOUJOURS test_playwright.spec.ts (canonique) --
+            # C'est le format interne utilise par /api/replay/{run_id}.
+            spec_path = output_dir / "test_playwright.spec.ts"
+            gen_result = generate_playwright_ts(
+                clean_steps=clean_steps,
+                output_path=spec_path,
+                parcours_url=scenario_url,
+            )
+            print(f"  test_playwright.spec.ts -> {spec_path}")
+            print(f"    Steps traduits : {gen_result['included_count']}, "
+                  f"skipped : {gen_result['skipped_count']}, "
+                  f"non traduisibles : {len(gen_result['unsupported'])}")
+            if gen_result["unsupported"]:
+                for u in gen_result["unsupported"]:
+                    print(f"    [ATTENTION] {u['step_id']} ({u['action']}) : {u['reason']}")
 
-            # -- ETAPE 9 : Sauvegarder le code de test (Katalon/Playwright/Cypress/Selenium) --
-            generated_code = clean_data.get('katalon_code', '')
-            if generated_code:
-                fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
-                code_file = output_dir / f"test_{output_format}{fmt_info['extension']}"
-                code_file.write_text(generated_code, encoding="utf-8")
-                print(f"\n  Code {fmt_info['label']} -> {code_file}")
+            # -- ETAPE 9b : Si le format demande n'est pas playwright, generer
+            # aussi l'export livrable (Katalon/Cypress/Selenium) via IA.
+            if output_format != "playwright":
+                export_code = generate_export_code(
+                    clean_steps=clean_steps,
+                    output_format=output_format,
+                    model=model,
+                    base_url=base_url,
+                    api_key=api_key,
+                    output_formats_map=OUTPUT_FORMATS,
+                )
+                if export_code:
+                    fmt_info = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
+                    code_file = output_dir / f"test_{output_format}{fmt_info['extension']}"
+                    code_file.write_text(export_code, encoding="utf-8")
+                    print(f"  Code {fmt_info['label']} (export) -> {code_file}")
 
             # -- ETAPE 10 : Generer le rapport HTML --
+            # On serialise clean_steps en dict pour rester compatible avec la
+            # signature existante de report_generator (dict-based).
+            clean_data_dict = clean_steps.model_dump(exclude_none=True)
+            print_clean_steps(clean_data_dict)
             if HAS_REPORT:
                 print_header("GENERATION DU RAPPORT")
                 report_path = generate_report(
-                    clean_data=clean_data,
+                    clean_data=clean_data_dict,
                     deduped_log=deduped,
                     agent_result=str(result.final_result()),
                     scenario_name=scenario_name,
@@ -1429,6 +1503,14 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "coverage_used_kb": coverage_summary["total_used"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
                 "coverage_total_kb": coverage_summary["total_size"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
                 "dom_mutations_total": (dom_mutations["attribute_modified"] + dom_mutations["child_node_inserted"] + dom_mutations["child_node_removed"]) if 'dom_mutations' in locals() else 0,
+                # Refactor Aout 2026 : pipeline unifie Playwright TS
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "bu_history_count": len(bu_history) if 'bu_history' in locals() else 0,
+                "clean_steps_total": len(clean_steps.steps) if 'clean_steps' in locals() and clean_steps else 0,
+                "clean_steps_included": sum(1 for s in clean_steps.steps if s.included_in_replay) if 'clean_steps' in locals() and clean_steps else 0,
+                "clean_steps_filtered": sum(1 for s in clean_steps.steps if not s.included_in_replay) if 'clean_steps' in locals() and clean_steps else 0,
+                "sensitive_env_vars": sensitive_env_vars if 'sensitive_env_vars' in locals() else [],
+                "playwright_spec_present": (output_dir / "test_playwright.spec.ts").exists(),
                 "status": "success",
             }
             (output_dir / "meta.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
