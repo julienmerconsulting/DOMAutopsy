@@ -869,7 +869,28 @@ async def _pump_stdout(run_id: str, proc: subprocess.Popen, queue: asyncio.Queue
         # Attendre que le process termine vraiment (idem, bloquant -> executor)
         await loop.run_in_executor(None, proc.wait)
         RUNS[run_id]["status"] = "exit_" + str(proc.returncode)
+        # Post-processing pour les replays : agrege le JSON Playwright dans
+        # un rapport HTML self-contained + enrichit le meta.json.
+        try:
+            r = RUNS.get(run_id) or {}
+            if r.get("is_replay") and r.get("run_dir"):
+                await loop.run_in_executor(None, _postprocess_replay, run_id, Path(r["run_dir"]))
+        except Exception as e:
+            await queue.put(f"[server] Post-processing replay echec : {e}")
         await queue.put(None)
+
+
+def _postprocess_replay(run_id: str, replay_dir: Path) -> None:
+    """Genere replay_report.html + enrichit meta.json d'un run replay termine.
+    Appele en thread executor pour ne pas bloquer l'event loop."""
+    try:
+        from replay_reporter import generate_replay_report, update_replay_meta_with_verdict
+        report_path = generate_replay_report(replay_dir)
+        if report_path and run_id in RUNS:
+            RUNS[run_id]["report_path"] = str(report_path.relative_to(ROOT)) if report_path.is_absolute() else str(report_path)
+        update_replay_meta_with_verdict(replay_dir)
+    except Exception as e:
+        print(f"[server] _postprocess_replay({run_id}) : {e}")
 
 
 @app.websocket("/ws/logs/{run_id}")
