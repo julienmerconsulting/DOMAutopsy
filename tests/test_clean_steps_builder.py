@@ -98,16 +98,29 @@ def test_bu_unknown_action_preserved_as_unknown_with_raw_payload():
     assert unknowns[0].raw_payload == {"do_barrel_roll": {"speed": 42, "axis": "z"}}
 
 
-def test_bu_done_extract_content_are_not_translated_to_steps():
-    """Les meta-actions LLM (done, extract_content) ne sont pas des
-    actions user rejouables : elles ne generent pas de step."""
-    bu_history = [{
-        "actions": [{"done": {"success": True}}, {"extract_content": {"query": "..."}}],
-    }]
+def test_bu_done_is_not_translated_to_step():
+    """La meta-action LLM 'done' n'est pas une action user : elle ne
+    genere pas de step (aucune interaction reproductible)."""
+    bu_history = [{"actions": [{"done": {"success": True}}]}]
     steps = build_pre_cleanup_steps(
         scenario_steps=None, bu_history=bu_history, dom_log=[], network_log=None,
     )
     assert steps == []
+
+
+def test_bu_extract_creates_step_marked_not_replayable():
+    """extract est conservee dans le JSON pour la tracabilite mais
+    explicitement marquee non-rejouable (regle : pas de no-op presente
+    comme executee). Le TS emit un throw plutot qu'un skip silencieux."""
+    bu_history = [{"actions": [{"extract_content": {"query": "titre article"}}]}]
+    steps = build_pre_cleanup_steps(
+        scenario_steps=None, bu_history=bu_history, dom_log=[], network_log=None,
+    )
+    assert len(steps) == 1
+    s = steps[0]
+    assert s.action == "extract"
+    assert s.included_in_replay is False
+    assert s.cleanup_reason and "extract" in s.cleanup_reason.lower()
 
 
 def test_scenario_verify_and_cookie_added_as_steps():
@@ -149,12 +162,23 @@ def test_sensitive_inputs_get_env_var_assigned():
 # --------------------------------------------------------------------
 
 @pytest.mark.parametrize("bu_name,expected", [
+    # Mapping direct
     ("go_to_url", "navigate"),
     ("input_text", "input"),
     ("press_key", "keyboard"),
     ("scroll_down", "scroll"),
+    # BU 0.12.9 : noms officiels differents
+    ("switch", "switch_tab"),
+    ("close", "close_tab"),
+    ("select_dropdown", "select"),
+    # extract : garde dans le JSON avec action='extract', pas None
+    ("extract", "extract"),
+    ("extract_content", "extract"),
+    # Meta-actions LLM sans interaction : None
     ("done", None),
-    ("extract_content", None),
+    ("read_content", None),
+    ("assess", None),
+    # Inconnu : conserve sous 'unknown'
     ("something_never_seen", "unknown"),
 ])
 def test_bu_action_name_normalization(bu_name, expected):

@@ -47,34 +47,42 @@ from schemas import (
 # ============================================================
 
 def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]:
-    """Recupere l'historique complet des actions browser-use.
+    """Recupere l'historique complet des actions browser-use 0.12.9.
 
-    Le shape de l'API browser-use varie selon la version :
-      - >= 0.3 : agent.history est un AgentHistoryList avec .history: list[AgentHistory]
-      - certaines versions : result est directement l'AgentHistoryList
-      - anciennes : agent.state.history
-      - fallback : result.all_history() ou result.model_actions()
+    Ordre de resolution des API (3 chemins + 1 fallback methode) :
+      1. result.history                    (AgentHistoryList retourne par agent.run)
+      2. agent.history.history             (property AgentHistoryList sur l'agent)
+      3. agent.state.history.history       (versions plus anciennes)
+      4. FALLBACK : result.model_actions() (methode qui retourne les actions
+                                            plates si l'objet history est
+                                            inaccessible)
 
-    On tente les 3 chemins et normalise en list de dicts. Si tout echoue,
-    retourne une liste vide + log warning (pas de crash).
+    Pour chaque AgentHistory extrait :
+      - model_output.action[] : les actions decidees par le LLM
+      - state.interacted_element : selecteur exact de l'element cible par
+        BU (xpath, css_selector, attributes) - CRITIQUE pour B2 : c'est
+        ce qui permet d'ecrire un click BU meme quand le DOM listener n'a
+        rien capture
+      - metadata.step_start_time, step_end_time, step_number : fenetre
+        temporelle utilisee par la fusion chronologique B1
+      - state.url, tabs : contexte
+
+    Retourne une liste ordonnee de dicts serialisables. Liste vide si
+    aucun chemin ne donne d'historique (log warning, pas de crash).
     """
-    history_list = None
+    history_list = _resolve_history_list(agent, result)
 
-    # Chemin 1 : result est deja l'AgentHistoryList (browser-use recent)
-    if result is not None and hasattr(result, "history") and result.history:
-        history_list = result.history
-    # Chemin 2 : agent.history
-    elif agent is not None and hasattr(agent, "history"):
-        h = getattr(agent, "history", None)
-        if h is not None:
-            history_list = getattr(h, "history", None) or h
-    # Chemin 3 : agent.state.history
-    if history_list is None and agent is not None and hasattr(agent, "state"):
-        state = getattr(agent, "state", None)
-        if state is not None:
-            h = getattr(state, "history", None)
-            if h is not None:
-                history_list = getattr(h, "history", None) or h
+    # Fallback 4 : model_actions() plat si aucune AgentHistoryList
+    if not history_list and result is not None and hasattr(result, "model_actions"):
+        try:
+            flat = result.model_actions()
+            if flat:
+                # Enveloppe chaque action plate dans un pseudo-entry sans
+                # metadata timing (la fusion chronologique retombera sur
+                # l'ordre) et sans interacted_element.
+                return [{"actions": [_action_to_dict(a)]} for a in flat]
+        except Exception:
+            pass
 
     if not history_list:
         return []
@@ -82,22 +90,20 @@ def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]
     normalized: list[dict[str, Any]] = []
     for entry in history_list:
         try:
-            # Chaque AgentHistory a typiquement .model_output, .result, .state (screenshot, url, tabs)
             item: dict[str, Any] = {}
-            # Actions decidees par le LLM
+            # Actions LLM
             model_output = getattr(entry, "model_output", None)
             if model_output is not None:
-                # model_output.action est en general une liste d'objets Action
                 actions = getattr(model_output, "action", None) or []
                 item["actions"] = [_action_to_dict(a) for a in actions]
                 if getattr(model_output, "current_state", None):
                     cs = model_output.current_state
                     item["thought"] = getattr(cs, "next_goal", None) or getattr(cs, "memory", None)
-            # Resultat de l'execution
+            # Results
             results = getattr(entry, "result", None) or []
             if results:
                 item["results"] = [_result_to_dict(r) for r in results]
-            # Etat du navigateur au moment du step
+            # State avec interacted_element (B2 critique)
             state = getattr(entry, "state", None)
             if state is not None:
                 item["state"] = {
@@ -105,11 +111,91 @@ def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]
                     "title": getattr(state, "title", None),
                     "tabs_count": len(getattr(state, "tabs", []) or []),
                 }
+                # BU 0.12.9 expose interacted_element sur le state ou sur
+                # les results (selon les versions). On teste les 2.
+                ie = getattr(state, "interacted_element", None)
+                if ie is not None:
+                    item["interacted_element"] = _element_to_dict(ie)
+                elif results:
+                    # Certaines versions le posent sur ActionResult
+                    for r in results:
+                        r_ie = getattr(r, "interacted_element", None)
+                        if r_ie is not None:
+                            item["interacted_element"] = _element_to_dict(r_ie)
+                            break
+            # Metadata timing (B1 critique pour la fusion chronologique)
+            metadata = getattr(entry, "metadata", None)
+            if metadata is not None:
+                item["metadata"] = {
+                    "step_number": getattr(metadata, "step_number", None),
+                    "step_start_time": _to_ms(getattr(metadata, "step_start_time", None)),
+                    "step_end_time": _to_ms(getattr(metadata, "step_end_time", None)),
+                    "input_tokens": getattr(metadata, "input_tokens", None),
+                }
             normalized.append(item)
         except Exception as e:
             normalized.append({"_parse_error": str(e)})
 
     return normalized
+
+
+def _resolve_history_list(agent: Any, result: Any) -> Any:
+    """3 chemins d'acces defensifs a AgentHistoryList selon la version BU."""
+    # 1. result.history (BU 0.12.9 : c'est ici que ca vit typiquement)
+    if result is not None and hasattr(result, "history") and getattr(result, "history"):
+        return result.history
+    # 2. agent.history (property qui expose AgentHistoryList)
+    if agent is not None and hasattr(agent, "history"):
+        h = getattr(agent, "history", None)
+        if h is not None:
+            return getattr(h, "history", None) or h
+    # 3. agent.state.history (versions plus anciennes)
+    if agent is not None and hasattr(agent, "state"):
+        state = getattr(agent, "state", None)
+        if state is not None:
+            h = getattr(state, "history", None)
+            if h is not None:
+                return getattr(h, "history", None) or h
+    return None
+
+
+def _element_to_dict(elem: Any) -> dict[str, Any]:
+    """Serialise defensivement un DOMHistoryElement browser-use."""
+    if isinstance(elem, dict):
+        return dict(elem)
+    if hasattr(elem, "model_dump"):
+        try:
+            return elem.model_dump(exclude_none=True)
+        except Exception:
+            pass
+    out: dict[str, Any] = {}
+    for attr in ("xpath", "css_selector", "tag_name", "attributes",
+                 "is_visible", "is_interactive", "shadow_root", "highlight_index"):
+        v = getattr(elem, attr, None)
+        if v is not None:
+            out[attr] = v
+    return out or {"raw": str(elem)}
+
+
+def _to_ms(ts: Any) -> int | None:
+    """Normalise un timestamp BU (datetime, float seconds, int ms) en int ms
+    pour permettre la fusion chronologique avec les timestamps DOM listener
+    (Date.now() JS = int ms since epoch)."""
+    if ts is None:
+        return None
+    # datetime avec .timestamp() -> secondes float
+    if hasattr(ts, "timestamp") and callable(ts.timestamp):
+        try:
+            return int(ts.timestamp() * 1000)
+        except Exception:
+            pass
+    # float seconds (time.time() typique)
+    if isinstance(ts, float):
+        return int(ts * 1000) if ts < 1e12 else int(ts)
+    # int - heuristique : > 1e12 = deja en ms, sinon secondes
+    if isinstance(ts, int):
+        return ts if ts > 1e12 else ts * 1000
+    return None
 
 
 def _action_to_dict(action: Any) -> dict[str, Any]:
@@ -168,11 +254,20 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     """Convertit une entree du DOM listener en Step v1.0.
     C'est la source la plus fiable pour click/input/scroll : le selecteur
     a ete valide runtime via querySelectorAll.
+
+    Le timestamp DOM listener vient de Date.now() JS = int ms since epoch.
+    On le stocke tel quel dans step.timestamp (unite normalisee ms utilisee
+    par la fusion chronologique).
     """
     action = (entry.get("action") or "unknown").lower()
     sel = _dom_selector_to_pydantic(entry.get("selector"))
     val = entry.get("value")
     is_sensitive = bool(entry.get("sensitive"))
+    # Normalisation timestamp : Date.now() est deja en ms int
+    ts_raw = entry.get("timestamp")
+    ts_ms = int(ts_raw) if isinstance(ts_raw, (int, float)) and ts_raw > 1e12 else (
+        int(ts_raw * 1000) if isinstance(ts_raw, (int, float)) else None
+    )
     step = Step(
         id=f"step-{index:04d}",
         step=index,
@@ -180,7 +275,7 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
         description=entry.get("text") or None,
         page=entry.get("url"),
         url=entry.get("url"),
-        timestamp=entry.get("timestamp"),
+        timestamp=ts_ms,
         selector=sel,
         selectorType=("xpath" if sel and sel.value and sel.value.startswith("//") else ("window" if action == "scroll" else "css")),
         target=entry.get("text"),
@@ -198,25 +293,37 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     return step
 
 
-def _step_from_bu_action(bu_action: dict[str, Any], index: int, current_url: str | None) -> Step | None:
-    """Convertit une action browser-use en Step v1.0 quand elle n'a pas
-    ete captee par le DOM listener (typiquement : navigate, go_back, reload,
-    open_tab, wait, screenshot, keyboard, upload).
+def _step_from_bu_action(
+    bu_action: dict[str, Any],
+    index: int,
+    current_url: str | None,
+    interacted_element: dict[str, Any] | None = None,
+    ts_ms: int | None = None,
+) -> Step | None:
+    """Convertit une action browser-use en Step v1.0.
 
-    Retourne None si l'action ne se traduit pas en une etape rejouable
-    (ex: extract_content, done - ce sont des observations LLM, pas des
-    actions user).
+    interacted_element : le state.interacted_element expose par BU 0.12.9
+    pour les actions qui ciblent un element (click, input, select). On
+    l'utilise pour extraire un selecteur QUAND le DOM listener n'a pas
+    capture l'evenement (scroll conteneur, iframe cross-origin, action
+    avant injection listener). Regle du cahier : "ne fabrique jamais un
+    selecteur sans correspondance fiable" - donc si interacted_element
+    ne fournit pas un selecteur valide, on garde le step SANS selecteur
+    et on signale l'incertitude via anomalies.
+
+    ts_ms : timestamp normalise en ms (int) pour la fusion chronologique.
+    Retourne None UNIQUEMENT pour les meta-actions LLM sans lien
+    interaction (done, read_content, etc.). Les actions extract sont
+    retournees mais marquees included_in_replay=False + cleanup_reason.
     """
-    # bu_action est un dict single-key: {action_name: params}
     if not isinstance(bu_action, dict) or not bu_action:
         return None
-    # Normalise : {"go_to_url": {"url": "..."}} -> action="navigate", params={"url": ...}
     action_name = next(iter(bu_action.keys()))
     params = bu_action[action_name] if isinstance(bu_action[action_name], dict) else {}
 
     normalized = _normalize_bu_action_name(action_name)
     if normalized is None:
-        # Action LLM sans traduction (ex: done, extract_content) -> non-step
+        # done, read_content, assess, think, note - meta-actions LLM pures
         return None
 
     step = Step(
@@ -226,13 +333,22 @@ def _step_from_bu_action(bu_action: dict[str, Any], index: int, current_url: str
         source="browser_use_history",
         included_in_replay=True,
         raw_payload=dict(bu_action),
+        timestamp=ts_ms,
     )
+
+    # Extraction de selecteur depuis interacted_element si BU l'expose.
+    # Structure typique : {xpath, css_selector, attributes: {...}, tag_name}
+    _apply_interacted_element(step, interacted_element)
 
     if normalized == "navigate":
         url = params.get("url") or params.get("website")
         step.url = url or current_url
         step.description = f"Va sur {url}" if url else "Navigation"
         step.selectorType = "url"
+        # navigate(new_tab=True) est different d'un simple navigate
+        if params.get("new_tab"):
+            step.action = "open_tab"
+            step.description = f"Ouvre nouvel onglet : {url or 'blank'}"
     elif normalized == "wait":
         secs = params.get("seconds") or params.get("duration") or 2
         try:
@@ -252,10 +368,54 @@ def _step_from_bu_action(bu_action: dict[str, Any], index: int, current_url: str
     elif normalized == "open_tab":
         step.url = params.get("url")
         step.description = f"Ouvre onglet : {step.url or 'blank'}"
+    elif normalized == "switch_tab":
+        # Gestion deterministe par ORDRE DE CREATION (page_index), pas
+        # par tab_id opaque BU. Le TS utilisera context().pages()[index].
+        idx = params.get("page_index")
+        if idx is None:
+            idx = params.get("index", 0)
+        try:
+            step.value = str(int(idx))
+        except (TypeError, ValueError):
+            step.value = "0"
+        step.description = f"Bascule sur l'onglet [{step.value}]"
+    elif normalized == "close_tab":
+        idx = params.get("page_index")
+        if idx is None:
+            idx = params.get("index")
+        step.value = str(int(idx)) if idx is not None else None
+        step.description = (
+            f"Ferme l'onglet [{step.value}]" if step.value else
+            "Ferme l'onglet courant"
+        )
     elif normalized in ("go_back", "go_forward", "reload"):
-        step.description = {"go_back": "Retour arriere", "go_forward": "Avance", "reload": "Recharge la page"}[normalized]
+        step.description = {
+            "go_back": "Retour arriere",
+            "go_forward": "Avance",
+            "reload": "Recharge la page",
+        }[normalized]
+    elif normalized == "extract":
+        # Extract est une lecture LLM (extraire un texte/donnee depuis
+        # le DOM pour raisonner). Aucune interaction user, NON rejouable.
+        # On garde dans le JSON pour tracabilite + rapport, mais on
+        # marque explicitement included_in_replay=False.
+        step.description = f"Extract LLM : {params.get('goal') or params.get('query') or 'lecture DOM'}"
+        step.included_in_replay = False
+        step.cleanup_reason = "action extract (lecture LLM only, pas d'interaction utilisateur reproductible)"
+    elif normalized in ("click", "input", "select", "scroll", "hover"):
+        # Actions interactives BU sans correspondance DOM listener.
+        # interacted_element a peut-etre fourni le selecteur. Sinon :
+        # valeur/description best-effort, anomalie signalee au niveau
+        # global (via _link_bu_dom_signal_anomalies).
+        if normalized == "input":
+            step.value = params.get("text") or params.get("value")
+        elif normalized == "select":
+            step.value = params.get("value") or params.get("option") or params.get("text")
+        elif normalized == "scroll":
+            step.direction = "down" if (params.get("direction") in (None, "down", "bas")) else "up"
+            step.deltaY = params.get("amount") or params.get("delta") or 650
+        step.description = f"{normalized.capitalize()} (BU-only, sans DOM event)"
     else:
-        # unknown : conserve intact via raw_payload
         step.action = "unknown"
         step.description = f"Action browser-use non standard : {action_name}"
 
@@ -263,51 +423,101 @@ def _step_from_bu_action(bu_action: dict[str, Any], index: int, current_url: str
     return step
 
 
-def _normalize_bu_action_name(name: str) -> str | None:
-    """Mappe les noms d'action browser-use vers notre vocabulaire.
+def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
+    """Extrait un selecteur robuste depuis state.interacted_element de BU.
 
-    Retourne None pour les actions LLM qui ne se traduisent pas en step
-    rejouable (done, extract_content, ...)."""
+    BU 0.12.9 expose : {xpath, css_selector, attributes: {id, class, ...},
+    tag_name, is_visible, is_interactive}. Regle du cahier : jamais
+    fabriquer un selecteur - on prend UNIQUEMENT ce que BU nous donne
+    (xpath ou css directement).
+    """
+    if not elem or not isinstance(elem, dict):
+        return
+    css = elem.get("css_selector")
+    xpath = elem.get("xpath")
+    if css and isinstance(css, str):
+        step.selector = Selector(strategy="bu-css", value=css, unique=None, matchCount=None)
+        step.selectorType = "css"
+    elif xpath and isinstance(xpath, str):
+        step.selector = Selector(strategy="bu-xpath", value=xpath, unique=None, matchCount=None)
+        step.selectorType = "xpath"
+    # Attributes peuvent enrichir la description sans devenir selecteur
+    attrs = elem.get("attributes") or {}
+    if isinstance(attrs, dict) and not step.target:
+        step.target = attrs.get("aria-label") or attrs.get("name") or attrs.get("id")
+
+
+def _normalize_bu_action_name(name: str) -> str | None:
+    """Mappe les noms d'action browser-use 0.12.9 vers notre vocabulaire.
+
+    Verifie contre les noms REELS du service browser-use (voir
+    https://github.com/browser-use/browser-use/blob/0.12.9/browser_use/tools/service.py)
+    - pas les noms qu'on aimerait avoir. Actions BU 0.12.9 :
+      switch, close, select_dropdown, extract (et non switch_tab, close_tab,
+      select_option, extract_content).
+
+    Retourne None UNIQUEMENT pour les meta-actions LLM sans lien avec une
+    interaction utilisateur (done, read_content, assess, think, note).
+    'extract' est retourne tel quel et sera marque non-rejouable au step
+    level (pas None : on veut le tracer dans le JSON, pas le supprimer)."""
     n = (name or "").lower()
-    NON_REPLAYABLE = {"done", "extract_content", "read_content", "assess", "think", "note"}
-    if n in NON_REPLAYABLE:
+    # Meta-actions LLM pures (aucune interaction utilisateur reelle)
+    NON_INTERACTION = {"done", "read_content", "assess", "think", "note"}
+    if n in NON_INTERACTION:
         return None
     MAP = {
+        # Navigation
         "go_to_url": "navigate",
         "navigate_to": "navigate",
         "open_url": "navigate",
+        # Attente
         "wait": "wait",
         "wait_for": "wait",
+        # Clavier
         "press_key": "keyboard",
         "key_press": "keyboard",
         "keyboard": "keyboard",
         "send_keys": "keyboard",
+        # Screenshot
         "screenshot": "screenshot",
         "take_screenshot": "screenshot",
+        # Upload
         "upload_file": "upload",
         "upload": "upload",
+        # Historique navigation
         "go_back": "go_back",
         "back": "go_back",
         "go_forward": "go_forward",
         "reload_page": "reload",
         "refresh": "reload",
         "reload": "reload",
+        # Onglets - BU 0.12.9 utilise switch/close (pas switch_tab/close_tab)
         "open_tab": "open_tab",
         "new_tab": "open_tab",
+        "switch": "switch_tab",
         "switch_tab": "switch_tab",
+        "close": "close_tab",
         "close_tab": "close_tab",
+        # Interactions elements
         "click_element": "click",
         "click_element_by_index": "click",
         "click": "click",
         "input_text": "input",
         "type": "input",
         "fill": "input",
+        # Dropdown - BU 0.12.9 utilise select_dropdown (pas select_option)
+        "select_dropdown": "select",
         "select_option": "select",
         "select": "select",
         "hover": "hover",
+        # Scroll
         "scroll": "scroll",
         "scroll_down": "scroll",
         "scroll_up": "scroll",
+        # Lecture DOM - BU 0.12.9 utilise extract (pas extract_content)
+        # Garde dans le JSON, marquera included_in_replay=False + reason
+        "extract": "extract",
+        "extract_content": "extract",
     }
     return MAP.get(n, n if n in KNOWN_ACTIONS else "unknown")
 
@@ -332,42 +542,130 @@ def build_pre_cleanup_steps(
     Rapprochement network : chaque step recoit un list[NetworkRef] pour
     les requetes tombees dans sa fenetre temporelle [ts, ts_next].
     """
+    # ============================================================
+    # FUSION CHRONOLOGIQUE REELLE (B1)
+    # ============================================================
+    # 1. Normalise les DOM entries en list ordonnee par timestamp ms.
+    #    dom_consumed[i]=True quand une entree a ete rattachee a un BU step.
+    dom_entries = []
+    for e in (dom_log or []):
+        ts_raw = e.get("timestamp")
+        if isinstance(ts_raw, (int, float)):
+            ts_ms = int(ts_raw) if ts_raw > 1e12 else int(ts_raw * 1000)
+        else:
+            ts_ms = None
+        dom_entries.append({"ts_ms": ts_ms, "entry": e})
+    dom_entries.sort(key=lambda x: x["ts_ms"] or 0)
+    dom_consumed = [False] * len(dom_entries)
+
     steps: list[Step] = []
     current_url: str | None = None
     global_index = 0
+    # Buffer temporel : DOM event peut arriver un peu avant/apres la fenetre
+    # BU (delais de flush localStorage cote listener, delais network cote
+    # BU). 500ms est empirique - reste ajustable via TOLERANCE_MS.
+    TOLERANCE_MS = 500
 
     def _next_index() -> int:
         nonlocal global_index
         global_index += 1
         return global_index
 
-    # 1. On demarre par les steps DOM listener (fiables, timestampes) tries par ts
-    dom_sorted = sorted(dom_log or [], key=lambda x: x.get("timestamp", 0))
-    for e in dom_sorted:
-        step = _step_from_dom_entry(e, _next_index())
-        current_url = step.url or current_url
+    def _find_matching_dom(normalized_action: str, window_start: int | None,
+                           window_end: int | None) -> int | None:
+        """Cherche un DOM entry non-consomme, meme action, dans la fenetre."""
+        for i, d in enumerate(dom_entries):
+            if dom_consumed[i]:
+                continue
+            if d["ts_ms"] is None:
+                continue
+            if window_start is not None and d["ts_ms"] < window_start:
+                continue
+            if window_end is not None and d["ts_ms"] > window_end:
+                continue
+            if (d["entry"].get("action") or "").lower() == normalized_action:
+                return i
+        return None
+
+    # 2. Parcours de l'historique BU dans l'ordre.
+    #    Pour chaque BU step (avec fenetre [start, end]) :
+    #      - matcher chaque click/input/scroll/select/hover a un DOM entry
+    #        de la fenetre (source=bu+dom, selecteur DOM fiable)
+    #      - si pas de match : construire depuis interacted_element de BU
+    #        (source=browser_use_history, selecteur BU-provided, anomalie
+    #        conservee dans le rapport)
+    #      - autres actions (navigate, wait, keyboard, etc.) : ajout direct
+    for h in bu_history or []:
+        if not isinstance(h, dict):
+            continue
+        metadata = h.get("metadata") or {}
+        start_ms = metadata.get("step_start_time")
+        end_ms = metadata.get("step_end_time")
+        window_start = (start_ms - TOLERANCE_MS) if start_ms is not None else None
+        window_end = (end_ms + TOLERANCE_MS) if end_ms is not None else None
+        # BU step level : ts par defaut = start_ms (pour ordering des actions
+        # au sein d'un meme step LLM qui declenche plusieurs actions)
+        default_step_ts = start_ms
+
+        interacted = h.get("interacted_element") or {}
+        for action_dict in (h.get("actions") or []):
+            if not isinstance(action_dict, dict) or not action_dict:
+                continue
+            action_name = next(iter(action_dict.keys()))
+            normalized = _normalize_bu_action_name(action_name)
+            if normalized is None:
+                # Meta LLM (done, read_content, etc.) - jamais un step
+                continue
+
+            step: Step | None = None
+            if normalized in ("click", "input", "scroll", "select", "hover"):
+                matched_idx = _find_matching_dom(normalized, window_start, window_end)
+                if matched_idx is not None:
+                    dom_consumed[matched_idx] = True
+                    step = _step_from_dom_entry(
+                        dom_entries[matched_idx]["entry"], _next_index()
+                    )
+                    step.source = "bu+dom"
+                    # Trace le lien BU dans le raw_payload pour audit
+                    step.raw_payload = {"bu_action": action_dict}
+                else:
+                    # Pas de correspondance DOM demontree - construit depuis
+                    # BU seul avec interacted_element si dispo. Regle du
+                    # cahier : jamais fabriquer un selecteur, mais BU peut
+                    # nous en fournir un (xpath/css_selector) - c'est
+                    # different d'une invention.
+                    step = _step_from_bu_action(
+                        action_dict, _next_index(), current_url,
+                        interacted_element=interacted, ts_ms=default_step_ts,
+                    )
+            else:
+                # navigate, wait, keyboard, screenshot, upload, tabs,
+                # go_back, reload, extract, ...
+                step = _step_from_bu_action(
+                    action_dict, _next_index(), current_url,
+                    interacted_element=interacted, ts_ms=default_step_ts,
+                )
+
+            if step is None:
+                continue
+            steps.append(step)
+            if step.url:
+                current_url = step.url
+
+    # 3. DOM entries orphelins : capture DOM sans correspondance BU.
+    #    Cause possible : clic manuel de l'utilisateur pendant la
+    #    demonstration, event avant/apres injection listener, scroll
+    #    conteneur. On les GARDE (regle cahier : ne jamais supprimer sans
+    #    correspondance demontree) avec source="dom_orphan" pour permettre
+    #    au LLM classifier de decider.
+    for i, d in enumerate(dom_entries):
+        if dom_consumed[i]:
+            continue
+        step = _step_from_dom_entry(d["entry"], _next_index())
+        step.source = "dom_orphan"
         steps.append(step)
 
-    # 2. On intercale les actions BU qui ne sont pas des clicks/inputs/scrolls
-    #    (elles ne sont pas dans le DOM listener). On les ajoute a la fin
-    #    dans l'ordre de l'historique BU pour rester deterministe. Une fusion
-    #    temporelle plus fine (par ts commun) est possible en V+1 quand
-    #    l'historique BU exposera aussi ses timestamps.
-    for h in bu_history or []:
-        for action_dict in (h.get("actions") or []):
-            action_name = next(iter(action_dict.keys())) if isinstance(action_dict, dict) else None
-            normalized = _normalize_bu_action_name(action_name or "") if action_name else None
-            # Les click/input/scroll sont deja captes par le DOM listener,
-            # on n'en ajoute pas de doublon depuis le BU history.
-            if normalized in ("click", "input", "scroll", None):
-                continue
-            new_step = _step_from_bu_action(action_dict, _next_index(), current_url)
-            if new_step is not None:
-                steps.append(new_step)
-                if new_step.url:
-                    current_url = new_step.url
-
-    # 3. Verify/cookie du scenario si non capturables (ils sont declaratifs)
+    # 4. Verify/cookie du scenario (declaratifs, non captes par DOM)
     for s in (scenario_steps or []):
         act = (s.get("action") or "").lower()
         if act in ("verify", "cookie"):
@@ -385,11 +683,25 @@ def build_pre_cleanup_steps(
                 included_in_replay=True,
             ))
 
-    # 4. Rapprochement network (best-effort par plage timestamp)
+    # 5. Tri final chronologique STABLE : timestamp croissant, les steps
+    #    sans timestamp gardent leur ordre d'insertion (verify/cookie
+    #    scenario tombent en fin, ce qui reflete leur nature declarative).
+    for i, s in enumerate(steps):
+        # Ordre d'insertion memorise dans un attribut prive stable via
+        # step-number initial ; on n'attache rien de nouveau au schema.
+        pass
+    steps_indexed = list(enumerate(steps))
+    steps_indexed.sort(key=lambda pair: (
+        pair[1].timestamp if pair[1].timestamp is not None else 10 ** 18,
+        pair[0],
+    ))
+    steps = [s for _, s in steps_indexed]
+
+    # 6. Rapprochement network
     if network_log:
         _link_network_to_steps(steps, network_log)
 
-    # 5. Renumbering final pour garder step-XXXX sequentiel apres fusion
+    # 7. Renumbering final
     for i, s in enumerate(steps, start=1):
         s.id = f"step-{i:04d}"
         s.step = i

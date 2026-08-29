@@ -39,7 +39,7 @@ BUILDER_ACTIONS = frozenset({
 BROWSER_USE_EXTRA_ACTIONS = frozenset({
     "go_back", "go_forward", "reload", "keyboard", "key_press",
     "upload", "file_upload", "open_tab", "switch_tab", "close_tab",
-    "extract", "screenshot_element", "wait_for_selector",
+    "extract", "extract_content", "screenshot_element", "wait_for_selector",
 })
 
 KNOWN_ACTIONS = BUILDER_ACTIONS | BROWSER_USE_EXTRA_ACTIONS

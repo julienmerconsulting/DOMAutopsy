@@ -298,6 +298,63 @@ def _emit_open_tab(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     ]
 
 
+def _emit_switch_tab(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
+    """Bascule sur l'onglet a l'index donne (deterministe par ordre de
+    creation, pas par tab_id opaque BU). Playwright expose context.pages()
+    dans l'ordre de creation - c'est notre reference stable."""
+    idx_str = (step.value or "0").strip()
+    try:
+        idx = int(idx_str)
+    except ValueError:
+        raise UnsupportedAction(step, f"switch_tab index invalide '{idx_str}'")
+    return [
+        f"    const _pages = page.context().pages();",
+        f'    if (_pages.length <= {idx}) throw new Error("switch_tab: pas d\'onglet a l\'index {idx} (pages ouvertes: " + _pages.length + ")");',
+        f"    page = _pages[{idx}];",
+        f"    await page.bringToFront();",
+    ]
+
+
+def _emit_close_tab(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
+    """Ferme l'onglet par index (ordre de creation) OU l'onglet courant
+    si aucun index fourni. Apres close, on repointe sur pages()[0]."""
+    if step.value is None or step.value == "":
+        return [
+            "    await page.close();",
+            "    const _pages = page.context().pages();",
+            '    if (_pages.length === 0) throw new Error("close_tab: aucun onglet restant apres fermeture");',
+            "    page = _pages[0];",
+            "    await page.bringToFront();",
+        ]
+    try:
+        idx = int(step.value)
+    except ValueError:
+        raise UnsupportedAction(step, f"close_tab index invalide '{step.value}'")
+    return [
+        f"    const _pages = page.context().pages();",
+        f'    if (_pages.length <= {idx}) throw new Error("close_tab: pas d\'onglet a l\'index {idx}");',
+        f"    await _pages[{idx}].close();",
+        f"    const _remaining = page.context().pages();",
+        f'    if (_remaining.length === 0) throw new Error("close_tab: aucun onglet restant");',
+        f"    page = _remaining[0];",
+        f"    await page.bringToFront();",
+    ]
+
+
+def _emit_extract(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
+    """extract est une lecture LLM (extraire un texte/donnee pour raisonner),
+    aucune interaction reproductible. Normalement, extract steps sont
+    marques included_in_replay=False au build_pre_cleanup_steps donc jamais
+    presentes ici. Cet emitter est un GARDE-FOU : si quelqu'un force
+    included_in_replay=True sur un extract, on genere une exception TS
+    explicite plutot qu'un no-op silencieux qui ferait passer le test."""
+    goal = (step.description or "extract LLM").replace('"', '\\"')
+    return [
+        f'    throw new Error("Action extract non rejouable : {goal}. '
+        f'Marquer included_in_replay=false dans le JSON pour la skipper propre.");',
+    ]
+
+
 # ============================================================
 # Dispatch + generation complete
 # ============================================================
@@ -330,6 +387,9 @@ EMITTERS = {
     "go_forward": _emit_go_forward,
     "reload": _emit_reload,
     "open_tab": _emit_open_tab,
+    "switch_tab": _emit_switch_tab,
+    "close_tab": _emit_close_tab,
+    "extract": _emit_extract,   # garde-fou : leve si included_in_replay=True
     # input et screenshot ont une signature enrichie (index)
 }
 
