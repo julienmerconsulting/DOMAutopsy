@@ -1,0 +1,10 @@
+# DOMAutopsy - dependances de developpement (tests uniquement).
+#
+# Volontairement NON couple a requirements.txt via `-r requirements.txt`
+# pour ne JAMAIS risquer de retirer/upgrade browser-use en installant
+# les deps de test. On installe uniquement ce dont pytest a besoin :
+#
+#   pip install -r requirements-dev.txt
+#
+pytest>=8.0.0
+httpx>=0.27.0

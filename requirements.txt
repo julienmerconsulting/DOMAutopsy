@@ -1,16 +1,25 @@
 # DOMAutopsy - Python 3.12+ requis
 # pip install -r requirements.txt
+#
+# IMPORTANT : versions FIGEES aux valeurs qui tournent en prod chez
+# Julien. Ne PAS mettre `>=` : browser-use en particulier casse
+# regulierement son API entre versions (voir extract_browser_use_history
+# dans clean_steps_builder.py pour les fallbacks defensifs sur
+# l'attribut history/state.history/result.history).
+#
+# Pour verifier la version en place avant tout upgrade :
+#   py -3.12 -m pip show browser-use
 
 # Core
-browser-use>=0.3.0
-playwright>=1.49.0
-openai>=1.50.0
-PySide6>=6.8.0
-python-dotenv>=1.0.0
+browser-use==0.12.9
+playwright==1.57.0
+openai==2.41.0
+PySide6==6.10.1
+python-dotenv==1.2.2
 
 # Web UI (server.py)
-fastapi>=0.115.0
-uvicorn[standard]>=0.32.0
-aiohttp>=3.10.0
-pydantic>=2.0.0
-python-multipart>=0.0.18
+fastapi==0.136.1
+uvicorn[standard]==0.40.0
+aiohttp==3.13.4
+pydantic==2.12.5
+python-multipart==0.0.21
