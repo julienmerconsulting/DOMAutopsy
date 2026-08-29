@@ -1320,7 +1320,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         except Exception as e:
             print(f"  [WARN] Ecriture browser_use_history.json echouee : {e}")
 
-        # -- ETAPE 8 : Construction du clean_steps.json enrichi (schema v1.0) --
+        # -- ETAPE 8 : Construction du clean_steps.json enrichi (schema v2.0) --
         # Nouveau pipeline unifie : fusion multi-sources (scenario + BU history +
         # DOM listener + network) -> classification LLM (included_in_replay +
         # anomalies, PAS de construction de selecteurs) -> validation Pydantic.

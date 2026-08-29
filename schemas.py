@@ -14,7 +14,9 @@ included_in_replay, pas de schema_version).
 Le champ schema_version en tete du JSON permet aux consommateurs de
 detecter le format et d'appliquer une migration transparente si besoin.
 
-Version actuelle : "1.0" (Aout 2026 - refactor unification Playwright TS).
+Version actuelle : "2.0" (Aout 2026 - refactor unification Playwright TS).
+L'ancien format non-versionne (pre-refactor) est traite comme "1.x
+implicite" par migrate_legacy_json() qui le fait passer a 2.0.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ from typing import Any, Optional, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
-CURRENT_SCHEMA_VERSION = "1.0"
+CURRENT_SCHEMA_VERSION = "2.0"
 
 # Actions livrees natives par le Scenario Builder (10 actions historiques)
 BUILDER_ACTIONS = frozenset({

@@ -12,7 +12,7 @@ def test_report_renders_all_action_types_and_skipped_marker(tmp_path):
     go_back, reload, open_tab, unknown) ET afficher les steps filtres
     (INCLUS / FILTRE + raison)."""
     clean_data = {
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "parcours": "Test toutes actions",
         "scenario_url": "https://example.com",
         "total_steps": 12,

@@ -788,7 +788,7 @@ Depuis le refactor :
 
 | Fichier | Rôle |
 |---|---|
-| `schemas.py` | Modèles Pydantic v2 versionnés (`schema_version="1.0"`), 25+ champs par step, migration transparente des anciens JSON |
+| `schemas.py` | Modèles Pydantic v2 versionnés (`schema_version="2.0"`), 25+ champs par step, migration transparente des anciens JSON |
 | `clean_steps_builder.py` | Pipeline unifié : `extract_browser_use_history` (3 fallbacks défensifs) → fusion multi-sources (scenario + BU history + DOM listener + network) → détection sensitive → **classification LLM** (le LLM annote `included_in_replay`, il ne construit plus les steps) |
 | `playwright_generator.py` | Traduction **déterministe** JSON→TS (15 actions, encapsulation `test.step("[step-XXXX] ...")` pour rapprochement rapport, sensitive→`process.env`, action inconnue→`throw`) |
 | `replay_reporter.py` | Rapport HTML self-contained pour les runs replay (rapproche `[step-XXXX]` du JSON reporter Playwright avec les données du `clean_steps.json` source) |

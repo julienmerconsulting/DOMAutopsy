@@ -1,7 +1,7 @@
 """
 DOMAutopsy - Generateur canonique test_playwright.spec.ts
 ==========================================================
-Traduit un clean_steps.json valide (schema v1.0) en un test Playwright TS
+Traduit un clean_steps.json valide (schema v2.0) en un test Playwright TS
 lancable via `npx playwright test`.
 
 Principes :
@@ -335,7 +335,7 @@ def generate_playwright_ts(
     """Genere test_playwright.spec.ts a partir d'un CleanSteps valide.
 
     Args:
-        clean_steps: parcours valide (schema v1.0)
+        clean_steps: parcours valide (schema v2.0)
         output_path: chemin absolu du fichier .spec.ts a ecrire
         parcours_url: URL de depart si absente des steps (fallback goto initial)
 

@@ -51,7 +51,7 @@ def _make_run_dir(root, run_id, with_ts=True):
     d = root / f"{ts}_{run_id}"
     d.mkdir()
     (d / "clean_steps.json").write_text(json.dumps({
-        "schema_version": "1.0",
+        "schema_version": "2.0",
         "parcours": "test", "steps": [{"action": "click", "selector": "#x"}],
     }), encoding="utf-8")
     if with_ts:

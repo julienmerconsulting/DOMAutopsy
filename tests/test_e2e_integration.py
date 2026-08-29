@@ -91,7 +91,7 @@ def test_full_pipeline_multi_action_scenario(tmp_path):
     with _serve_fixture(port) as page_url:
         # 1. Construire un CleanSteps avec 5+ types d'actions
         cs = CleanSteps(
-            schema_version="1.0",
+            schema_version="2.0",
             parcours="e2e test multi-action",
             scenario_url=page_url,
             total_steps=5,

@@ -40,7 +40,7 @@ def test_unknown_action_is_preserved_with_raw_payload():
 
 
 def test_migrate_legacy_json_no_version_stamps_current():
-    """#11 : un ancien clean_steps.json sans schema_version obtient v1.0."""
+    """#11 : un ancien clean_steps.json sans schema_version obtient v2.0."""
     legacy = {
         "parcours": "old parcours",
         "steps": [{"action": "click", "selector": "#btn"}],

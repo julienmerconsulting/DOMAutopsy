@@ -144,7 +144,7 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
     }
 
     # --- Generation HTML ---
-    # Le schema v1.0 (post-refactor Aout 2026) stocke selector comme dict
+    # Le schema v2.0 (post-refactor Aout 2026) stocke selector comme dict
     # {value, strategy, unique, matchCount, ...}. Les anciens JSON avaient
     # selector comme string simple. On gere les deux via _extract_selector().
     def _extract_selector(s):

@@ -264,7 +264,7 @@ code {{ background:#0d1117; padding:2px 6px; border-radius:4px; color:#58a6ff; f
     <tbody>{step_rows}</tbody>
   </table>
   <div style="margin-top:24px;color:#8b949e;font-size:12px;text-align:center">
-    Rapport genere par DOMAutopsy replay_reporter &middot; format schema v1.0
+    Rapport genere par DOMAutopsy replay_reporter &middot; format schema v2.0
   </div>
 </div>
 </body></html>"""

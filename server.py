@@ -465,7 +465,7 @@ async def replay_run(run_id: str, headless: bool = True):
       remplacerait tout et le JSON ne serait pas produit). Le fichier JSON
       atterrit dans <replay_dir>/replay_results.json via l'env var
       DOMAUTOPSY_REPLAY_JSON. C'est le format canonique produit
-      systematiquement par qa_explorer (schema v1.0). Ce chemin est le
+      systematiquement par qa_explorer (schema v2.0). Ce chemin est le
       moteur normal a partir du refactor Aout 2026.
 
     - LEGACY FALLBACK : qa_player.py (Playwright pur Python, click+input

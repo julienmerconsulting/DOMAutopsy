@@ -1,5 +1,5 @@
 """
-DOMAutopsy - Construction du clean_steps.json enrichi (schema v1.0)
+DOMAutopsy - Construction du clean_steps.json enrichi (schema v2.0)
 ====================================================================
 Remplace l'ancien ai_cleanup() qui produisait un JSON limite (click/input).
 
