@@ -94,9 +94,38 @@ def _top_level_verdict(playwright_report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def generate_replay_report(replay_dir: Path) -> Path | None:
+def _load_source_steps(source_run_dir: Path | None) -> dict[str, dict[str, Any]]:
+    """Charge le clean_steps.json du run source et retourne un mapping
+    {step_id: step_dict} pour enrichir le rapport par lookup. Retourne un
+    dict vide si le fichier est absent (le rapport HTML reste utilisable
+    avec les seules infos Playwright)."""
+    if source_run_dir is None:
+        return {}
+    p = Path(source_run_dir) / "clean_steps.json"
+    if not p.exists():
+        return {}
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for s in (data.get("steps") or []):
+        sid = s.get("id")
+        if sid:
+            out[sid] = s
+    return out
+
+
+def generate_replay_report(replay_dir: Path, source_run_dir: Path | None = None) -> Path | None:
     """Ecrit replay_report.html dans replay_dir. Retourne le chemin, ou None
-    si aucune source n'a pu etre chargee."""
+    si aucune source n'a pu etre chargee.
+
+    Args:
+        replay_dir: dossier du run replay
+        source_run_dir: dossier du run source (si dispo, permet d'enrichir
+            chaque ligne avec le selector, expected/actual, action, network
+            et included_in_replay du step JSON canonique)
+    """
     replay_dir = Path(replay_dir)
     results_path = replay_dir / "replay_results.json"
     meta_path = replay_dir / "meta.json"
@@ -112,6 +141,9 @@ def generate_replay_report(replay_dir: Path) -> Path | None:
     source_run_id = meta.get("source_run_id", "?")
     legacy_fallback = bool(meta.get("legacy_fallback"))
     fallback_reason = meta.get("legacy_fallback_reason")
+
+    # Enrichissement optionnel via le clean_steps.json du run source
+    source_steps = _load_source_steps(source_run_dir)
 
     step_results: list[dict[str, Any]] = []
     verdict: dict[str, Any] = {"passed": 0, "failed": 0, "skipped": 0, "total": 0, "verdict": "unknown"}
@@ -138,10 +170,40 @@ def generate_replay_report(replay_dir: Path) -> Path | None:
         badge_color = "#3fb950" if r["status"] == "passed" else "#f85149"
         dur = f"{r['duration_ms']} ms" if r["duration_ms"] is not None else "&mdash;"
         err = f'<div style="color:#f85149;font-family:monospace;font-size:11px;margin-top:6px">{_esc(r["error"])[:400]}</div>' if r.get("error") else ""
+
+        # Enrichissement source : action, selector, expected/actual, page
+        source = source_steps.get(r["step_id"] or "") or {}
+        src_action = (source.get("action") or "").upper() if source else ""
+        src_sel = ""
+        if source:
+            sel_val = source.get("selector")
+            if isinstance(sel_val, dict):
+                sel_val = sel_val.get("value") or sel_val.get("playwrightSelector")
+            if sel_val:
+                src_sel = f'<code style="font-size:11px">{_esc(str(sel_val)[:80])}</code>'
+        src_desc = _esc(source.get("description") or "")[:120] if source else ""
+        # Expected/actual pour les verify
+        src_expected = source.get("expected") if source else None
+        src_actual = source.get("actual") if source else None
+        expected_row = ""
+        if src_expected is not None or src_actual is not None:
+            expected_row = f'<div style="margin-top:6px;font-size:11px;color:#94a3b8">Attendu : <code>{_esc(src_expected)}</code> &middot; Recu : <code>{_esc(src_actual)}</code></div>'
+        # Reseau associe
+        net = source.get("network") if source else None
+        net_line = ""
+        if net:
+            fails = sum(1 for n in net if isinstance(n, dict) and (n.get("status") or 0) >= 400)
+            net_line = f'<div style="margin-top:4px;font-size:11px;color:#94a3b8">Reseau : {len(net)} req' + (f", <span style=\"color:#f85149\">{fails} echec HTTP</span>" if fails else "") + "</div>"
+
         step_rows += f"""
         <tr>
           <td><code>{_esc(r["step_id"] or "&mdash;")}</code></td>
-          <td>{_esc(r["title"])[:120]}</td>
+          <td>
+            <div>{('<strong style=\"color:#7dd3fc\">' + src_action + '</strong> - ') if src_action else ''}{src_desc or _esc(r["title"])[:120]}</div>
+            {('<div style=\"margin-top:4px\">' + src_sel + '</div>') if src_sel else ''}
+            {expected_row}
+            {net_line}
+          </td>
           <td><span style="background:{badge_color};color:#0e1116;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700">{r["status"].upper()}</span></td>
           <td>{dur}</td>
           <td>{err}</td>

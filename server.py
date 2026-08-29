@@ -882,15 +882,34 @@ async def _pump_stdout(run_id: str, proc: subprocess.Popen, queue: asyncio.Queue
 
 def _postprocess_replay(run_id: str, replay_dir: Path) -> None:
     """Genere replay_report.html + enrichit meta.json d'un run replay termine.
-    Appele en thread executor pour ne pas bloquer l'event loop."""
+    Appele en thread executor pour ne pas bloquer l'event loop.
+
+    Le run source est resolu depuis RUNS[run_id]["source_run_id"] pour que
+    le rapport puisse enrichir chaque step_id avec les infos du JSON
+    canonique (action, selector, expected/actual, network). Sans ca, on
+    n'aurait que les statuts Playwright bruts sans le contexte metier.
+
+    Principe : la generation du rapport est SECONDAIRE. Si elle echoue,
+    on log un warning mais on ne transforme jamais un test Playwright
+    reussi en echec.
+    """
     try:
         from replay_reporter import generate_replay_report, update_replay_meta_with_verdict
-        report_path = generate_replay_report(replay_dir)
+        source_dir = None
+        r = RUNS.get(run_id) or {}
+        source_run_id = r.get("source_run_id")
+        if source_run_id:
+            source_dir = _find_run_dir(source_run_id)
+        report_path = generate_replay_report(replay_dir, source_run_dir=source_dir)
         if report_path and run_id in RUNS:
-            RUNS[run_id]["report_path"] = str(report_path.relative_to(ROOT)) if report_path.is_absolute() else str(report_path)
+            try:
+                RUNS[run_id]["report_path"] = str(report_path.relative_to(ROOT))
+            except ValueError:
+                RUNS[run_id]["report_path"] = str(report_path)
         update_replay_meta_with_verdict(replay_dir)
     except Exception as e:
-        print(f"[server] _postprocess_replay({run_id}) : {e}")
+        # Warning uniquement - n'affecte pas le verdict du test Playwright
+        print(f"[server] _postprocess_replay({run_id}) WARNING : {e}")
 
 
 @app.websocket("/ws/logs/{run_id}")
