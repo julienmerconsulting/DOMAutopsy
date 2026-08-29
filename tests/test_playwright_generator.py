@@ -28,12 +28,38 @@ def test_navigate_emits_page_goto(out_dir):
     assert 'await page.goto("https://example.com/login");' in body
 
 
-def test_click_emits_locator_click(out_dir):
-    """#7 : click -> locator(sel).first().click()."""
+def test_click_emits_locator_click_without_first(out_dir):
+    """#7 : click -> locator(sel).click() (SANS .first() : le strict mode
+    Playwright doit crasher si le selecteur est ambigu, pas cliquer
+    silencieusement sur le premier match)."""
     cs = _wrap([Step(id="step-0001", step=1, action="click",
                      selector=Selector(value="#login", strategy="id", unique=True))])
     body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
-    assert 'page.locator("#login").first().click()' in body
+    assert 'page.locator("#login").click()' in body
+    assert '.first().click()' not in body
+
+
+def test_shadow_dom_chain_splits_into_nested_locators(out_dir):
+    """Shadow DOM : les chaines 'host >>> inner' sont splittees en
+    .locator().locator() (syntaxe Playwright officielle, les shadow
+    roots ouverts sont traverses automatiquement) plutot que passees
+    littarelement a page.locator() qui ne comprendrait pas '>>>'."""
+    cs = _wrap([Step(id="step-0001", step=1, action="click",
+                     selector=Selector(value="my-widget >>> [aria-label='Submit']",
+                                       strategy="shadow", inShadowDOM=True))])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    # Doit chainer .locator() et NE PAS contenir la string ">>>"
+    assert 'page.locator("my-widget").locator("[aria-label=\'Submit\']")' in body
+    assert ">>>" not in body
+
+
+def test_deep_shadow_dom_chain(out_dir):
+    """Shadow DOM 3 niveaux : host1 >>> host2 >>> inner"""
+    cs = _wrap([Step(id="step-0001", step=1, action="click",
+                     selector=Selector(value="app-root >>> nav-bar >>> #logout",
+                                       strategy="shadow", inShadowDOM=True))])
+    body = Path(generate_playwright_ts(cs, out_dir / "t.spec.ts")["path"]).read_text()
+    assert 'page.locator("app-root").locator("nav-bar").locator("#logout")' in body
 
 
 def test_input_non_sensitive_uses_fill_with_value_literal(out_dir):
@@ -69,8 +95,13 @@ def test_verify_variants_emit_expect(out_dir):
              selector=Selector(value=".error", strategy="css")),
     ]
     body = Path(generate_playwright_ts(_wrap(steps), out_dir / "t.spec.ts")["path"]).read_text()
-    assert 'expect(page.getByText("Bienvenue")).toBeVisible()' in body
-    assert 'expect(page.locator(".welcome").first()).toBeVisible()' in body
+    # getByText garde .first() car un mot peut apparaitre N fois sur la
+    # page et on veut verifier qu'au moins une occurrence est visible -
+    # sans .first() Playwright leverait "strict mode violation" sur du
+    # texte legitiment repete (ex. header + footer). Distinction avec
+    # locator(css) ou l'ambiguite reflete un vrai probleme QA.
+    assert 'expect(page.getByText("Bienvenue").first()).toBeVisible()' in body
+    assert 'expect(page.locator(".welcome")).toBeVisible()' in body
     assert 'expect(page.locator(".error")).toHaveCount(0)' in body
 
 

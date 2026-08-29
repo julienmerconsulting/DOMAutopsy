@@ -146,7 +146,12 @@ def _extract(archive: Path, dest: Path) -> None:
         import tarfile
         mode = "r:xz" if name.endswith(".xz") else "r:gz"
         with tarfile.open(archive, mode) as tf:
-            tf.extractall(dest)
+            # filter='data' : protection path-traversal introduite en
+            # Python 3.12 (PEP 706), obligatoire des Python 3.14. Refuse
+            # les entrees absolues, les .., les symlinks vers l'exterieur
+            # de dest - critique pour un installeur qui telecharge du
+            # code binaire depuis Internet.
+            tf.extractall(dest, filter="data")
     else:
         raise RuntimeError(f"Format d'archive non supporte : {archive.name}")
 
@@ -174,6 +179,12 @@ def install_node(force: bool = False) -> Path:
     with tempfile.TemporaryDirectory(prefix="domautopsy-node-") as tmpdir:
         archive = Path(tmpdir) / f"node-v{version}.{ext}"
         _download(url, archive, "  [Node]  ")
+        # TODO(supply-chain): avant packaging commercial, telecharger
+        # aussi https://nodejs.org/dist/v{version}/SHASUMS256.txt.sig +
+        # verifier la signature GPG (cle Node officielle), puis matcher
+        # sha256(archive) contre l'entree pour ce fichier. Sans ca, un
+        # MITM ou une compromission du CDN nodejs.org peut injecter un
+        # binaire modifie. Point #4 de la review de securite.
 
         extract_dir = Path(tmpdir) / "extracted"
         _extract(archive, extract_dir)

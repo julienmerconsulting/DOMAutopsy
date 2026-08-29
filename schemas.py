@@ -210,7 +210,17 @@ def migrate_legacy_json(data: dict[str, Any]) -> dict[str, Any]:
     Retourne un dict pret a etre passe a CleanSteps.model_validate().
     """
     out = dict(data)
-    out.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
+    # Deux chemins de migration :
+    # - pas de schema_version : ancien JSON pre-refactor (aucune version
+    #   n'existait), stampe directement le CURRENT
+    # - schema_version == "1.0" : JSON produit entre le commit initial du
+    #   refactor et le bump 2.0 (fenetre courte, faible probabilite mais
+    #   theoriquement possible). Migre en "2.0" sans autre transformation
+    #   car le format est identique - c'est un renumerotage cosmetique.
+    if out.get("schema_version") == "1.0":
+        out["schema_version"] = CURRENT_SCHEMA_VERSION
+    else:
+        out.setdefault("schema_version", CURRENT_SCHEMA_VERSION)
 
     # Migration des steps
     steps = out.get("steps", []) or []

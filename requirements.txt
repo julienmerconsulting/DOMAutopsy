@@ -1,25 +1,36 @@
 # DOMAutopsy - Python 3.12+ requis
 # pip install -r requirements.txt
 #
-# IMPORTANT : versions FIGEES aux valeurs qui tournent en prod chez
-# Julien. Ne PAS mettre `>=` : browser-use en particulier casse
-# regulierement son API entre versions (voir extract_browser_use_history
-# dans clean_steps_builder.py pour les fallbacks defensifs sur
-# l'attribut history/state.history/result.history).
+# IMPORTANT : ces versions sont alignees STRICT sur les Requires-Dist du
+# pyproject officiel de browser-use==0.12.9. Un `pip install -r
+# requirements.txt` doit resoudre proprement sur un fresh clone, sans
+# warning `pip check`.
 #
-# Pour verifier la version en place avant tout upgrade :
-#   py -3.12 -m pip show browser-use
+# Version pinning :
+#   - browser-use==0.12.9 impose openai==2.16.0 (pas 2.4x), click==8.3.1
+#     (pas 8.4.x), groq==1.0.0, httpx==0.28.1, pydantic==2.12.5,
+#     python-dotenv==1.2.2, aiohttp==3.13.4. On matche EXACTEMENT ces
+#     valeurs pour eviter `ResolutionImpossible` a l'install fresh.
+#   - Ton env local peut avoir des versions plus recentes (grew organic-
+#     ally over time). Pour aligner : `pip install -r requirements.txt
+#     --force-reinstall` DANS UN VENV DEDIE - ne pas taper la commande
+#     dans l'env de dev existant sans backup.
+#   - Ne PAS `pip install --upgrade`. Les fallbacks defensifs de
+#     extract_browser_use_history sont testes contre browser-use==0.12.9
+#     precisement.
 
-# Core
+# Core - browser-use tire toutes ses transitives via ses Requires-Dist
+# strictes (34 packages). On epingle explicitement ce qui est important
+# pour DOMAutopsy et qu'on utilise directement.
 browser-use==0.12.9
 playwright==1.57.0
-openai==2.41.0
-PySide6==6.10.1
+openai==2.16.0
 python-dotenv==1.2.2
+pydantic==2.12.5
+aiohttp==3.13.4
+PySide6==6.10.1
 
 # Web UI (server.py)
 fastapi==0.136.1
 uvicorn[standard]==0.40.0
-aiohttp==3.13.4
-pydantic==2.12.5
 python-multipart==0.0.21

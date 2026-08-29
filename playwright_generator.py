@@ -95,10 +95,27 @@ def _selector_value_and_type(step: Step) -> tuple[str | None, str | None]:
 
 def _locator_expr(step: Step) -> str:
     """Construit l'expression Playwright page.locator(...) pour un step.
-    Retourne '' si aucun selecteur exploitable (le caller doit gerer)."""
+    Retourne '' si aucun selecteur exploitable (le caller doit gerer).
+
+    Shadow DOM : le DOM listener produit des chaines "host >>> inner" pour
+    les elements dans un shadow root. Playwright locators traversent
+    automatiquement les shadow roots OUVERTS quand on chaine .locator(),
+    donc on split sur " >>> " et on chaine :
+        page.locator("host").locator("inner")
+    C'est la syntaxe supportee officiellement (doc Playwright "Locate in
+    Shadow DOM"), pas de plugin, pas de piercing syntax exotique.
+    """
     value, sel_type = _selector_value_and_type(step)
     if not value:
         return ""
+    # Shadow DOM chain : splitter et chainer .locator() proprement
+    if " >>> " in value and sel_type != "xpath" and not value.startswith("//"):
+        parts = [p.strip() for p in value.split(" >>> ") if p.strip()]
+        if len(parts) > 1:
+            head = f"page.locator({_ts_string(parts[0])})"
+            for p in parts[1:]:
+                head += f".locator({_ts_string(p)})"
+            return head
     if sel_type == "xpath" or value.startswith("//"):
         arg = value if value.startswith("xpath=") else f"xpath={value}"
         return f"page.locator({_ts_string(arg)})"
@@ -106,7 +123,6 @@ def _locator_expr(step: Step) -> str:
         return f"page.getByText({_ts_string(value)})"
     if sel_type == "role":
         return f"page.getByRole({_ts_string(value)})"
-    # css par defaut (couvre aussi les chaines shadow "host >>> inner")
     return f"page.locator({_ts_string(value)})"
 
 
@@ -125,7 +141,11 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     if not loc:
         raise UnsupportedAction(step, "click sans selecteur")
-    return [f"    await {loc}.first().click();"]
+    # PAS de .first() : Playwright en mode strict crashe sur selecteur
+    # ambigu, ce qui est le comportement voulu (faire echouer plutot que
+    # cliquer silencieusement sur le mauvais element). Le .first() ne
+    # serait justifie que pour un fallback intentionnel comme cookie().
+    return [f"    await {loc}.click();"]
 
 
 def _emit_input(step: Step, sensitive_vars: dict[str, str], index: int) -> list[str]:
@@ -140,10 +160,10 @@ def _emit_input(step: Step, sensitive_vars: dict[str, str], index: int) -> list[
         return [
             f'    const _val_{index} = process.env.{env_name};',
             f'    if (_val_{index} === undefined) throw new Error("Env var {env_name} manquante (valeur sensible du step {index})");',
-            f"    await {loc}.first().fill(_val_{index});",
+            f"    await {loc}.fill(_val_{index});",
         ]
     val = step.value if step.value is not None else ""
-    return [f"    await {loc}.first().fill({_ts_string(val)});"]
+    return [f"    await {loc}.fill({_ts_string(val)});"]
 
 
 def _emit_select(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
@@ -151,7 +171,7 @@ def _emit_select(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     if not loc:
         raise UnsupportedAction(step, "select sans selecteur")
     val = step.value or ""
-    return [f"    await {loc}.first().selectOption({_ts_string(val)});"]
+    return [f"    await {loc}.selectOption({_ts_string(val)});"]
 
 
 def _emit_verify(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
@@ -159,21 +179,21 @@ def _emit_verify(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     expected = step.expected or step.target or step.value or ""
     loc = _locator_expr(step)
     if vtype in ("texte_contient", "text_contains"):
-        return [f"    await expect(page.getByText({_ts_string(expected)})).toBeVisible();"]
+        return [f"    await expect(page.getByText({_ts_string(expected)}).first()).toBeVisible();"]
     if vtype in ("texte_exact", "text_exact"):
-        return [f'    await expect(page.getByText({_ts_string(expected)}, {{ exact: true }})).toBeVisible();']
+        return [f'    await expect(page.getByText({_ts_string(expected)}, {{ exact: true }}).first()).toBeVisible();']
     if vtype in ("visible",):
         if not loc:
             raise UnsupportedAction(step, "verify visible sans selecteur")
-        return [f"    await expect({loc}.first()).toBeVisible();"]
+        return [f"    await expect({loc}).toBeVisible();"]
     if vtype in ("absent",):
         if loc:
             return [f"    await expect({loc}).toHaveCount(0);"]
         return [f"    await expect(page.getByText({_ts_string(expected)})).toHaveCount(0);"]
     # presence par defaut
     if loc:
-        return [f"    await expect({loc}.first()).toBeAttached();"]
-    return [f"    await expect(page.getByText({_ts_string(expected)})).toBeVisible();"]
+        return [f"    await expect({loc}).toBeAttached();"]
+    return [f"    await expect(page.getByText({_ts_string(expected)}).first()).toBeVisible();"]
 
 
 def _emit_scroll(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
@@ -181,7 +201,7 @@ def _emit_scroll(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     direction = (step.direction or "").lower()
     if direction == "vers_element" and loc:
-        return [f"    await {loc}.first().scrollIntoViewIfNeeded();"]
+        return [f"    await {loc}.scrollIntoViewIfNeeded();"]
     # Scroll par delta (roue souris)
     delta = step.deltaY
     if delta is None:
@@ -195,7 +215,7 @@ def _emit_hover(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     if not loc:
         raise UnsupportedAction(step, "hover sans selecteur")
-    return [f"    await {loc}.first().hover();"]
+    return [f"    await {loc}.hover();"]
 
 
 def _emit_wait(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
@@ -203,7 +223,7 @@ def _emit_wait(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     if loc:
         state = step.wait_state or "visible"
-        return [f'    await {loc}.first().waitFor({{ state: {_ts_string(state)} }});']
+        return [f'    await {loc}.waitFor({{ state: {_ts_string(state)} }});']
     seconds = step.seconds if step.seconds is not None else 2.0
     ms = int(seconds * 1000)
     return [f"    await page.waitForTimeout({ms});"]
@@ -249,7 +269,7 @@ def _emit_upload(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     path = step.value or step.target
     if not path:
         raise UnsupportedAction(step, "upload sans chemin de fichier")
-    return [f"    await {loc}.first().setInputFiles({_ts_string(path)});"]
+    return [f"    await {loc}.setInputFiles({_ts_string(path)});"]
 
 
 def _emit_go_back(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
