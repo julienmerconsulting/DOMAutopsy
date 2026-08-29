@@ -144,6 +144,122 @@ def test_extract_defensive_on_broken_entry():
     assert out[1]["actions"] == [{"click": {}}]
 
 
+# ============================================================
+# R2 : Alignment action[i] <-> interacted_element[i]
+# ============================================================
+
+def test_step_with_multi_actions_and_aligned_element_list():
+    """R2 CRITIQUE : un step avec N actions + une LISTE de N elements
+    doit produire N normalized_actions avec chaque element correctement
+    apparie a son action (pas le premier partout)."""
+    # Simule un step avec 3 actions ou l'element de l'action 1 est None
+    entry = _make_history_entry(
+        actions=[
+            {"click_element": {"index": 0}},
+            {"input_text": {"text": "hello"}},
+            {"click_element": {"index": 2}},
+        ],
+        interacted=None,  # on construit la liste manuellement
+    )
+    # BU 0.13 : state.interacted_element est une LISTE alignee
+    entry.state.interacted_element = [
+        SimpleNamespace(xpath="//button[1]", css_selector="button.first"),
+        None,  # input_text sans element (rare mais possible)
+        SimpleNamespace(xpath="//button[3]", css_selector="button.third"),
+    ]
+    result = SimpleNamespace(history=[entry])
+    out = extract_browser_use_history(agent=None, result=result)
+    assert len(out) == 1
+
+    na = out[0]["normalized_actions"]
+    assert len(na) == 3
+
+    # Action 0 -> element 0 (button.first)
+    assert na[0]["action_index"] == 0
+    assert na[0]["interacted_element"]["css_selector"] == "button.first"
+
+    # Action 1 -> None (input_text sans element)
+    assert na[1]["action_index"] == 1
+    assert na[1]["interacted_element"] is None
+
+    # Action 2 -> element 2 (button.third)
+    assert na[2]["action_index"] == 2
+    assert na[2]["interacted_element"]["css_selector"] == "button.third"
+
+
+def test_single_element_applies_to_first_action_only_not_all():
+    """Regression fix : un element unique pour N actions ne doit PAS
+    etre colle a toutes les actions (bug ancien code)."""
+    entry = _make_history_entry(
+        actions=[{"click_element": {}}, {"input_text": {"text": "x"}}],
+        interacted={"css_selector": "#the-only-elem", "xpath": "//button"},
+    )
+    result = SimpleNamespace(history=[entry])
+    out = extract_browser_use_history(agent=None, result=result)
+    na = out[0]["normalized_actions"]
+    assert len(na) == 2
+    # Action 0 recoit l'element unique
+    assert na[0]["interacted_element"]["css_selector"] == "#the-only-elem"
+    # Action 1 recoit None (pas le meme element clone !)
+    assert na[1]["interacted_element"] is None
+
+
+def test_no_interacted_element_all_actions_get_none():
+    """Aucun element dispo -> chaque action a interacted_element=None."""
+    entry = _make_history_entry(
+        actions=[{"go_to_url": {"url": "https://x"}}, {"wait": {"seconds": 1}}],
+        interacted=None,
+    )
+    result = SimpleNamespace(history=[entry])
+    out = extract_browser_use_history(agent=None, result=result)
+    na = out[0]["normalized_actions"]
+    assert len(na) == 2
+    assert all(x["interacted_element"] is None for x in na)
+
+
+def test_element_list_longer_than_actions_truncated():
+    """Liste elements plus longue que actions -> tronque au nb d'actions."""
+    entry = _make_history_entry(actions=[{"click_element": {}}])
+    entry.state.interacted_element = [
+        SimpleNamespace(css_selector="#a"),
+        SimpleNamespace(css_selector="#b"),  # sera ignore
+    ]
+    result = SimpleNamespace(history=[entry])
+    out = extract_browser_use_history(agent=None, result=result)
+    assert len(out[0]["normalized_actions"]) == 1
+    assert out[0]["normalized_actions"][0]["interacted_element"]["css_selector"] == "#a"
+
+
+def test_element_list_shorter_than_actions_padded_with_none():
+    """Liste elements plus courte que actions -> complete avec None."""
+    entry = _make_history_entry(
+        actions=[{"click_element": {}}, {"click_element": {}}, {"click_element": {}}],
+    )
+    entry.state.interacted_element = [SimpleNamespace(css_selector="#a")]  # 1 elem pour 3 actions
+    result = SimpleNamespace(history=[entry])
+    out = extract_browser_use_history(agent=None, result=result)
+    na = out[0]["normalized_actions"]
+    assert len(na) == 3
+    assert na[0]["interacted_element"]["css_selector"] == "#a"
+    assert na[1]["interacted_element"] is None
+    assert na[2]["interacted_element"] is None
+
+
+def test_normalized_actions_carry_step_timing_metadata():
+    """Chaque normalized action porte step_number/step_start/step_end
+    pour permettre la fusion chronologique fine downstream."""
+    entry = _make_history_entry(
+        actions=[{"click_element": {}}, {"input_text": {"text": "x"}}],
+        ts_start=1700000000.0, ts_end=1700000001.0, step_number=5,
+    )
+    result = SimpleNamespace(history=[entry])
+    na = extract_browser_use_history(agent=None, result=result)[0]["normalized_actions"]
+    for entry in na:
+        assert entry["step_number"] == 5
+        assert entry["step_start_time"] == 1700000000000
+        assert entry["step_end_time"] == 1700000001000
+
+
 # _to_ms normalisation
 class TestToMs:
     def test_none(self):

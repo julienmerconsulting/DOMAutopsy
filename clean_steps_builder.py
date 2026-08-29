@@ -47,40 +47,61 @@ from schemas import (
 # ============================================================
 
 def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]:
-    """Recupere l'historique complet des actions browser-use 0.12.9.
+    """Recupere l'historique complet des actions browser-use 0.13.8.
 
-    Ordre de resolution des API (3 chemins + 1 fallback methode) :
-      1. result.history                    (AgentHistoryList retourne par agent.run)
-      2. agent.history.history             (property AgentHistoryList sur l'agent)
-      3. agent.state.history.history       (versions plus anciennes)
-      4. FALLBACK : result.model_actions() (methode qui retourne les actions
-                                            plates si l'objet history est
-                                            inaccessible)
+    CRITICAL FIX (review round 2) : interacted_element est une LISTE
+    alignee avec model_output.action (BU >= 0.12). L'ancien code prenait
+    juste state.interacted_element (le premier) et le collait a TOUTES
+    les actions du step - faux pour les steps multi-actions. Fix :
+    aligner explicitement action[i] <-> interacted_element[i] via
+    _align_actions_with_elements().
 
-    Pour chaque AgentHistory extrait :
-      - model_output.action[] : les actions decidees par le LLM
-      - state.interacted_element : selecteur exact de l'element cible par
-        BU (xpath, css_selector, attributes) - CRITIQUE pour B2 : c'est
-        ce qui permet d'ecrire un click BU meme quand le DOM listener n'a
-        rien capture
-      - metadata.step_start_time, step_end_time, step_number : fenetre
-        temporelle utilisee par la fusion chronologique B1
-      - state.url, tabs : contexte
+    Ordre de resolution des sources :
+      1. result.history (AgentHistoryList) - PRINCIPAL, expose actions +
+         elements + metadata timing intacts (chemin recommande)
+      2. agent.history.history / agent.state.history - fallbacks defensifs
+         pour variations d'API entre versions BU
+      3. result.model_actions() - fallback ULTIME quand aucune history
+         list n'est disponible. Cette methode retourne une liste plate
+         d'actions SANS metadata timing (pas de step_start_time). On
+         l'utilise pour ne rien perdre mais on ne peut pas faire de
+         fusion chronologique dessus.
 
-    Retourne une liste ordonnee de dicts serialisables. Liste vide si
-    aucun chemin ne donne d'historique (log warning, pas de crash).
+    Retourne : list[step_dict] ou chaque step_dict a :
+      - normalized_actions : list[{action, interacted_element, action_index,
+                                    step_number, step_start_time, step_end_time,
+                                    thought, action_result}]
+        Chaque entree est deja resolue pour son element - pas de reference
+        step-level qui pourrait etre mal appliquee downstream.
+      - Anomalies dans un step sont capturees per-action, pas au step level.
+
+    Ancien shape (actions/interacted_element/metadata au step level) est
+    egalement conserve pour retro-compat des tests et de browser_use_history.json.
     """
     history_list = _resolve_history_list(agent, result)
 
-    # Fallback 4 : model_actions() plat si aucune AgentHistoryList
+    # Fallback ULTIME : model_actions() flat, sans metadata timing.
+    # NE PAS utiliser en principal si history_list est dispo (perte info).
     if not history_list and result is not None and hasattr(result, "model_actions"):
         try:
             flat = result.model_actions()
             if flat:
-                # Enveloppe chaque action plate dans un pseudo-entry sans
-                # metadata timing (la fusion chronologique retombera sur
-                # l'ordre) et sans interacted_element.
-                return [{"actions": [_action_to_dict(a)]} for a in flat]
+                out = []
+                for i, a in enumerate(flat):
+                    action_dict = _action_to_dict(a)
+                    out.append({
+                        "actions": [action_dict],
+                        "normalized_actions": [{
+                            "action": action_dict,
+                            "action_index": 0,
+                            "interacted_element": None,
+                            "step_number": None,
+                            "step_start_time": None,
+                            "step_end_time": None,
+                            "source_hint": "model_actions_fallback",
+                        }],
+                    })
+                return out
         except Exception:
             pass
 
@@ -91,39 +112,55 @@ def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]
     for entry in history_list:
         try:
             item: dict[str, Any] = {}
-            # Actions LLM
+
+            # Actions LLM du step
             model_output = getattr(entry, "model_output", None)
+            actions_raw: list[Any] = []
             if model_output is not None:
-                actions = getattr(model_output, "action", None) or []
-                item["actions"] = [_action_to_dict(a) for a in actions]
+                actions_raw = getattr(model_output, "action", None) or []
+                item["actions"] = [_action_to_dict(a) for a in actions_raw]
                 if getattr(model_output, "current_state", None):
                     cs = model_output.current_state
                     item["thought"] = getattr(cs, "next_goal", None) or getattr(cs, "memory", None)
-            # Results
-            results = getattr(entry, "result", None) or []
-            if results:
-                item["results"] = [_result_to_dict(r) for r in results]
-            # State avec interacted_element (B2 critique)
+
+            # Results per-action
+            results_raw = getattr(entry, "result", None) or []
+            if results_raw:
+                item["results"] = [_result_to_dict(r) for r in results_raw]
+
+            # State avec interacted_element (peut etre LISTE alignee)
             state = getattr(entry, "state", None)
+            interacted_source: Any = None
             if state is not None:
                 item["state"] = {
                     "url": getattr(state, "url", None),
                     "title": getattr(state, "title", None),
                     "tabs_count": len(getattr(state, "tabs", []) or []),
                 }
-                # BU 0.12.9 expose interacted_element sur le state ou sur
-                # les results (selon les versions). On teste les 2.
-                ie = getattr(state, "interacted_element", None)
-                if ie is not None:
-                    item["interacted_element"] = _element_to_dict(ie)
-                elif results:
-                    # Certaines versions le posent sur ActionResult
-                    for r in results:
+                interacted_source = getattr(state, "interacted_element", None)
+                # BU 0.13.8 peut aussi exposer sur ActionResult
+                if interacted_source is None and results_raw:
+                    per_result = []
+                    any_found = False
+                    for r in results_raw:
                         r_ie = getattr(r, "interacted_element", None)
+                        per_result.append(r_ie)
                         if r_ie is not None:
-                            item["interacted_element"] = _element_to_dict(r_ie)
-                            break
-            # Metadata timing (B1 critique pour la fusion chronologique)
+                            any_found = True
+                    if any_found:
+                        interacted_source = per_result  # deja aligne aux results
+
+            # Retro-compat step-level (single element pour anciens consumers)
+            if interacted_source is not None and not isinstance(interacted_source, list):
+                item["interacted_element"] = _element_to_dict(interacted_source)
+            elif isinstance(interacted_source, list) and interacted_source:
+                # Prend le premier NON-NULL pour retrocompat (le vrai
+                # matching action-par-action est dans normalized_actions).
+                first_nn = next((e for e in interacted_source if e is not None), None)
+                if first_nn is not None:
+                    item["interacted_element"] = _element_to_dict(first_nn)
+
+            # Metadata timing
             metadata = getattr(entry, "metadata", None)
             if metadata is not None:
                 item["metadata"] = {
@@ -132,11 +169,81 @@ def extract_browser_use_history(agent: Any, result: Any) -> list[dict[str, Any]]
                     "step_end_time": _to_ms(getattr(metadata, "step_end_time", None)),
                     "input_tokens": getattr(metadata, "input_tokens", None),
                 }
+
+            # ALIGNMENT CRITIQUE : action[i] <-> interacted_element[i]
+            item["normalized_actions"] = _align_actions_with_elements(
+                actions_raw=actions_raw,
+                interacted_source=interacted_source,
+                results_raw=results_raw,
+                metadata=item.get("metadata") or {},
+            )
+
             normalized.append(item)
         except Exception as e:
             normalized.append({"_parse_error": str(e)})
 
     return normalized
+
+
+def _align_actions_with_elements(
+    actions_raw: list[Any],
+    interacted_source: Any,
+    results_raw: list[Any],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Cœur du fix R2 : construit une liste normalisee ou chaque action
+    est APPARIEE a son element correspondant (par index).
+
+    Cas gerés :
+      - interacted_source = LISTE de N elements pour N actions -> alignement direct
+      - interacted_source = SEUL element pour 1 seule action -> alignement direct
+      - interacted_source = SEUL element pour N actions -> applique a l'action 0,
+        None pour les autres (evite le bug d'ancien code qui collait le meme
+        element a toutes)
+      - interacted_source = None -> tous les elements a None
+      - LISTE plus courte/longue que actions -> aligne autant que possible,
+        les extras cote actions ont element=None, les extras cote elements
+        sont ignores (l'action est la source de verite du nombre d'entrees)
+    """
+    out: list[dict[str, Any]] = []
+    n = len(actions_raw)
+    if n == 0:
+        return out
+
+    # Normalise interacted_source en liste de meme longueur que actions
+    if isinstance(interacted_source, list):
+        elements_list = list(interacted_source)
+    elif interacted_source is not None:
+        # Element unique - applique a l'action 0 uniquement
+        elements_list = [interacted_source] + [None] * (n - 1)
+    else:
+        elements_list = [None] * n
+
+    # Ajuste la longueur : tronque si trop long, complete avec None si trop court
+    if len(elements_list) < n:
+        elements_list = elements_list + [None] * (n - len(elements_list))
+    elif len(elements_list) > n:
+        elements_list = elements_list[:n]
+
+    step_number = metadata.get("step_number")
+    step_start_time = metadata.get("step_start_time")
+    step_end_time = metadata.get("step_end_time")
+
+    for i, action in enumerate(actions_raw):
+        elem = elements_list[i]
+        action_result = None
+        if results_raw and i < len(results_raw):
+            action_result = _result_to_dict(results_raw[i])
+        out.append({
+            "action": _action_to_dict(action),
+            "action_index": i,
+            "interacted_element": _element_to_dict(elem) if elem is not None else None,
+            "step_number": step_number,
+            "step_start_time": step_start_time,
+            "step_end_time": step_end_time,
+            "action_result": action_result,
+        })
+    return out
 
 
 def _resolve_history_list(agent: Any, result: Any) -> Any:
@@ -605,8 +712,24 @@ def build_pre_cleanup_steps(
         # au sein d'un meme step LLM qui declenche plusieurs actions)
         default_step_ts = start_ms
 
-        interacted = h.get("interacted_element") or {}
-        for action_dict in (h.get("actions") or []):
+        # R2 : utilise normalized_actions (chaque action a son element PROPRE
+        # deja apparie par _align_actions_with_elements) au lieu de l'ancien
+        # interacted_element step-level qui melangeait toutes les actions.
+        # Retro-compat : si normalized_actions absent (vieux JSON), on construit
+        # a la volee depuis actions + interacted_element step-level.
+        normalized_actions_list = h.get("normalized_actions")
+        if not normalized_actions_list:
+            legacy_interacted = h.get("interacted_element")
+            actions_dicts = h.get("actions") or []
+            normalized_actions_list = _align_actions_with_elements(
+                actions_raw=actions_dicts,
+                interacted_source=legacy_interacted,
+                results_raw=[],
+                metadata=metadata,
+            )
+
+        for na in normalized_actions_list:
+            action_dict = na.get("action") or {}
             if not isinstance(action_dict, dict) or not action_dict:
                 continue
             action_name = next(iter(action_dict.keys()))
@@ -614,6 +737,9 @@ def build_pre_cleanup_steps(
             if normalized is None:
                 # Meta LLM (done, read_content, etc.) - jamais un step
                 continue
+
+            # Element APPARIE a cette action precise (pas step-level)
+            per_action_element = na.get("interacted_element")
 
             step: Step | None = None
             if normalized in ("click", "input", "scroll", "select", "hover"):
@@ -624,24 +750,21 @@ def build_pre_cleanup_steps(
                         dom_entries[matched_idx]["entry"], _next_index()
                     )
                     step.source = "bu+dom"
-                    # Trace le lien BU dans le raw_payload pour audit
-                    step.raw_payload = {"bu_action": action_dict}
+                    step.raw_payload = {"bu_action": action_dict, "action_index": na.get("action_index")}
                 else:
                     # Pas de correspondance DOM demontree - construit depuis
-                    # BU seul avec interacted_element si dispo. Regle du
-                    # cahier : jamais fabriquer un selecteur, mais BU peut
-                    # nous en fournir un (xpath/css_selector) - c'est
-                    # different d'une invention.
+                    # BU + interacted_element de CETTE action. Regle cahier :
+                    # jamais fabriquer, mais BU peut fournir le selecteur.
                     step = _step_from_bu_action(
                         action_dict, _next_index(), current_url,
-                        interacted_element=interacted, ts_ms=default_step_ts,
+                        interacted_element=per_action_element, ts_ms=default_step_ts,
                     )
             else:
                 # navigate, wait, keyboard, screenshot, upload, tabs,
                 # go_back, reload, extract, ...
                 step = _step_from_bu_action(
                     action_dict, _next_index(), current_url,
-                    interacted_element=interacted, ts_ms=default_step_ts,
+                    interacted_element=per_action_element, ts_ms=default_step_ts,
                 )
 
             if step is None:
