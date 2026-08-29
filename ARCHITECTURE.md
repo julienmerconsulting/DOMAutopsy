@@ -855,16 +855,26 @@ Détection : test_playwright.spec.ts présent dans le run source ?
 - Docstring + banner runtime marqués LEGACY FALLBACK
 - Réponse `/api/replay` expose `legacy_fallback: true` + `legacy_fallback_reason` pour que le CLI/UI signale à l'utilisateur
 
-### 15.8 Roadmap runtime autonome (V+1, hors scope refactor Août 2026)
+### 15.8 Runtime autonome — résolveur en place, packaging à décider
 
-Le refactor actuel unifie correctement le pipeline pour le **développement** et pour un déploiement où Node + un cache Playwright Python déjà rempli sont disponibles. Il **dépend cependant** de :
+**Le résolveur runtime est implémenté** dans `server.py::_resolve_embedded_runtime()`. Trois variables `.env` optionnelles :
 
-- `npx` trouvé dans le `PATH` système
-- `@playwright/test` installé via `npm ci`
-- Le cache Chromium partagé de Playwright Python (`~/AppData/Local/ms-playwright/chromium-XXXX` sur Windows, réutilisé via `channel: 'chromium'`)
+```env
+DOMAUTOPSY_NODE_PATH=runtime/node/node.exe
+DOMAUTOPSY_PLAYWRIGHT_CLI=runtime/node_modules/@playwright/test/cli.js
+DOMAUTOPSY_BROWSERS_PATH=runtime/browsers
+```
 
-Pour un **produit final autonome** (distribution sans prérequis machine, air-gap), la V+1 doit embarquer son propre runtime :
+Chemins résolus relativement à `ROOT`. Si les 3 sont set et pointent sur des fichiers existants, `/api/replay` lance directement :
 
+```python
+[node_path, playwright_cli, "test", spec_rel, "--workers=1", f"--output={output_rel}"]
+# + env["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
+```
+
+Sinon fallback automatique en mode DEV sur `npx playwright test` global + cache Playwright utilisateur, avec log clair. `meta.json` des runs replay expose `runtime_mode: "embedded" | "system_npx"` pour traçabilité.
+
+Le layout attendu à fournir par l'installateur :
 ```
 DOMAutopsy/
 └── runtime/
@@ -873,16 +883,29 @@ DOMAutopsy/
     └── browsers/chromium-XXXX/             # binaire embarque
 ```
 
-Ajustements à faire dans `server.py::/api/replay` :
+**Résolveur ET provisionneur sont en place.** Le helper `runtime_installer.py` télécharge Node officiel + fait `npm ci` du lockfile + télécharge Chromium isolé dans `runtime/browsers/` :
 
-- Appeler `runtime/node/node.exe` directement, jamais `npx` global
-- Positionner `PLAYWRIGHT_BROWSERS_PATH=runtime/browsers` dans l'env du subprocess
-- Utiliser la version exacte de Playwright associée au Chromium embarqué
-- Doit fonctionner **sans Node système** et **sans connexion Internet**
+```bash
+python domautopsy_cli.py runtime install          # idempotent
+python domautopsy_cli.py runtime status           # JSON exit 0/1
+python domautopsy_cli.py runtime install --force  # re-installe tout
+```
 
-**Critère d'acceptation** : lancer DOMAutopsy sur une machine sans Node installé et avec un cache Playwright utilisateur vide. Si le replay TypeScript fonctionne, l'installation est réellement autonome. Même logique que pour OculiX : le produit maîtrise entièrement son runtime.
+Détails du provisionnement :
+- **Node** : télécharge depuis `nodejs.org/dist/vXX/` officiel (archétype auto-détecté : `win-x64` / `linux-x64` / `darwin-x64` / `darwin-arm64`), extrait dans `runtime/node/`, jamais dans le PATH
+- **@playwright/test** : `npm ci` avec le Node embarqué (PATH prefixé), respecte le `package-lock.json` versionné, installe dans `runtime/node_modules/`
+- **Chromium** : `node cli.js install chromium` avec `PLAYWRIGHT_BROWSERS_PATH=runtime/browsers` — isolé du cache utilisateur
+- **Manifest** : `runtime/runtime_manifest.json` enregistre versions réelles installées + SHA-256 du binaire Node + timestamps + chemins relatifs (audit)
+- **Idempotent** : `install()` reprend proprement si Node est déjà là ; `--force` re-télécharge tout
+- **Fallback dev automatique** : si le runtime n'est pas provisionné, `/api/replay` détecte et bascule sur `npx` global + cache utilisateur (mode dev), avec `runtime_mode: "system_npx"` dans le `meta.json`
 
-Ce chantier ne fait PAS partie du refactor Août 2026 (qui reste dev-mode) — il est capturé ici pour la roadmap.
+**Ce qui reste côté distribution** — packaging effectif des binaires vers l'utilisateur final :
+
+- **`pip install domautopsy` + `python -m domautopsy_cli runtime install`** : wheel PyPI léger + le user lance le helper post-install (même pattern que `playwright install` pour Playwright Python). Simple, universel, un télé-chargement.
+- **Image Docker** : `docker pull julienmerconsulting/domautopsy` avec `runtime/` déjà provisionné (Dockerfile fait `RUN python domautopsy_cli.py runtime install`).
+- **Installeur natif** (msi/dmg via PyInstaller) : le dossier `runtime/` déjà provisionné est embarqué dans le bundle. Décrit dans README section V5.
+
+**Critère d'acceptation autonomie** : lancer DOMAutopsy sur une machine sans Node installé et avec un cache Playwright utilisateur vide → `python domautopsy_cli.py runtime install` puis `/api/replay` fonctionne uniquement avec les binaires de `runtime/`. Le code sait le faire de bout en bout.
 
 ### 15.9 Tests couverture cahier des charges
 
