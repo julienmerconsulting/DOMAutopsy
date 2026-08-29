@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>DOMAutopsy E2E fixture</title>
+</head>
+<body>
+    <h1 id="page-title">DOMAutopsy E2E Test Page</h1>
+    <form id="login-form">
+        <input id="username" name="username" placeholder="Nom d'utilisateur" type="text" />
+        <input id="password" name="password" type="password" autocomplete="current-password" />
+        <button id="login-btn" type="button" onclick="document.getElementById('welcome').textContent='Bienvenue ' + document.getElementById('username').value">
+            Connexion
+        </button>
+    </form>
+    <div id="welcome" style="margin-top:20px;color:green;font-weight:bold"></div>
+    <div style="height:2000px;padding-top:1500px">
+        <p id="footer-text">Contenu tout en bas de page</p>
+    </div>
+</body>
+</html>

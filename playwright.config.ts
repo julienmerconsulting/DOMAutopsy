@@ -59,7 +59,17 @@ export default defineConfig({
   projects: [
     {
       name: 'chromium',
-      use: { ...devices['Desktop Chrome'] },
+      use: {
+        ...devices['Desktop Chrome'],
+        // channel: 'chromium' force l'utilisation du binaire Chromium
+        // classique deja telecharge par Playwright Python (partage le
+        // cache ms-playwright/chromium-XXXX). Sans cette option,
+        // Playwright JS >= 1.49 cherche un binaire separe
+        // ms-playwright/chromium_headless_shell-XXXX qui n'est pas
+        // installe par Playwright Python, provoquant un "Executable
+        // doesn't exist" a la premiere execution.
+        channel: 'chromium',
+      },
     },
   ],
 });
