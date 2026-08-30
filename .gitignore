@@ -45,3 +45,12 @@ test-results/
 # (Node.exe + @playwright/test + Chromium ~200MB au total, JAMAIS committes).
 # Le code d'install lui-meme (runtime_installer.py) reste versionne.
 runtime/
+
+# Benchmark cache : clone browser-use/benchmark local + BU_Bench_V1.enc +
+# artifacts d'execution. JAMAIS committes (contient l'ecosysteme des tests
+# officiels + les instructions dechiffrees en RAM produisent des rapports
+# locaux dans .bu_bench_runs/ qui contiennent les texts des taches).
+.bu_bench_cache/
+.bu_bench_runs/
+bu_bench_report.html
+bu_bench_report.json
