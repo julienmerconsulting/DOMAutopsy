@@ -198,6 +198,255 @@ def test_runner_wave_layout_5_workers():
 # Reporter local uniquement (aucune fuite GitHub)
 # ============================================================
 
+def test_build_clean_steps_no_network_by_default():
+    """GARANTIE : build_clean_steps(use_llm=False) ne fait AUCUN appel
+    reseau (aucun socket TCP outgoing). Post-processing 100% deterministe.
+
+    Protection : on remplace socket.socket par une classe qui raise
+    ConnectionRefusedError des la creation. Si build_clean_steps tente
+    d'appeler OpenAI, le test explose."""
+    import socket as _real_socket
+    from clean_steps_builder import build_clean_steps
+
+    class _NoNetSocket(_real_socket.socket):
+        def __init__(self, *a, **kw):
+            raise ConnectionRefusedError("Post-processing DOMAutopsy ne DOIT PAS ouvrir de socket")
+
+    real_socket_cls = _real_socket.socket
+    _real_socket.socket = _NoNetSocket
+    try:
+        import time
+        t0 = time.monotonic()
+        bu_history = [
+            {"step": 1, "action_type": "navigate", "url": "https://example.com", "success": True},
+            {"step": 2, "action_type": "click", "locator": "#login", "success": True},
+            {"step": 3, "action_type": "input", "locator": "#email", "value": "a@b.c", "success": True},
+        ]
+        clean_steps, env_vars = build_clean_steps(
+            scenario_name="test_no_network",
+            scenario_url="https://example.com",
+            scenario_steps=None,
+            bu_history=bu_history,
+            dom_log=[],
+            network_log=None,
+            model="gpt-5-mini",
+            base_url=None,
+            api_key="fake-key",
+            use_llm=False,
+        )
+        elapsed = time.monotonic() - t0
+        assert clean_steps is not None
+        assert clean_steps.total_steps == len(clean_steps.steps)
+        assert elapsed < 5.0, f"post-processing deterministe trop lent : {elapsed:.2f}s"
+    finally:
+        _real_socket.socket = real_socket_cls
+
+
+def test_deterministic_classify_filters_duplicate_clicks():
+    """Regle R1 : clics consecutifs identiques (<500ms sur meme selecteur)
+    -> le premier reste inclus, les suivants passent a included_in_replay=False."""
+    from clean_steps_builder import deterministic_classify_steps
+    from schemas import Step, Selector
+    steps = [
+        Step(id="step-0001", action="click", page="p1", timestamp=1000,
+             selector=Selector(value="#login-btn", unique=True)),
+        Step(id="step-0002", action="click", page="p1", timestamp=1100,
+             selector=Selector(value="#login-btn", unique=True)),
+        Step(id="step-0003", action="click", page="p1", timestamp=1250,
+             selector=Selector(value="#login-btn", unique=True)),
+    ]
+    out, anomalies, noise = deterministic_classify_steps(steps)
+    assert out[0].included_in_replay is True
+    assert out[1].included_in_replay is False
+    assert out[2].included_in_replay is False
+    assert "redondant" in out[1].cleanup_reason
+    assert any("#login-btn" in n for n in noise)
+
+
+def test_generate_playwright_ts_injects_oracle_assertions(tmp_path):
+    """Real-World 7 : quand un oracle {url_contains, text_contains} est
+    fourni a generate_playwright_ts, le TS produit contient un
+    test.step('[oracle]') avec expect().toHaveURL et
+    expect(page.locator('body')).toContainText. Sans LLM."""
+    from playwright_generator import generate_playwright_ts
+    from schemas import CleanSteps, Step, Selector
+    cs = CleanSteps(
+        schema_version="2.0",
+        parcours="test",
+        scenario_name="test",
+        scenario_url="https://example.com",
+        total_steps=1,
+        steps=[Step(id="step-0001", action="navigate", url="https://example.com")],
+    )
+    out = tmp_path / "test.spec.ts"
+    res = generate_playwright_ts(
+        clean_steps=cs, output_path=out,
+        parcours_url="https://example.com",
+        oracle={"url_contains": "checkout-complete", "text_contains": "Thank you for your order"},
+    )
+    assert res["oracle_asserted"] is True
+    ts = out.read_text(encoding="utf-8")
+    assert "[oracle]" in ts
+    assert "toHaveURL" in ts
+    assert "toContainText" in ts
+    assert "Thank you for your order" in ts
+
+
+def test_oracle_condition_is_strictly_or(tmp_path):
+    """Verrou : la condition d'injection est url_contains OR text_contains,
+    JAMAIS AND. Un oracle avec un seul champ present doit generer le bloc."""
+    from playwright_generator import generate_playwright_ts
+    from schemas import CleanSteps, Step
+    def _mk():
+        return CleanSteps(schema_version="2.0", parcours="t", scenario_name="t",
+                          scenario_url="https://example.com", total_steps=1,
+                          steps=[Step(id="step-0001", action="navigate", url="https://example.com")])
+    # url_contains SEUL
+    out1 = tmp_path / "url_only.spec.ts"
+    r1 = generate_playwright_ts(clean_steps=_mk(), output_path=out1,
+                                 parcours_url="https://example.com",
+                                 oracle={"url_contains": "/checkout"})
+    assert r1["oracle_asserted"] is True
+    ts1 = out1.read_text(encoding="utf-8")
+    assert "toHaveURL" in ts1 and "toContainText" not in ts1
+    # text_contains SEUL
+    out2 = tmp_path / "text_only.spec.ts"
+    r2 = generate_playwright_ts(clean_steps=_mk(), output_path=out2,
+                                 parcours_url="https://example.com",
+                                 oracle={"text_contains": "Merci"})
+    assert r2["oracle_asserted"] is True
+    ts2 = out2.read_text(encoding="utf-8")
+    assert "toContainText" in ts2 and "toHaveURL" not in ts2
+    # oracle vide/None
+    out3 = tmp_path / "empty.spec.ts"
+    r3 = generate_playwright_ts(clean_steps=_mk(), output_path=out3,
+                                 parcours_url="https://example.com",
+                                 oracle={"unrelated": "x"})
+    assert r3["oracle_asserted"] is False
+
+
+def test_ts_always_imports_expect(tmp_path):
+    """Verrou : le TS genere doit toujours importer expect, meme sans oracle
+    (evite un ReferenceError silencieux quand un oracle est ajoute later)."""
+    from playwright_generator import generate_playwright_ts
+    from schemas import CleanSteps, Step
+    cs = CleanSteps(schema_version="2.0", parcours="t", scenario_name="t",
+                    scenario_url="https://example.com", total_steps=1,
+                    steps=[Step(id="step-0001", action="navigate", url="https://example.com")])
+    out = tmp_path / "spec.ts"
+    generate_playwright_ts(clean_steps=cs, output_path=out,
+                            parcours_url="https://example.com", oracle=None)
+    ts = out.read_text(encoding="utf-8")
+    assert "import { test, expect } from '@playwright/test'" in ts
+
+
+def test_generate_playwright_ts_no_oracle_no_assertion(tmp_path):
+    """Sans oracle : pas de test.step('[oracle]') injecte, back-compat."""
+    from playwright_generator import generate_playwright_ts
+    from schemas import CleanSteps, Step
+    cs = CleanSteps(
+        schema_version="2.0", parcours="test", scenario_name="test",
+        scenario_url="https://example.com", total_steps=1,
+        steps=[Step(id="step-0001", action="navigate", url="https://example.com")],
+    )
+    out = tmp_path / "test2.spec.ts"
+    res = generate_playwright_ts(clean_steps=cs, output_path=out,
+                                  parcours_url="https://example.com")
+    assert res["oracle_asserted"] is False
+    ts = out.read_text(encoding="utf-8")
+    assert "[oracle]" not in ts
+
+
+def test_oracle_false_fails_playwright_replay(tmp_path):
+    """Test NEGATIF integration : un oracle volontairement faux DOIT faire
+    exit code != 0 quand npx playwright test rejoue le TS genere. Si ce test
+    passe (exit=0), c'est que l'oracle n'est pas veritablement enforce =
+    la promesse marketing 'validation fonctionnelle' est cassee.
+
+    Skip si npx/playwright pas disponible dans l'env de test."""
+    import shutil, subprocess
+    if shutil.which("npx") is None:
+        pytest.skip("npx pas dispo dans PATH")
+
+    from playwright_generator import generate_playwright_ts
+    from schemas import CleanSteps, Step
+
+    workdir = tmp_path / "pw_neg"
+    workdir.mkdir()
+    (workdir / "package.json").write_text(json.dumps({
+        "name": "oracle-neg-test", "version": "1.0.0",
+        "devDependencies": {"@playwright/test": "1.57.0"},
+    }), encoding="utf-8")
+
+    # Fixture minimale : data:text/html <body>Hello</body>. L'oracle
+    # demande "GoodbyeXYZ_MISSING" qui n'est pas dans le body -> DOIT fail.
+    cs = CleanSteps(
+        schema_version="2.0", parcours="neg", scenario_name="neg",
+        scenario_url="data:text/html,<body>Hello</body>", total_steps=1,
+        steps=[Step(id="step-0001", action="navigate",
+                    url="data:text/html,<body>Hello</body>")],
+    )
+    spec = workdir / "neg.spec.ts"
+    res = generate_playwright_ts(
+        clean_steps=cs, output_path=spec,
+        parcours_url="data:text/html,<body>Hello</body>",
+        oracle={"text_contains": "GoodbyeXYZ_MISSING_ORACLE"},
+    )
+    assert res["oracle_asserted"] is True
+
+    # Utilise npx --package pour installer @playwright/test on-the-fly
+    # sans polluer un node_modules global. Timeout serre pour ne pas
+    # bloquer si Playwright n'est pas installable dans l'env de test.
+    try:
+        proc = subprocess.run(
+            ["npx", "--yes", "-p", "@playwright/test@1.57.0",
+             "playwright", "test", str(spec.name),
+             "--reporter=line", "--workers=1"],
+            cwd=str(workdir), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=180,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pytest.skip("npx/playwright indisponible ou installation lente dans l'env de test")
+
+    assert proc.returncode != 0, (
+        "Oracle faux devrait faire echouer le replay Playwright, "
+        f"mais exit_code={proc.returncode}. stdout:{proc.stdout[-600:]}"
+    )
+    assert "GoodbyeXYZ_MISSING_ORACLE" in (proc.stdout + proc.stderr), (
+        "Le message d'erreur devrait mentionner le texte oracle manquant"
+    )
+
+
+def test_kill_process_tree_terminates_children(tmp_path):
+    """Non-regression benchmark stop : _kill_process_tree tue le parent ET
+    son subprocess enfant en < 5s."""
+    from domautopsy_cli import _kill_process_tree
+    # Spawn un parent Python qui spawn lui-meme un enfant sleeping 60s
+    script = tmp_path / "parent.py"
+    script.write_text(
+        "import subprocess, sys, time\n"
+        f"child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        "print(child.pid, flush=True)\n"
+        "time.sleep(60)\n",
+        encoding="utf-8",
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    # Lit la 1ere ligne = PID de l'enfant
+    child_pid_line = proc.stdout.readline().strip()
+    child_pid = int(child_pid_line)
+    parent_pid = proc.pid
+
+    res = _kill_process_tree(parent_pid, timeout=5.0)
+    # Verifie que parent ET enfant sont dans killed_pids
+    assert parent_pid in res["killed_pids"], f"parent {parent_pid} pas tue"
+    assert child_pid in res["killed_pids"], f"enfant {child_pid} pas tue"
+    assert res["still_alive"] == []
+    proc.wait(timeout=3)
+
+
 def test_reporter_writes_local_only(tmp_path):
     """Le reporter ecrit report.html et report.json dans le run_root
     passe, jamais ailleurs."""
