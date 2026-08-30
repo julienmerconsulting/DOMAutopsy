@@ -22,6 +22,7 @@ import concurrent.futures
 import hashlib
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -29,6 +30,34 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+
+def _allocate_unique_cdp_ports(n: int, start: int = 9300, end: int = 9500) -> list[int]:
+    """Alloue N ports CDP UNIQUES et non-collidants en un seul passage
+    single-thread. Bind chaque port dans une socket qu'on garde ouverte
+    JUSQU'A AVOIR ALLOUE LES N PORTS, puis on les libere tous ensemble.
+    Ca elimine la race ou 2 workers appellent chacun 'find_free' et
+    obtiennent le meme port entre bind et return."""
+    sockets = []
+    ports: list[int] = []
+    try:
+        port = start
+        while len(ports) < n and port < end:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                s.bind(("127.0.0.1", port))
+                sockets.append(s)
+                ports.append(port)
+            except OSError:
+                s.close()
+            port += 1
+        if len(ports) < n:
+            raise RuntimeError(f"Impossible d'allouer {n} ports libres dans [{start},{end})")
+        return ports
+    finally:
+        for s in sockets:
+            try: s.close()
+            except: pass
 
 
 ROOT = Path(__file__).parent
@@ -39,7 +68,8 @@ CUSTOM_CATEGORY_NAMES = ("Custom", "InteractionTests", "Custom / Page interactio
 EXPECTED_TASKS_COUNT = 20
 
 DEFAULT_MAX_WORKERS = 5
-DEFAULT_CAPTURE_TIMEOUT_S = 900   # 15 min par capture (regle Sol)
+DEFAULT_CAPTURE_TIMEOUT_S = 1800  # 30 min par tache = defaut officiel BU benchmark
+                                  # (frameworks/__init__.py:DEFAULT_TASK_TIMEOUT)
 DEFAULT_REPLAY_TIMEOUT_S = 180
 DEFAULT_REPLAYS = 3
 
@@ -51,6 +81,23 @@ class BenchmarkRunError(Exception):
 # ============================================================
 # Dechiffrement OFFICIEL (Fernet, cle = SHA-256("BU_Bench_V1") en b64)
 # ============================================================
+
+def load_real_world_7() -> list[dict]:
+    """Charge le corpus DOMAutopsy Real-World 7 depuis benchmarks/real_world_7.json.
+
+    Complementaire au BU_Bench_V1 : 7 scenarios QA realistes (saucedemo,
+    automationexercise, demoblaze, parabank, heroku login, demoqa text-box,
+    todomvc). Chaque tache declare un oracle final deterministe. Le fichier
+    est LIBRE (pas chiffre) car ce sont des sites publics."""
+    corpus_path = ROOT / "benchmarks" / "real_world_7.json"
+    if not corpus_path.exists():
+        raise BenchmarkRunError(f"Corpus Real-World 7 absent : {corpus_path}")
+    data = json.loads(corpus_path.read_text(encoding="utf-8"))
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        raise BenchmarkRunError("real_world_7.json : cle 'tasks' absente ou vide")
+    return tasks
+
 
 def load_bu_bench_v1_in_memory(enc_path: Path) -> list[dict]:
     """Dechiffre BU_Bench_V1.enc EN MEMOIRE UNIQUEMENT.
@@ -98,49 +145,71 @@ def select_custom_tasks(tasks: list[dict]) -> tuple[list[dict], dict[str, int], 
 # Execution par worker via stdin
 # ============================================================
 
-def _run_capture_worker(task: dict, output_dir: Path, timeout_s: float) -> dict:
+def _run_capture_worker(task: dict, output_dir: Path, timeout_s: float, cdp_port: int | None = None) -> dict:
     """Lance benchmark_worker.py en subprocess, transmet la tache par
     STDIN (pas argv). Retourne le dict resultat que le worker a emit
-    sur son stdout."""
+    sur son stdout. `cdp_port` alloue par le runner (single-thread,
+    non-collidant) - passer None seulement pour tests unitaires."""
     output_dir.mkdir(parents=True, exist_ok=True)
+    # Preserve task["start_url"] du corpus (real_world_7.json a des URLs
+    # cibles precises comme https://www.saucedemo.com/). Un fallback
+    # "about:blank" est ajoute UNIQUEMENT si la task n'en declare pas.
     payload = {
         **task,
         "output_dir": str(output_dir),
-        "start_url": "about:blank",
+        "start_url": task.get("start_url") or "about:blank",
         "model": "gpt-5-mini",
-        "max_steps": 40,
-        "max_actions_per_step": 10,
         "timeout_s": timeout_s,
     }
+    if cdp_port is not None:
+        payload["cdp_port"] = cdp_port
     env = dict(os.environ)
     cmd = [sys.executable, str(ROOT / "benchmark_worker.py")]
+    # Streaming direct sur disque : Popen + fichiers ouverts + python -u.
+    # Permet de tail -f worker_stdout.txt / stderr.txt pendant que le
+    # worker tourne, plutot que d'attendre sa fin pour voir un dump.
+    # cmd inclut -u (unbuffered stdin/stdout/stderr Python).
+    stdout_path = output_dir / "worker_stdout.txt"
+    stderr_path = output_dir / "worker_stderr.txt"
+    cmd_stream = [sys.executable, "-u", str(ROOT / "benchmark_worker.py")]
     try:
-        proc = subprocess.run(
-            cmd, input=json.dumps(payload), capture_output=True,
-            text=True, encoding="utf-8", errors="replace",
-            timeout=timeout_s + 60,  # marge parent pour capturer le stdout
-            env=env, cwd=str(ROOT),
-        )
+        with open(stdout_path, "w", encoding="utf-8", errors="replace") as fout, \
+             open(stderr_path, "w", encoding="utf-8", errors="replace") as ferr:
+            proc = subprocess.Popen(
+                cmd_stream, stdin=subprocess.PIPE, stdout=fout, stderr=ferr,
+                env=env, cwd=str(ROOT), text=True, encoding="utf-8", errors="replace",
+            )
+            try:
+                proc.communicate(input=json.dumps(payload), timeout=timeout_s + 60)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+                return {
+                    "task_id": task.get("task_id"),
+                    "capture_result": "timeout",
+                    "error": f"Parent subprocess timeout apres {timeout_s + 60}s",
+                    "output_dir": str(output_dir),
+                }
+        # Extrait la derniere ligne JSON du stdout ecrit par le worker
         try:
-            result = json.loads(proc.stdout.strip().split("\n")[-1])
-        except (json.JSONDecodeError, IndexError):
+            stdout_txt = stdout_path.read_text(encoding="utf-8", errors="replace")
+            last_line = stdout_txt.strip().split("\n")[-1]
+            result = json.loads(last_line)
+        except (json.JSONDecodeError, IndexError, FileNotFoundError):
+            tail = stdout_txt[-300:] if 'stdout_txt' in locals() else ""
             return {
                 "task_id": task.get("task_id"),
                 "capture_result": "infrastructure_error",
-                "error": f"stdout worker non-JSON. exit={proc.returncode} tail={proc.stdout[-300:]}",
+                "error": f"stdout worker non-JSON. exit={proc.returncode} tail={tail}",
+                "output_dir": str(output_dir),
             }
         return result
-    except subprocess.TimeoutExpired:
-        return {
-            "task_id": task.get("task_id"),
-            "capture_result": "timeout",
-            "error": f"Parent subprocess timeout apres {timeout_s + 60}s",
-        }
     except Exception as e:
         return {
             "task_id": task.get("task_id"),
             "capture_result": "infrastructure_error",
             "error": f"{type(e).__name__}: {e}",
+            "output_dir": str(output_dir),
         }
 
 
@@ -169,11 +238,30 @@ def _run_replay(spec_path: Path, replay_output_dir: Path, timeout_s: float) -> d
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=timeout_s,
             )
+        # Detection du step qui a fail : si [oracle] apparait dans un bloc
+        # d'erreur, on marque oracle_pass=False ; sinon oracle_pass=None
+        # (fail sur un autre step, avant meme d'atteindre l'oracle).
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
+        combined = stdout + "\n" + stderr
+        # Un oracle est present si le TS contient le marqueur "[oracle]"
+        # (heuristique : Playwright reporter l'imprime dans la sortie qu'il
+        # matche ou non). Sur une reussite complete, on ne le voit pas
+        # explicitement dans line reporter, mais le exit=0 vaut oracle_pass=True.
+        oracle_step_failed = ("[oracle]" in combined) and (proc.returncode != 0)
+        oracle_pass: bool | None
+        if proc.returncode == 0:
+            oracle_pass = True
+        elif oracle_step_failed:
+            oracle_pass = False
+        else:
+            oracle_pass = None  # fail sur un step non-oracle, oracle jamais atteint
         return {
             "status": "pass" if proc.returncode == 0 else "fail",
             "returncode": proc.returncode,
+            "oracle_pass": oracle_pass,
             "duration_s": round(time.monotonic() - t0, 1),
-            "error": None if proc.returncode == 0 else (proc.stdout or "")[-500:],
+            "error": None if proc.returncode == 0 else stdout[-500:],
         }
     except subprocess.TimeoutExpired:
         return {
@@ -195,7 +283,7 @@ def _is_replayable(capture_result: dict) -> bool:
 
 
 # ============================================================
-# Orchestration en vagues
+# Orchestration : pipeline continu (pool de N slots)
 # ============================================================
 
 def run_benchmark(
@@ -207,34 +295,42 @@ def run_benchmark(
     replay_timeout_s: float = DEFAULT_REPLAY_TIMEOUT_S,
     progress_cb=None,
 ) -> dict:
-    """Execute 4 vagues * 5 captures STRICTEMENT SEQUENTIELLES, puis
-    tous les replays des taches eligibles par vagues de 5. Le plafond
-    de workers est GLOBAL : jamais 5 captures + 5 replays simultanes.
+    """Pipeline continu de N workers concurrents (defaut 5). Des qu'une
+    tache termine, la suivante est lancee immediatement -> toujours N en
+    vol tant qu'il reste des taches en file. Elimine le temps mort des
+    vagues (ou la wave etait bloquee par sa tache la plus lente).
+    Puis phase 2 : replays des taches eligibles (memes N slots).
     """
     run_root.mkdir(parents=True, exist_ok=True)
     started_at = datetime.now()
 
-    # --- PHASE 1 : Captures ---
+    # --- PHASE 1 : Captures en pipeline continu ---
     capture_results: list[dict] = []
     total = len(tasks)
-    n_waves = (total + workers - 1) // workers
-    for wave_idx in range(n_waves):
-        wave = tasks[wave_idx * workers : (wave_idx + 1) * workers]
-        if progress_cb:
-            progress_cb(f"CAPTURE wave {wave_idx+1}/{n_waves} : {len(wave)} taches en parallele")
-        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {}
-            for i, task in enumerate(wave):
-                task_id = task.get("task_id") or f"t{wave_idx*workers+i:02d}"
-                # output_dir unique par tache
-                safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(task_id))[:40]
-                out = run_root / f"capture_{safe_id}"
-                futures[ex.submit(_run_capture_worker, task, out, capture_timeout_s)] = task
-            for fut in concurrent.futures.as_completed(futures):
-                res = fut.result()
-                capture_results.append(res)
-                if progress_cb:
-                    progress_cb(f"  -> {res.get('task_id')} : {res.get('capture_result')} ({res.get('duration_s', '?')}s)")
+
+    # Pre-alloue UN port unique par tache (bind simultane single-thread ->
+    # aucun TOCTOU entre workers). Assignation stable index->port.
+    all_ports = _allocate_unique_cdp_ports(total, start=9300)
+    if progress_cb:
+        progress_cb(f"CAPTURE pipeline : {total} taches, {workers} slots concurrents")
+        progress_cb(f"  ports CDP alloues : {all_ports[0]}..{all_ports[-1]}")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {}
+        for i, task in enumerate(tasks):
+            task_id = task.get("task_id") or f"t{i:02d}"
+            safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in str(task_id))[:40]
+            out = run_root / f"capture_{safe_id}"
+            futures[ex.submit(_run_capture_worker, task, out, capture_timeout_s, all_ports[i])] = task
+        # as_completed re-emet des que N'IMPORTE lequel finit. Le pool
+        # de N=workers threads reutilise automatiquement le slot libere.
+        done_count = 0
+        for fut in concurrent.futures.as_completed(futures):
+            res = fut.result()
+            capture_results.append(res)
+            done_count += 1
+            if progress_cb:
+                progress_cb(f"  [{done_count}/{total}] {res.get('task_id')} : {res.get('capture_result')} ({res.get('duration_s','?')}s)")
 
     # --- PHASE 2 : Replays 3x des taches eligibles ---
     replay_results_by_task: dict[str, list[dict]] = {}
@@ -267,6 +363,13 @@ def run_benchmark(
 
     ended_at = datetime.now()
 
+    # Detection heuristique automatique des incidents runner : ecrit un
+    # runner_incident.json signalant les taches suspectes de contamination
+    # (kill externe, perte CDP, etc.), pour orienter un 'benchmark rerun'.
+    incident = _detect_runner_incident(capture_results, run_root)
+    if incident and progress_cb:
+        progress_cb(f"[incident] {len(incident['suspect_task_ids'])} taches suspectes -> {incident['suggested_command']}")
+
     summary = {
         "started_at": started_at.isoformat(timespec="seconds"),
         "ended_at": ended_at.isoformat(timespec="seconds"),
@@ -277,5 +380,75 @@ def run_benchmark(
         "tasks_total": len(tasks),
         "captures": capture_results,
         "replays": replay_results_by_task,
+        "runner_incident": incident,
     }
     return summary
+
+
+# ============================================================
+# Detection automatique d'incident runner
+# ============================================================
+
+_INCIDENT_KEYWORDS = (
+    "CDP", "cdp", "Connection", "connection lost", "closed", "aborted",
+    "killed", "SIGTERM", "SIGKILL", "BrowserType.launch", "Target closed",
+    "TargetClosedError", "WebSocket", "protocol", "Session closed",
+)
+
+_INCIDENT_MIN_INFRA_RATIO = 0.20   # >= 20% de taches en infra_error = suspect
+_INCIDENT_MIN_ABSOLUTE = 2          # ou >= 2 infra_error avec messages suspects
+
+
+def _detect_runner_incident(capture_results: list[dict], run_root: Path) -> dict | None:
+    """Analyse les capture_results et retourne un dict incident si des
+    signes de contamination (kill externe, perte CDP, connection reset)
+    sont detectes. Ecrit runner_incident.json dans run_root en parallele.
+
+    Retourne None si aucun signe suspect. Ne bloque pas le run.
+    Heuristiques :
+      H1  taux d'infrastructure_error >= 20% (seuil arbitraire, pouvant
+          etre serre plus tard avec des donnees historiques)
+      H2  au moins 2 infra_errors dont le message contient un mot-cle
+          suspect (Connection, CDP, closed, killed, WebSocket, etc.)
+    """
+    infra_errors = [r for r in capture_results if r.get("capture_result") == "infrastructure_error"]
+    if not infra_errors or not capture_results:
+        return None
+
+    ratio = len(infra_errors) / len(capture_results)
+    suspicious_messages = []
+    for r in infra_errors:
+        msg = str(r.get("error") or "")
+        if any(k in msg for k in _INCIDENT_KEYWORDS):
+            suspicious_messages.append({"task_id": r.get("task_id"), "error_snippet": msg[:300]})
+
+    if ratio < _INCIDENT_MIN_INFRA_RATIO and len(suspicious_messages) < _INCIDENT_MIN_ABSOLUTE:
+        return None
+
+    suspect_task_ids = [r.get("task_id") for r in infra_errors]
+    incident = {
+        "type": "runner_kill_contamination_suspected",
+        "detected_at": datetime.now().isoformat(timespec="seconds"),
+        "captures_total": len(capture_results),
+        "infra_error_count": len(infra_errors),
+        "infra_error_ratio": round(ratio, 3),
+        "suspect_task_ids": suspect_task_ids,
+        "suspicious_messages": suspicious_messages[:20],
+        "reasoning": (
+            f"H1_ratio={ratio >= _INCIDENT_MIN_INFRA_RATIO} "
+            f"H2_keywords={len(suspicious_messages) >= _INCIDENT_MIN_ABSOLUTE}"
+        ),
+        "suggested_command": (
+            f"py -3.12 domautopsy_cli.py benchmark rerun --tasks "
+            f"{','.join(suspect_task_ids)} --reason contamination_suspected"
+        ),
+        "note": "Fichier LOCAL uniquement (.bu_bench_runs/ gitignore).",
+    }
+    try:
+        (run_root / "runner_incident.json").write_text(
+            json.dumps(incident, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+    return incident
