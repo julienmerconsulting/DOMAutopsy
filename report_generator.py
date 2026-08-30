@@ -510,11 +510,11 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
             stack_top = ""
             if e.get("stackTrace"):
                 fr = e["stackTrace"][0]
-                stack_top = f"{_esc(fr.get('functionName') or '?')} at {_esc(fr.get('url', '')[:80])}:{fr.get('lineNumber', '?')}"
+                stack_top = f"{_esc(fr.get('functionName') or '?')} at {_esc((fr.get('url') or '')[:80])}:{fr.get('lineNumber', '?')}"
             js_rows += f"""
             <tr>
-              <td><span class="status-badge status-fail">{_esc(e.get('text', '')[:120])}</span></td>
-              <td><code>{_esc(e.get('exception', '')[:200])}</code></td>
+              <td><span class="status-badge status-fail">{_esc((e.get('text') or '')[:120])}</span></td>
+              <td><code>{_esc((e.get('exception') or '')[:200])}</code></td>
               <td><small>{stack_top}</small></td>
             </tr>"""
 
@@ -525,8 +525,8 @@ def generate_report(clean_data, deduped_log, agent_result, scenario_name="",
             console_rows += f"""
             <tr>
               <td><span class="status-badge {badge_cls}">{_esc(level)}</span></td>
-              <td>{_esc(m.get('text', '')[:200])}</td>
-              <td><small>{_esc(m.get('url', '')[:60])}{':' + str(m['line']) if m.get('line') else ''}</small></td>
+              <td>{_esc((m.get('text') or '')[:200])}</td>
+              <td><small>{_esc((m.get('url') or '')[:60])}{':' + str(m['line']) if m.get('line') else ''}</small></td>
             </tr>"""
 
         observability_html = f"""
