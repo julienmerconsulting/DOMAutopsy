@@ -901,6 +901,10 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     # Le screencast CDP marche aussi bien en headless qu'en headed
     print_header("LANCEMENT CHROMIUM + CDP" + (" [HEADLESS]" if headless else ""))
     pw = await async_playwright().start()
+    # cdp_port est PRE-ALLOUE par le runner parent (bench) via
+    # _allocate_unique_cdp_ports (bind simultane des N sockets, aucun
+    # worker ne fait sa propre recherche -> pas de TOCTOU entre workers).
+    # Mode standalone : cdp_port passe en CLI (ex: 9222 pour Chrome dev).
     chromium_args = [f"--remote-debugging-port={cdp_port}"]
     if headless:
         # Optimisations RAM/CPU pour permettre N Chromiums en parallele
@@ -915,10 +919,63 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         ]
     else:
         chromium_args.append("--start-maximized")
-    browser = await pw.chromium.launch(headless=headless, args=chromium_args)
+    # timeout=600000 (10 min) : sur le bench, 5 Chromium lances en parallele
+    # peuvent depasser le default Playwright de 180s (contention I/O disque
+    # cold-start Windows). Sans ca, timeout=180000ms tue le worker.
+    # Journalisation : ts_before + ts_after launch + duration, ecrit dans
+    # output_dir/worker_launch.json (append). Permet de mesurer la vraie
+    # duree cold-start Chromium sous contention et distinguer collision
+    # de port (fail immediat) vs simple contention I/O (long mais reussi).
+    import time as _time
+    _ts_launch_start = _time.monotonic()
+    browser = await pw.chromium.launch(headless=headless, args=chromium_args, timeout=600000)
+    _ts_launch_end = _time.monotonic()
+    try:
+        _launch_file = Path(timing_opts.get("output_dir") or ".") / "worker_launch.json"
+        _data = json.loads(_launch_file.read_text(encoding="utf-8")) if _launch_file.exists() else {}
+        _data["ts_launch_start_monotonic"] = _ts_launch_start
+        _data["ts_launch_end_monotonic"] = _ts_launch_end
+        _data["launch_duration_s"] = round(_ts_launch_end - _ts_launch_start, 2)
+        _data["cdp_port_used"] = cdp_port
+        _launch_file.write_text(json.dumps(_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as _log_err:
+        print(f"  [WARN] worker_launch.json log echoue : {_log_err}")
     try:
         context = browser.contexts[0] if browser.contexts else await browser.new_context(no_viewport=True)
         page = context.pages[0] if context.pages else await context.new_page()
+
+        # === DIALOG HANDLER : Playwright unique proprietaire ===
+        # BU 0.13.8 PopupsWatchdog enregistre son handler CDP sur la session
+        # cible ET sur le client racine (double-register). En parallele,
+        # Playwright a un auto-handler qui tente aussi de fermer le dialog.
+        # Race condition -> ProtocolError "No dialog is showing" non-catchee
+        # dans playwright/dialog.ts 1.57 -> crash du process Node driver ->
+        # WebSocket CDP fermee -> BU stop apres 5 retries. Observe sur
+        # demoblaze (alert 'Product added' apres Add to cart).
+        # Fix : on installe UN listener explicite cote Playwright, il devient
+        # l'unique proprietaire. Comportement natif preserve (le dialog
+        # s'ouvre bien, on l'accepte pour alert/confirm/beforeunload et
+        # on dismiss pour prompt selon la policy BU). On log dans les
+        # preuves DOMAutopsy pour tracabilite.
+        dialog_log = []
+        async def _handle_dialog(dialog):
+            entry = {
+                "type": dialog.type,
+                "message": dialog.message,
+                "url": page.url,
+                "ts": int(__import__('time').time() * 1000),
+            }
+            dialog_log.append(entry)
+            try:
+                if dialog.type in ("alert", "confirm", "beforeunload"):
+                    await dialog.accept()
+                else:  # prompt : dismiss (policy alignee sur BU)
+                    await dialog.dismiss()
+            except Exception:
+                pass  # dialog deja handled ailleurs, ignore silencieusement
+        page.on("dialog", _handle_dialog)
+        # Aussi sur les futures pages (open_tab par BU)
+        context.on("page", lambda newp: newp.on("dialog", _handle_dialog))
 
         # Forcer plein ecran via CDP
         try:
@@ -937,9 +994,14 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         print(f"  Page prete : {page.url}")
 
         # -- ETAPE 2 : Injecter le DOM Listener --
-        await context.add_init_script(DOM_LISTENER_JS)
-        await page.evaluate(DOM_LISTENER_JS)
-        print(f"  DOM Listener injecte via Playwright")
+        # En bench_mode : setter window.__DOMAUTOPSY_BENCH_MODE=true AVANT
+        # le listener pour desactiver la redaction des inputs sensibles
+        # (le TS de replay a besoin des vraies valeurs pour se reconnecter).
+        bench_mode = bool((timing_opts or {}).get("bench_mode", False))
+        _bench_prelude = "window.__DOMAUTOPSY_BENCH_MODE = true;" if bench_mode else ""
+        await context.add_init_script(_bench_prelude + DOM_LISTENER_JS)
+        await page.evaluate(_bench_prelude + DOM_LISTENER_JS)
+        print(f"  DOM Listener injecte via Playwright" + (" [BENCH_MODE: pas de redaction]" if bench_mode else ""))
 
         # Via CDP direct (couvre TOUS les contextes, y compris celui de browser-use)
         try:
@@ -1103,6 +1165,14 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             llm_kwargs["base_url"] = base_url
         if api_key:
             llm_kwargs["api_key"] = api_key
+        # BU 0.13.8 default max_completion_tokens=4096 -> truncation frequente
+        # sur les steps a normalized_actions verbeuses (parabank 12 champs,
+        # todomvc 4 taches sequentielles). Passe a 16384 pour laisser place
+        # au reasoning + JSON complet sans ModelOutputTruncatedError.
+        try:
+            llm_kwargs["max_completion_tokens"] = 16384
+        except Exception:
+            pass
         llm = ChatOpenAI(**llm_kwargs)
         # Construire le BrowserProfile (browser-use 0.12+) qui porte les params de timing
         # Avant 0.12 : kwargs directement sur BrowserSession. Apres : via BrowserProfile.
@@ -1154,19 +1224,52 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         if not profile_applied:
             print(f"  [INFO] Les SPA lourdes (DuckDuckGo, Twitter...) risquent d'echouer sans timing custom")
 
-        agent_kwargs = {
-            "task": task,
-            "llm": llm,
-            "browser_session": browser_session,
-            "use_vision": use_vision,
-            "max_actions_per_step": 10,
-        }
+        # Mode BENCH : reproduit EXACTEMENT la configuration Agent du
+        # runner officiel browser-use/benchmark (frameworks/browser_use/
+        # run_task.py). Diffs cle : Browser(cdp_url=...) au lieu de
+        # BrowserSession, use_judge=False, AUCUN override step_timeout /
+        # llm_timeout / max_actions_per_step / max_steps (defaults BU).
+        # Sans ca, on handicape l'agent vs le run officiel et on obtient
+        # un taux de reussite artificiellement bas.
+        bench_mode = bool((timing_opts or {}).get("bench_mode", False))
+        if bench_mode:
+            from browser_use import Browser as _BUBrowser
+            bench_browser = _BUBrowser(cdp_url=f"http://localhost:{cdp_port}")
+            agent_kwargs = {
+                "task": task,
+                "llm": llm,
+                "browser": bench_browser,
+                "use_vision": use_vision,
+                "use_judge": False,
+                "max_actions_per_step": 4,
+                "llm_timeout": 300,
+            }
+            print(f"  [BENCH_MODE] Agent = Browser(cdp_url) + use_judge=False + max_actions_per_step=4 + llm_timeout=300s")
+        else:
+            agent_kwargs = {
+                "task": task,
+                "llm": llm,
+                "browser_session": browser_session,
+                "use_vision": use_vision,
+                "max_actions_per_step": 10,
+            }
+            step_timeout_override = (timing_opts or {}).get("step_timeout")
+            llm_timeout_override = (timing_opts or {}).get("llm_timeout")
+            if step_timeout_override:
+                agent_kwargs["step_timeout"] = int(step_timeout_override)
+            if llm_timeout_override:
+                agent_kwargs["llm_timeout"] = int(llm_timeout_override)
         try:
             agent = Agent(**agent_kwargs)
         except TypeError:
-            # Version de browser-use sans support use_vision -> fallback
-            agent_kwargs.pop("use_vision", None)
-            agent = Agent(**agent_kwargs)
+            # BU plus ancien : retire les overrides puis use_vision
+            for k in ("step_timeout", "llm_timeout", "use_judge"):
+                agent_kwargs.pop(k, None)
+            try:
+                agent = Agent(**agent_kwargs)
+            except TypeError:
+                agent_kwargs.pop("use_vision", None)
+                agent = Agent(**agent_kwargs)
 
         # -- Snapshot Performance AVANT le run (V3 phase 4) --
         perf_before = {}
@@ -1178,11 +1281,45 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             except Exception as e:
                 print(f"  [WARN] Performance.getMetrics avant : {e}")
 
-        try:
-            result = await agent.run(max_steps=max_steps)
-        except TypeError:
-            # Fallback : agent.run sans max_steps
+        # BENCH : agent.run() sans args = defaut BU officiel. Mode standard :
+        # on garde max_steps garde-fou anti-boucle.
+        import time as _t
+        _phase_agent_start = _t.monotonic()
+        if bench_mode:
             result = await agent.run()
+        else:
+            try:
+                result = await agent.run(max_steps=max_steps)
+            except TypeError:
+                result = await agent.run()
+        _phase_agent_end = _t.monotonic()
+
+        # Publication immediate agent_done.json (le browser reste vivant
+        # pour les etapes 3-7 qui ont besoin du DOM/CDP - la fermeture
+        # precoce se fait plus bas, juste avant build_clean_steps).
+        try:
+            _agent_status = "success"
+            _agent_result_str = ""
+            try:
+                _agent_result_str = str(result.final_result() or "")[:2000]
+                if _agent_result_str.upper().startswith("FAIL"):
+                    _agent_status = "fail"
+            except Exception:
+                pass
+            _agent_done = {
+                "agent_status": _agent_status,
+                "agent_result": _agent_result_str,
+                "agent_duration_s": round(_phase_agent_end - _phase_agent_start, 2),
+                "ts_agent_done_monotonic": _phase_agent_end,
+                "num_steps": (result.number_of_steps() if hasattr(result, "number_of_steps") else None),
+            }
+            _tmp = output_dir / "agent_done.json.tmp"
+            _fin = output_dir / "agent_done.json"
+            _tmp.write_text(json.dumps(_agent_done, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(_tmp, _fin)
+            print(f"  [PHASE agent] done in {_agent_done['agent_duration_s']}s ({_agent_status})")
+        except Exception as _e:
+            print(f"  [WARN] agent_done.json ecriture echouee : {_e}")
 
         # -- Snapshot Performance APRES le run --
         if 'page_cdp' in locals() and page_cdp:
@@ -1345,6 +1482,52 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         clean_steps = None
         sensitive_env_vars: list[str] = []
         if len(deduped) > 0 or bu_history:
+            # -- FERMETURE CHROMIUM PRECOCE : libere le slot navigateur AVANT
+            # le post-processing (fusion, classify, TS, rapport). Le worker
+            # Python reste vivant pour finir les artefacts, mais Chromium
+            # est tue net -> pas d'accumulation de Chromium orphelins
+            # pendant le post-processing multi-secondes. Cross-platform
+            # via psutil : browser.close() de Playwright ne propage pas
+            # toujours le kill au sous-process Chromium (bug connu Windows +
+            # peut arriver sur Linux si le node driver meurt sans propager
+            # SIGTERM). psutil.Process(pid).children.kill() fonctionne
+            # identiquement Linux/macOS/Windows.
+            _phase_close_start = _t.monotonic()
+            try:
+                _chromium_pid = None
+                _proc_attr = getattr(browser, "process", None)
+                if _proc_attr is not None:
+                    _chromium_pid = getattr(_proc_attr, "pid", None)
+                try:
+                    if hasattr(agent, "browser_session") and agent.browser_session:
+                        await agent.browser_session.close()
+                except Exception:
+                    pass
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+                if _chromium_pid:
+                    try:
+                        import psutil as _ps
+                        _p = _ps.Process(_chromium_pid)
+                        for _c in _p.children(recursive=True):
+                            try: _c.kill()
+                            except Exception: pass
+                        try: _p.kill()
+                        except Exception: pass
+                    except Exception:
+                        pass
+            except Exception as _close_e:
+                print(f"  [WARN] fermeture Chromium precoce echouee : {_close_e}")
+            _phase_close_end = _t.monotonic()
+            print(f"  [PHASE close] Chromium ferme en {round(_phase_close_end - _phase_close_start, 2)}s")
+            _phase_post_start = _t.monotonic()
+
+            # bench_mode = 100% deterministe, zero appel LLM en post-processing.
+            # Le JSON, TS et exports sont produits meme si OpenAI ne repond plus
+            # apres la fin de Browser Use. Mode standard : LLM refinement avec
+            # timeout court + fallback needs_review sur les steps ambigus.
             clean_steps, sensitive_env_vars = build_clean_steps(
                 scenario_name=scenario_name,
                 scenario_url=scenario_url,
@@ -1355,6 +1538,9 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
+                use_llm=(not bench_mode),
+                llm_timeout_s=30.0,
+                detect_sensitive=(not bench_mode),
             )
 
             clean_file = output_dir / "clean_steps.json"
@@ -1367,15 +1553,58 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             skipped = len(clean_steps.steps) - included
             print(f"  Steps : {len(clean_steps.steps)} total, {included} rejouables, {skipped} filtres")
             if sensitive_env_vars:
-                print(f"  Vars sensibles a positionner avant replay : {', '.join(sensitive_env_vars)}")
+                _bar = "=" * 72
+                # Retro-compat : accepte list[str] (ancien format) OU list[dict]
+                # (nouveau format avec context : step, selector, page, description).
+                _rows = []
+                for _v in sensitive_env_vars:
+                    if isinstance(_v, str):
+                        _rows.append({"name": _v, "selector": "?", "page": "?", "description": ""})
+                    elif isinstance(_v, dict):
+                        _rows.append(_v)
+                print(f"\n{_bar}")
+                print("  ACTION REQUISE : variables d'environnement a positionner avant replay")
+                print(f"{_bar}")
+                print(f"  DOMAutopsy a detecte {len(_rows)} champ(s) sensible(s) dans le parcours")
+                print("  (password, secret, token, api_key, credit_card, cvv, ssn, ...).")
+                print("")
+                print("  Les valeurs saisies pendant la capture ont ete REMPLACEES dans")
+                print("  test_playwright.spec.ts par des lectures d'environnement. Le TS")
+                print("  refuse de rejouer si ces variables ne sont pas positionnees.")
+                print("")
+                print("  --- Ce qu'il faut faire ---")
+                print("")
+                print("  Dans le TS il y a exactement ces reads a satisfaire :")
+                for _r in _rows:
+                    print(f"    process.env.{_r['name']}   ({_r.get('selector','?')} - {_r.get('page','?')[:60]})")
+                print("")
+                print("  Positionne chaque variable AVANT de lancer 'npx playwright test' :")
+                print("")
+                print("  Bash / macOS / Linux :")
+                for _r in _rows:
+                    print(f'    export {_r["name"]}="<valeur_pour_{_r.get("selector","?").lstrip("#.")}>"')
+                print("")
+                print("  PowerShell :")
+                for _r in _rows:
+                    print(f'    $env:{_r["name"]} = "<valeur_pour_{_r.get("selector","?").lstrip("#.")}>"')
+                print("")
+                print("  cmd.exe :")
+                for _r in _rows:
+                    print(f'    set {_r["name"]}=<valeur_pour_{_r.get("selector","?").lstrip("#.")}>')
+                print("")
+                print("  Puis lancer :  npx playwright test test_playwright.spec.ts")
+                print(f"{_bar}\n")
 
             # -- ETAPE 9a : Generer TOUJOURS test_playwright.spec.ts (canonique) --
             # C'est le format interne utilise par /api/replay/{run_id}.
+            # oracle transmis via timing_opts (corpus Real-World 7) : injecte
+            # une assertion finale expect().toContainText / toHaveURL au TS.
             spec_path = output_dir / "test_playwright.spec.ts"
             gen_result = generate_playwright_ts(
                 clean_steps=clean_steps,
                 output_path=spec_path,
                 parcours_url=scenario_url,
+                oracle=(timing_opts or {}).get("oracle"),
             )
             print(f"  test_playwright.spec.ts -> {spec_path}")
             print(f"    Steps traduits : {gen_result['included_count']}, "
@@ -1542,6 +1771,10 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "coverage_pct": coverage_summary["total_pct"] if 'coverage_summary' in locals() and coverage_summary else None,
                 "coverage_used_kb": coverage_summary["total_used"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
                 "coverage_total_kb": coverage_summary["total_size"] // 1024 if 'coverage_summary' in locals() and coverage_summary else None,
+                "oracle": (timing_opts or {}).get("oracle"),
+                "oracle_asserted": gen_result.get("oracle_asserted", False) if 'gen_result' in locals() else False,
+                "dialog_log": dialog_log if 'dialog_log' in locals() else [],
+                "dialog_count": len(dialog_log) if 'dialog_log' in locals() else 0,
                 "dom_mutations_total": (dom_mutations["attribute_modified"] + dom_mutations["child_node_inserted"] + dom_mutations["child_node_removed"]) if 'dom_mutations' in locals() else 0,
                 # Refactor Aout 2026 : pipeline unifie Playwright TS
                 "schema_version": CURRENT_SCHEMA_VERSION,
@@ -1592,6 +1825,27 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         except Exception as e:
             print(f"  Erreur fermeture browser: {e}")
         await pw.stop()
+        # Chronometrage phase post-processing (utile pour benchmark : sait
+        # exactement ou va le temps entre agent.run() et fin worker).
+        try:
+            import time as _t_end
+            if '_phase_post_start' in locals():
+                _post_dur = round(_t_end.monotonic() - _phase_post_start, 2)
+                print(f"  [PHASE post] post-processing termine en {_post_dur}s")
+                # Enrichit agent_done.json avec le breakdown final si present
+                if 'output_dir' in locals():
+                    _final = output_dir / "agent_done.json"
+                    if _final.exists():
+                        try:
+                            _data = json.loads(_final.read_text(encoding="utf-8"))
+                            _data["post_processing_duration_s"] = _post_dur
+                            if '_phase_close_start' in locals() and '_phase_close_end' in locals():
+                                _data["close_chromium_duration_s"] = round(_phase_close_end - _phase_close_start, 2)
+                            _final.write_text(json.dumps(_data, ensure_ascii=False, indent=2), encoding="utf-8")
+                        except Exception:
+                            pass
+        except Exception:
+            pass
         print("  Termine !")
 
 
