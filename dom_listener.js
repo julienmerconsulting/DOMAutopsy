@@ -41,8 +41,13 @@
     }
 
     // -- DETECTION INPUTS SENSIBLES (password, CB, etc.) --
+    // En mode BENCH (window.__DOMAUTOPSY_BENCH_MODE=true injecte avant le
+    // listener), la redaction est desactivee : on veut la vraie valeur
+    // dans le TS pour que le replay puisse se reconnecter/soumettre.
+    // Les credentials du corpus bench sont deja publics (comptes demo).
     const SENSITIVE_PATTERN = /(?:^|[\s\-_])(password|passwd|pwd|secret|token|otp|cvv|cvc|ccv|cc[\-_]?num|card[\-_]?num|ssn|sin|pin)(?:$|[\s\-_])/i;
     function isSensitiveField(el) {
+        if (window.__DOMAUTOPSY_BENCH_MODE === true) return false;
         if (!el || !el.getAttribute) return false;
         if ((el.type || '').toLowerCase() === 'password') return true;
         const ac = (el.getAttribute('autocomplete') || '').toLowerCase();
@@ -154,10 +159,33 @@
 
         // === Tier 3 : Href pour les liens ===
         if (!best && el.tagName === 'A' && el.getAttribute('href')) {
-            let href = el.getAttribute('href');
+            let rawHref = el.getAttribute('href');
+            // Detecte-t-on un token de session dans le href brut ? Si oui,
+            // le vrai <a href="..."> sur la page rendue peut aussi contenir
+            // un token (session-scoped) -> match EXACT casse. On strip pour
+            // l'affichage ET on utilise [href*="..."] (partial contains)
+            // au lieu de [href="..."] pour etre robuste a la re-attribution
+            // du token a chaque nouvelle session (cas ParaBank overview.htm;jsessionid=NEW).
+            const SESSION_TOKEN_RE = /(;jsessionid=|;jsession=|[?&](?:jsessionid|phpsessid|asp\.net_sessionid|sid|sessionid|csrftoken)=)/i;
+            const hasSessionToken = SESSION_TOKEN_RE.test(rawHref);
+            let href = rawHref.replace(/;jsessionid=[^?&#]*/i, '')
+                       .replace(/;jsession=[^?&#]*/i, '')
+                       .replace(/[?&](jsessionid|phpsessid|asp\.net_sessionid|sid|sessionid|csrftoken)=[^&#]*/gi, function(m, k, offset, s){
+                           const rest = s.slice(offset + m.length);
+                           if (m[0] === '?' && rest.startsWith('&')) return '?';
+                           if (m[0] === '?') return '';
+                           return '';
+                       })
+                       .replace(/\?$/, '');
             if (href !== '#' && href !== '/' && href !== 'javascript:void(0)' && href.length < 100) {
-                best = 'a[href="' + attrValue(href) + '"]';
-                strategy = 'href';
+                if (hasSessionToken) {
+                    // partial contains : robuste au token qui change a chaque session
+                    best = 'a[href*="' + attrValue(href) + '"]';
+                    strategy = 'href-contains';
+                } else {
+                    best = 'a[href="' + attrValue(href) + '"]';
+                    strategy = 'href';
+                }
             }
         }
 
@@ -228,6 +256,73 @@
             }
         } catch(e) { matchCount = -1; }
 
+        // Si multi-match ET c'est un input/button avec 'value' visible
+        // (ex: <input type="submit" value="Register">), enrichir avec le
+        // value pour discriminer. Cas frequent sur les formulaires legacy
+        // qui ont juste class="button" partage entre Login/Register/Cancel.
+        if (matchCount !== 1 && (tag === 'input' || tag === 'button')) {
+            let val = el.getAttribute('value');
+            if (val && val.length > 0 && val.length < 60) {
+                let valSel = tag + '[value="' + attrValue(val) + '"]';
+                try {
+                    let valCount = document.querySelectorAll(valSel).length;
+                    if (valCount === 1) {
+                        best = valSel;
+                        strategy = 'value-attr';
+                        matchCount = 1;
+                    } else if (valCount > 0 && valCount < matchCount) {
+                        // Combiner class actuelle + value pour affiner
+                        let combined = best + '[value="' + attrValue(val) + '"]';
+                        let combCount = document.querySelectorAll(combined).length;
+                        if (combCount === 1) {
+                            best = combined;
+                            strategy = 'class-value';
+                            matchCount = 1;
+                        }
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // Si multi-match sur un INPUT sans value attr : tenter des
+        // discriminants stables (placeholder, form parent id, section
+        // ancestor). Cas ex automationexercise : 2 forms sur /login,
+        // chacun avec input[name="email"] -> selecteur non-unique.
+        if (matchCount !== 1 && tag === 'input') {
+            const tryRefine = (candidate, strat) => {
+                try {
+                    const c = document.querySelectorAll(candidate).length;
+                    if (c === 1) { best = candidate; strategy = strat; matchCount = 1; return true; }
+                    if (c > 0 && c < matchCount) { best = candidate; strategy = strat; matchCount = c; }
+                } catch(e) {}
+                return false;
+            };
+            const ph = el.getAttribute('placeholder');
+            if (ph && ph.length > 0 && ph.length < 60 && matchCount !== 1) {
+                if (tryRefine(best + '[placeholder="' + attrValue(ph) + '"]', 'name-placeholder')) {}
+            }
+            if (matchCount !== 1) {
+                const form = el.closest('form');
+                if (form) {
+                    if (form.id) {
+                        tryRefine('form#' + CSS.escape(form.id) + ' ' + best, 'form-id-scope');
+                    } else if (form.getAttribute('name')) {
+                        tryRefine('form[name="' + attrValue(form.getAttribute('name')) + '"] ' + best, 'form-name-scope');
+                    } else if (form.getAttribute('action')) {
+                        const act = form.getAttribute('action');
+                        if (act.length < 60) tryRefine('form[action="' + attrValue(act) + '"] ' + best, 'form-action-scope');
+                    }
+                }
+            }
+            if (matchCount !== 1 && el.parentElement) {
+                const same = Array.from(document.querySelectorAll(best));
+                const idx = same.indexOf(el);
+                if (idx >= 0) {
+                    tryRefine(best + ':nth-of-type(' + (idx + 1) + ')', 'input-nth');
+                }
+            }
+        }
+
         // Si multi-match -> tenter XPath text-based
         let text = (el.innerText || el.textContent || '').trim();
         if (matchCount !== 1 && text && text.length > 0 && text.length < 50 && text.indexOf('\n') === -1) {
@@ -245,6 +340,74 @@
                 best = xpathText;
                 strategy = 'xpath-text';
                 matchCount = xpathCount;
+            }
+        }
+
+        // === Tier "self data-attr" (generique tous tags) ===
+        // Beaucoup de sites listent N items structurellement identiques
+        // (products grid, table rows, feed cards) ou seul un data-* de
+        // l'element identifie l'item : data-product-id, data-item-id,
+        // data-row-id, data-index, data-key. Un [data-product-id="1"]
+        // rend le selecteur unique la ou class+tag ne peuvent pas.
+        if (matchCount !== 1 && el.attributes) {
+            for (let i = 0; i < el.attributes.length; i++) {
+                const a = el.attributes[i];
+                if (!a.name.startsWith('data-')) continue;
+                if (!a.value || a.value.length === 0 || a.value.length > 60) continue;
+                const cand = '[' + a.name + '="' + attrValue(a.value) + '"]';
+                try {
+                    const c = document.querySelectorAll(cand).length;
+                    if (c === 1) {
+                        best = cand;
+                        strategy = 'self-data-attr';
+                        matchCount = 1;
+                        break;
+                    }
+                } catch(e) {}
+            }
+        }
+
+        // === Tier "ancestor scope" (generique tous tags) ===
+        // Remonter l'arbre jusqu'a trouver un ancetre avec un attribut
+        // discriminant (id, data-testid, data-*) qui, combine au selecteur
+        // courant, rend l'ensemble unique. Cas type : bouton "Add to cart"
+        // dans une carte produit dont l'ancetre proche porte data-product-id
+        // ou id="product-X". Se limite a 6 niveaux (au-dela = trop generique).
+        if (matchCount !== 1) {
+            let anc = el.parentElement;
+            let depth = 0;
+            while (anc && anc !== document.body && depth < 6) {
+                const ancCandidates = [];
+                if (anc.id) {
+                    ancCandidates.push('#' + CSS.escape(anc.id));
+                }
+                if (anc.getAttribute && anc.getAttribute('data-testid')) {
+                    ancCandidates.push('[data-testid="' + attrValue(anc.getAttribute('data-testid')) + '"]');
+                }
+                if (anc.attributes) {
+                    for (let i = 0; i < anc.attributes.length; i++) {
+                        const a = anc.attributes[i];
+                        if (!a.name.startsWith('data-')) continue;
+                        if (a.name === 'data-testid') continue;
+                        if (!a.value || a.value.length === 0 || a.value.length > 60) continue;
+                        ancCandidates.push('[' + a.name + '="' + attrValue(a.value) + '"]');
+                    }
+                }
+                for (const ancSel of ancCandidates) {
+                    const scoped = ancSel + ' ' + best;
+                    try {
+                        const c = document.querySelectorAll(scoped).length;
+                        if (c === 1) {
+                            best = scoped;
+                            strategy = 'ancestor-scope';
+                            matchCount = 1;
+                            break;
+                        }
+                    } catch(e) {}
+                }
+                if (matchCount === 1) break;
+                anc = anc.parentElement;
+                depth++;
             }
         }
 
@@ -336,6 +499,42 @@
         if (elType === 'checkbox' || elType === 'radio') return;
         let sel = getBestSelector(el);
         let sensitive = isSensitiveField(el);
+        // <select> : capture le LABEL visible de l'option choisie + index +
+        // unicite du label parmi les options. Le generateur TS emet
+        // .selectOption({label:...}) si label unique, sinon fallback index.
+        // Evite les .fill(value_technique) qui casse : (a) fill sur select
+        // throw en Playwright, (b) la value peut etre un ID ephemere
+        // (ex: ParaBank fromAccountId=15120 change a chaque register).
+        if (el.tagName === 'SELECT') {
+            let selectedIdx = el.selectedIndex;
+            let selectedOpt = selectedIdx >= 0 ? el.options[selectedIdx] : null;
+            let optionLabel = selectedOpt ? (selectedOpt.text || selectedOpt.innerText || '').trim() : '';
+            let optionValue = selectedOpt ? (selectedOpt.value || '') : '';
+            // Comptage : ce label est-il unique parmi les options ?
+            let sameLabelCount = 0;
+            for (let i = 0; i < el.options.length; i++) {
+                if ((el.options[i].text || el.options[i].innerText || '').trim() === optionLabel) sameLabelCount++;
+            }
+            saveEntry({
+                action: 'select',
+                timestamp: Date.now(),
+                tag: 'SELECT',
+                value: optionValue,           // value technique (peut etre ephemere)
+                label: optionLabel,           // texte visible - source de verite au replay
+                selectedIndex: selectedIdx,
+                optionCount: el.options.length,
+                labelIsUnique: sameLabelCount === 1,
+                selector: sel,
+                url: location.href,
+                inShadowDOM: sel.inShadowDOM,
+                attributes: {
+                    id: el.id || null,
+                    name: el.getAttribute ? el.getAttribute('name') : null,
+                    'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
+                }
+            });
+            return;
+        }
         saveEntry({
             action: 'input',
             timestamp: Date.now(),
