@@ -279,35 +279,41 @@ def cmd_benchmark_run(args):
     Custom -> execute par vagues -> replays -> rapport local."""
     from benchmark_installer import get_enc_path
     from benchmark_runner import (
-        load_bu_bench_v1_in_memory, select_custom_tasks, run_benchmark,
+        load_bu_bench_v1_in_memory, load_real_world_7,
+        select_custom_tasks, run_benchmark,
     )
     from benchmark_reporter import write_reports
     from datetime import datetime
     from pathlib import Path
 
-    try:
-        enc = get_enc_path()
-    except Exception as e:
-        print(f"[benchmark run] {e}", file=sys.stderr)
-        sys.exit(1)
-
-    # Dechiffrement en memoire uniquement
-    print(f"[benchmark] Dechiffrement en memoire de {enc.name}...")
-    all_tasks = load_bu_bench_v1_in_memory(enc)
-    print(f"[benchmark] {len(all_tasks)} taches dechiffrees.")
-
-    if args.category == "custom":
-        selected, counts, chosen = select_custom_tasks(all_tasks)
-        if chosen is None or len(selected) != 20:
-            print(f"[benchmark] Aucune categorie 'Custom' avec exactement 20 taches. Arret.", file=sys.stderr)
-            print("Categories disponibles + compteurs (aucun texte de tache expose) :")
-            for name, n in sorted(counts.items(), key=lambda x: -x[1]):
-                print(f"  {n:3d} x {name!r}")
-            sys.exit(2)
-        print(f"[benchmark] Selection : {len(selected)} taches categorie '{chosen}'.")
+    if args.source == "real-world-7":
+        # Corpus DOMAutopsy Real-World 7 (libre, sites publics)
+        selected = load_real_world_7()
+        print(f"[benchmark] Corpus Real-World 7 charge : {len(selected)} scenarios.")
     else:
-        print(f"[benchmark] Categorie '{args.category}' non supportee. Attendu : 'custom'.", file=sys.stderr)
-        sys.exit(1)
+        # Corpus BU_Bench_V1 chiffre
+        try:
+            enc = get_enc_path()
+        except Exception as e:
+            print(f"[benchmark run] {e}", file=sys.stderr)
+            sys.exit(1)
+
+        print(f"[benchmark] Dechiffrement en memoire de {enc.name}...")
+        all_tasks = load_bu_bench_v1_in_memory(enc)
+        print(f"[benchmark] {len(all_tasks)} taches dechiffrees.")
+
+        if args.category == "custom":
+            selected, counts, chosen = select_custom_tasks(all_tasks)
+            if chosen is None or len(selected) != 20:
+                print(f"[benchmark] Aucune categorie 'Custom' avec exactement 20 taches. Arret.", file=sys.stderr)
+                print("Categories disponibles + compteurs (aucun texte de tache expose) :")
+                for name, n in sorted(counts.items(), key=lambda x: -x[1]):
+                    print(f"  {n:3d} x {name!r}")
+                sys.exit(2)
+            print(f"[benchmark] Selection : {len(selected)} taches categorie '{chosen}'.")
+        else:
+            print(f"[benchmark] Categorie '{args.category}' non supportee. Attendu : 'custom'.", file=sys.stderr)
+            sys.exit(1)
 
     # Dossier de run local (gitignore)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -368,21 +374,195 @@ def cmd_benchmark_report(args):
     }, indent=2, ensure_ascii=False))
 
 
+def cmd_benchmark_rerun(args):
+    """Rejoue N taches isolement (1 seul worker a la fois, port CDP unique
+    non-collidant). Utilise APRES un run contamine (ex: kill accidentel
+    de Chromium par un process externe) pour remplacer les capture_dir
+    des taches identifiees comme faussement infra_error.
+
+    Ecrit reran.json dans le run_root avec la liste des task_ids rejoues,
+    horodatage, raison. Le rapport reste a regenerer ensuite via
+    'benchmark report' ou re-invocation de write_reports."""
+    from pathlib import Path
+    from datetime import datetime
+    from benchmark_installer import get_enc_path
+    from benchmark_runner import load_bu_bench_v1_in_memory, load_real_world_7, _run_capture_worker, _allocate_unique_cdp_ports
+
+    runs_root = Path(__file__).parent / ".bu_bench_runs"
+    if not runs_root.exists():
+        print("Aucun run dans .bu_bench_runs/", file=sys.stderr)
+        sys.exit(1)
+    if args.run == "latest":
+        runs = sorted([d for d in runs_root.iterdir() if d.is_dir()], reverse=True)
+        if not runs:
+            print("Aucun run trouve", file=sys.stderr); sys.exit(1)
+        run_root = runs[0]
+    else:
+        run_root = runs_root / args.run
+        if not run_root.is_dir():
+            print(f"Run introuvable : {run_root}", file=sys.stderr); sys.exit(1)
+
+    task_ids = [t.strip() for t in args.tasks.split(",") if t.strip()]
+    if not task_ids:
+        print("--tasks vide", file=sys.stderr); sys.exit(1)
+
+    # Auto-detect corpus : real-world-7 (JSON libre) puis BU_Bench_V1 (chiffre).
+    # Un task_id peut appartenir a l'un ou l'autre selon son prefixe (rw7-*)
+    # ou son uuid natif BU. On merge les 2 loaders pour trouver dans les 2.
+    all_tasks: list[dict] = []
+    try:
+        all_tasks.extend(load_real_world_7())
+    except Exception:
+        pass
+    try:
+        enc = get_enc_path()
+        all_tasks.extend(load_bu_bench_v1_in_memory(enc))
+    except Exception:
+        pass
+    if not all_tasks:
+        print("[rerun] Aucun corpus chargeable (ni real-world-7 ni BU_Bench_V1)", file=sys.stderr); sys.exit(1)
+    by_id = {t.get("task_id"): t for t in all_tasks}
+    missing = [tid for tid in task_ids if tid not in by_id]
+    if missing:
+        print(f"task_id inconnu dans les corpus charges : {missing}", file=sys.stderr); sys.exit(1)
+
+    ports = _allocate_unique_cdp_ports(len(task_ids), start=9400)
+    reran_entries = []
+    for i, tid in enumerate(task_ids):
+        task = by_id[tid]
+        safe_id = "".join(c if c.isalnum() or c in "-_" else "_" for c in tid)[:40]
+        out = run_root / f"capture_{safe_id}"
+        # Archive l'ancien capture_dir pour audit
+        if out.exists():
+            archive = run_root / f"capture_{safe_id}.contaminated_{datetime.now().strftime('%H%M%S')}"
+            try:
+                out.rename(archive)
+                print(f"  ancien capture_dir archive -> {archive.name}")
+            except OSError as e:
+                print(f"  [WARN] archive echouee ({e}), overwrite direct")
+
+        print(f"[rerun {i+1}/{len(task_ids)}] {tid} port={ports[i]}")
+        res = _run_capture_worker(task, out, args.capture_timeout, ports[i])
+        reran_entries.append({
+            "task_id": tid,
+            "cdp_port": ports[i],
+            "capture_result": res.get("capture_result"),
+            "duration_s": res.get("duration_s"),
+            "ts": datetime.now().isoformat(timespec="seconds"),
+        })
+        print(f"  -> {res.get('capture_result')} ({res.get('duration_s')}s)")
+
+    reran_file = run_root / "reran.json"
+    prev = []
+    if reran_file.exists():
+        try:
+            prev = json.loads(reran_file.read_text(encoding="utf-8")).get("reruns", [])
+        except Exception:
+            pass
+    prev.extend(reran_entries)
+    reran_file.write_text(json.dumps({
+        "reason": args.reason,
+        "reruns": prev,
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"[rerun] {len(reran_entries)} tache(s) rejouee(s) - trace : {reran_file}")
+
+
+def _kill_process_tree(pid: int, timeout: float = 3.0) -> dict:
+    """Tue le processus ET tous ses descendants (Chromium, Playwright node
+    driver, browser-use spawn plusieurs enfants qui survivent au kill du
+    parent - le simple terminate() du parent laisse des orphelins).
+
+    Sequence : terminate parent + enfants -> attente timeout -> kill
+    survivants. Cross-OS via psutil (Linux/macOS/Windows).
+
+    Retourne {killed_pids, still_alive} pour audit et tests.
+    """
+    import os as _os, signal as _sig
+    try:
+        import psutil
+    except ImportError:
+        try:
+            _os.kill(pid, _sig.SIGKILL if hasattr(_sig, "SIGKILL") else _sig.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+        return {"killed_pids": [pid], "still_alive": [], "psutil": False}
+
+    killed: list[int] = []
+    still_alive: list[int] = []
+    try:
+        parent = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return {"killed_pids": [], "still_alive": [], "psutil": True}
+
+    try:
+        children = parent.children(recursive=True)
+    except psutil.NoSuchProcess:
+        children = []
+    all_procs = children + [parent]
+
+    for p in all_procs:
+        try:
+            p.terminate()
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    gone, alive = psutil.wait_procs(all_procs, timeout=timeout)
+    for p in gone:
+        killed.append(p.pid)
+    for p in alive:
+        try:
+            p.kill()
+            killed.append(p.pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            still_alive.append(p.pid)
+    return {"killed_pids": killed, "still_alive": still_alive, "psutil": True}
+
+
 def cmd_benchmark_stop(args):
-    """Kill les processus benchmark en cours (workers python + Chromium
-    dans la plage CDP dynamique du benchmark)."""
-    import psutil
-    killed = 0
+    """Kill les processus benchmark en cours + TOUTE leur descendance
+    (Chromium, node driver Playwright). Utilise _kill_process_tree pour
+    garantir qu'aucun orphelin ne survit (regle Julien : arret complet
+    des processus appartenant au benchmark)."""
+    import psutil, os
+    self_pid = os.getpid()
+    roots: list[int] = []
     for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        if p.info['pid'] == self_pid:
+            continue
         try:
             cmdline = " ".join(p.info.get('cmdline') or [])
             if 'benchmark_worker.py' in cmdline or 'benchmark_runner' in cmdline:
-                print(f"  kill PID {p.info['pid']} ({p.info['name']})")
-                p.terminate()
-                killed += 1
+                roots.append(p.info['pid'])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
-    print(f"[benchmark stop] {killed} process(us) benchmark terminee(s).")
+
+    total_killed: list[int] = []
+    total_still_alive: list[int] = []
+    for pid in roots:
+        print(f"  kill tree from PID {pid}")
+        res = _kill_process_tree(pid)
+        total_killed.extend(res["killed_pids"])
+        total_still_alive.extend(res["still_alive"])
+    # Filet de securite : Chromium spawn en dehors de la descendance (rare
+    # sur Linux, plus frequent sur Windows via node driver detache).
+    chromium_orphans = []
+    for p in psutil.process_iter(['pid', 'name', 'cmdline']):
+        if p.info['pid'] == self_pid:
+            continue
+        try:
+            cmdline = " ".join(p.info.get('cmdline') or [])
+            name = (p.info.get('name') or "").lower()
+            if 'remote-debugging-port=93' in cmdline and ('chrome' in name or 'headless' in name):
+                chromium_orphans.append(p.info['pid'])
+                try: p.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied): pass
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+
+    print(f"[benchmark stop] roots={len(roots)} killed_tree={len(total_killed)} "
+          f"chromium_orphans_swept={len(chromium_orphans)} still_alive={len(total_still_alive)}")
+    if total_still_alive:
+        sys.exit(1)
 
 
 def cmd_install_runtime(args):
@@ -529,7 +709,7 @@ def main():
     p_br.add_argument("--category", default="custom", help="Categorie a executer (defaut: custom = 20 taches Custom/InteractionTests)")
     p_br.add_argument("--workers", type=int, default=5, help="Plafond GLOBAL de navigateurs simultanes (defaut: 5)")
     p_br.add_argument("--replays", type=int, default=3, help="Replays TS par tache eligible (defaut: 3)")
-    p_br.add_argument("--capture-timeout", type=float, default=900, help="Timeout par capture BU en s (defaut: 900 = 15 min)")
+    p_br.add_argument("--capture-timeout", type=float, default=1800, help="Timeout par capture BU en s (defaut: 1800 = 30 min, aligne sur browser-use/benchmark officiel)")
     p_br.set_defaults(func=cmd_benchmark_run)
 
     p_brep = bench_sub.add_parser("report", help="Affiche le rapport du run le plus recent")
@@ -538,6 +718,13 @@ def main():
 
     p_bstop = bench_sub.add_parser("stop", help="Kill les processus benchmark en cours (workers + Chromium)")
     p_bstop.set_defaults(func=cmd_benchmark_stop)
+
+    p_brerun = bench_sub.add_parser("rerun", help="Rejoue une ou plusieurs taches isolees (1 worker a la fois) et remplace leurs artefacts")
+    p_brerun.add_argument("--tasks", required=True, help="task_id ou liste separee par virgule")
+    p_brerun.add_argument("--run", default="latest", help="run cible (nom du dossier .bu_bench_runs/xxx ou 'latest')")
+    p_brerun.add_argument("--capture-timeout", type=float, default=1800)
+    p_brerun.add_argument("--reason", default="manual_rerun", help="Motif consigne dans reran.json (contamination_kill / manual_rerun / ...)")
+    p_brerun.set_defaults(func=cmd_benchmark_rerun)
 
     args = parser.parse_args()
     args.func(args)
