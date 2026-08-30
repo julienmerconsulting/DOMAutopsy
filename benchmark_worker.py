@@ -35,6 +35,17 @@ import sys
 import time
 from pathlib import Path
 
+# Force stdout/stderr en UTF-8 des le demarrage - regle memoire
+# rule-python-utf8-stdout-windows : sur Windows, sys.stdout default =
+# cp1252 qui fail silencieusement sur les caracteres UTF-8 (accents FR,
+# emojis, etc.). Sans ca, sys.stdout.write(json.dumps(...)) emet rien
+# et le parent voit un stdout vide -> classe infrastructure_error a tort.
+try:
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+
 ROOT = Path(__file__).parent
 
 
@@ -81,10 +92,48 @@ async def _run_capture(task: dict) -> dict:
     start_url = task.get("start_url", "about:blank")
     scenario_prompt = task["confirmed_task"]
     model = task.get("model", "gpt-5-mini")
-    max_steps = int(task.get("max_steps", 40))
-    max_actions_per_step = int(task.get("max_actions_per_step", 10))
-    timeout_s = float(task.get("timeout_s", 900))
-    cdp_port = int(task.get("cdp_port") or _find_free_cdp_port())
+    # BENCH : max_steps/max_actions non passes = defauts BU officiel
+    timeout_s = float(task.get("timeout_s", 1800))
+
+    # Print IMMEDIAT du texte de la tache dans worker_stdout.txt (local,
+    # gitignore) - permet de voir ce que le worker execute pendant qu'il
+    # tourne via tail worker_stdout.txt. Reste STRICTEMENT en local.
+    print("=" * 60, flush=True)
+    print(f"TASK {task_id}", flush=True)
+    print("=" * 60, flush=True)
+    print(f"[CONFIRMED_TASK]\n{scenario_prompt}", flush=True)
+    print("=" * 60, flush=True)
+    # cdp_port=0 (bench par defaut) : Chromium le choisit atomiquement via
+    # --remote-debugging-port=0, qa_explorer lit ensuite via ws_endpoint.
+    # cdp_port>0 : port fixe (mode standalone, Chrome dev perso).
+    # cdp_port absent : fallback legacy self_allocate (jamais en bench).
+    port_from_parent = task.get("cdp_port")
+    if port_from_parent is None:
+        cdp_port = _find_free_cdp_port()
+        cdp_port_source = "self_allocated_fallback"
+    else:
+        cdp_port = int(port_from_parent)
+        cdp_port_source = "chromium_delegated" if cdp_port == 0 else "parent_fixed"
+
+    # Journalisation early : pid, port, provenance, timestamp - persiste
+    # AVANT tout call reseau/browser. Permet de comparer ts_start entre
+    # workers de la meme wave (cold-start Chromium sous contention) et
+    # de recouper cdp_port_resolved (rempli par qa_explorer plus tard).
+    try:
+        (Path(output_dir) / "worker_launch.json").write_text(
+            json.dumps({
+                "task_id": task_id,
+                "pid": os.getpid(),
+                "cdp_port_requested": cdp_port,
+                "cdp_port_source": cdp_port_source,
+                "profile_mode": "temp_ephemeral_via_chromium_launch",
+                "ts_start_utc": time.strftime("%Y-%m-%dT%H:%M:%S.", time.gmtime()) + f"{int(time.time()*1000)%1000:03d}Z",
+                "ts_start_monotonic": time.monotonic(),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
 
     # OPENAI_API_KEY doit etre transmis via env par le parent
     from dotenv import load_dotenv
@@ -100,27 +149,58 @@ async def _run_capture(task: dict) -> dict:
 
     # Construit le task prompt pour qa_explorer (memes conventions que CLI)
     # start_url = about:blank pour ce benchmark - BU navigate lui-meme.
+    # NOTE : le browser demarre sur about:blank, c'est normal. NE PAS
+    # inclure about:blank dans les instructions - BU interpretait
+    # "premiere action navigate" comme incluant about:blank et bouclait.
     task_prompt = (
-        f"Va sur {start_url}\n\n"
+        f"URL DU TEST (obligatoire, publique et fonctionnelle) : {start_url}\n\n"
+        f"Ta premiere action utile doit etre : navigate vers cette URL exacte.\n"
+        f"Ne cherche pas d'URL alternative (pas de todomvc.com, pas de netlify.app,\n"
+        f"pas de recherche moteur). Si cette URL repond 404, retourne FAIL\n"
+        f"immediatement sans tenter d'autres URLs.\n\n"
         "IMPORTANT : Si un element n'est pas visible ou cliquable, "
         "scroll pour le trouver. Si un popup de cookies apparait, "
-        "accepte-le d'abord.\n\n"
+        "accepte-le d'abord. Si un element visible n'a pas d'interactive "
+        "index dans browser_state (checkbox dans liste, toggle shadow, "
+        "etc.), tu es AUTORISE a utiliser evaluate() JavaScript pour "
+        "cliquer directement - mais UN SEUL click par appel evaluate(), "
+        "pas de setTimeout, pas de boucle, pas de multi-click chaine.\n\n"
         f"{scenario_prompt}\n\n"
         "Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."
     )
 
+    # Mode BENCH : reproduit exactement la config Agent officielle
+    # browser-use/benchmark. AUCUN override step_timeout/llm_timeout/
+    # max_actions/max_steps (defaults BU). Seul use_vision reste.
+    # Timeout global par tache = 1800s (30 min, defaut officiel).
     timing_opts = {
         "min_wait": 2.0, "max_wait": 15.0, "network_idle": 3.0,
-        "max_steps": max_steps,
         "provider": "openai",
         "base_url": None,
         "api_key": api_key,
         "use_vision": True,
         "output_format": "katalon",
-        "headless": True,
+        "headless": os.getenv("BENCH_HEADED") != "1",
         "output_dir": output_dir,
         "open_report": False,
+        "bench_mode": True,
+        # Oracle final : dict {url_contains?, text_contains?} venant du corpus
+        # (Real-World 7). qa_explorer l'injecte en assertion Playwright a la
+        # fin du TS genere. Aucun LLM implique pour la validation replay.
+        "oracle": task.get("oracle"),
     }
+
+    def _persist(result: dict) -> None:
+        """Ecrit worker_result.json en local dans output_dir, garanti meme si
+        le runner parent meurt (Ctrl-C, TaskStop). Reste STRICTEMENT en
+        .bu_bench_runs/ (gitignore) - jamais push."""
+        try:
+            (Path(output_dir) / "worker_result.json").write_text(
+                json.dumps(result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
 
     t0 = time.monotonic()
     try:
@@ -145,7 +225,7 @@ async def _run_capture(task: dict) -> dict:
                 meta = json.loads(meta_path.read_text(encoding="utf-8"))
             except Exception:
                 pass
-        return {
+        result = {
             "task_id": task_id,
             "capture_result": "success",
             "agent_status": meta.get("agent_status"),
@@ -158,26 +238,46 @@ async def _run_capture(task: dict) -> dict:
             "duration_s": round(duration, 1),
             "cdp_port": cdp_port,
         }
-    except asyncio.TimeoutError:
+        _persist(result)
+        return result
+    except (asyncio.TimeoutError, TimeoutError) as e:
         duration = time.monotonic() - t0
-        return {
+        result = {
             "task_id": task_id,
             "capture_result": "timeout",
-            "error": f"Timeout apres {timeout_s}s",
+            "error": f"{type(e).__name__}: {str(e)[:400] or f'Timeout apres {timeout_s}s'}",
             "duration_s": round(duration, 1),
             "cdp_port": cdp_port,
             "output_dir": output_dir,
         }
+        _persist(result)
+        return result
     except Exception as e:
         duration = time.monotonic() - t0
-        return {
+        # Classe comme timeout aussi les erreurs OpenAI/httpx explicitement
+        # "timeout" (APITimeoutError, ReadTimeout, WriteTimeout, ConnectTimeout)
+        # pour ne pas polluer 'infrastructure_error' avec du network slow.
+        etype = type(e).__name__
+        is_timeout_like = any(k in etype for k in ("Timeout", "TimeOut"))
+        # Print traceback complet sur stderr pour debug local
+        import traceback as _tb
+        tb_str = _tb.format_exc()
+        try:
+            sys.stderr.write(f"\n[worker exception traceback]\n{tb_str}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+        result = {
             "task_id": task_id,
-            "capture_result": "infrastructure_error",
-            "error": f"{type(e).__name__}: {str(e)[:400]}",
+            "capture_result": "timeout" if is_timeout_like else "infrastructure_error",
+            "error": f"{etype}: {str(e)[:400]}",
+            "traceback": tb_str[-2000:],
             "duration_s": round(duration, 1),
             "cdp_port": cdp_port,
             "output_dir": output_dir,
         }
+        _persist(result)
+        return result
 
 
 def main():
