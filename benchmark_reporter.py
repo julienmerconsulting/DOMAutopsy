@@ -72,9 +72,14 @@ def _summarize_replays(replays_by_task: dict[str, list[dict]]) -> dict:
     total = sum(len(v) for v in replays_by_task.values())
     from collections import Counter
     c = Counter()
+    oracle_c = Counter()
     for lst in replays_by_task.values():
         for r in lst:
             c[r.get("status")] += 1
+            op = r.get("oracle_pass")
+            if op is True: oracle_c["pass"] += 1
+            elif op is False: oracle_c["fail"] += 1
+            elif op is None: oracle_c["not_reached_or_absent"] += 1
     return {
         "total_replays": total,
         "pass": c.get("pass", 0),
@@ -85,6 +90,13 @@ def _summarize_replays(replays_by_task: dict[str, list[dict]]) -> dict:
             if lst and all(r.get("status") == "pass" for r in lst)
         ),
         "tasks_covered": len(replays_by_task),
+        "oracle_pass": oracle_c["pass"],
+        "oracle_fail": oracle_c["fail"],
+        "oracle_not_reached_or_absent": oracle_c["not_reached_or_absent"],
+        "tasks_with_all_oracle_pass": sum(
+            1 for lst in replays_by_task.values()
+            if lst and all(r.get("oracle_pass") is True for r in lst)
+        ),
     }
 
 
@@ -156,6 +168,9 @@ code{{background:#0d1117;padding:2px 6px;border-radius:4px;color:#58a6ff}}
   <div class="kpi"><div class="kpi-val" style="color:#3fb950">{rep_sum['pass']}</div><div class="kpi-lbl">Replays PASS</div></div>
   <div class="kpi"><div class="kpi-val" style="color:#f85149">{rep_sum['fail']}</div><div class="kpi-lbl">Replays FAIL</div></div>
   <div class="kpi"><div class="kpi-val" style="color:#3fb950">{rep_sum['tasks_with_all_pass']}</div><div class="kpi-lbl">Taches 3/3 PASS</div></div>
+  <div class="kpi"><div class="kpi-val" style="color:#3fb950">{rep_sum.get('tasks_with_all_oracle_pass', 0)}</div><div class="kpi-lbl">Taches 3/3 ORACLE OK</div></div>
+  <div class="kpi"><div class="kpi-val" style="color:#3fb950">{rep_sum.get('oracle_pass', 0)}</div><div class="kpi-lbl">Replays ORACLE PASS</div></div>
+  <div class="kpi"><div class="kpi-val" style="color:#f85149">{rep_sum.get('oracle_fail', 0)}</div><div class="kpi-lbl">Replays ORACLE FAIL</div></div>
   <div class="kpi"><div class="kpi-val">{summary.get('duration_s')}s</div><div class="kpi-lbl">Duree totale</div></div>
 </div>
 
