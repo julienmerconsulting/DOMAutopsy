@@ -11,11 +11,14 @@
 import { defineConfig, devices } from '@playwright/test';
 
 export default defineConfig({
-  // Les specs generes vivent dans runs/<ts>_<runid>/ et sont passes en
-  // argument absolu a `npx playwright test`. On garde 'runs' comme
-  // testDir formel pour eviter le glob par defaut qui capturerait tout.
-  testDir: 'runs',
+  // Les specs generes vivent dans runs/<ts>_<runid>/ ET dans
+  // .bu_bench_runs/<ts>_bench/capture_<task>/ pour le CRD-7 bench.
+  // On elargit testDir a la racine + testMatch restrictif au nom
+  // canonique 'test_playwright.spec.ts' -> matche uniquement nos
+  // specs generees, jamais un autre .spec.ts du projet.
+  testDir: '.',
   testMatch: ['**/test_playwright.spec.ts'],
+  testIgnore: ['node_modules/**', '.git/**'],
 
   // Un seul worker : le replay doit etre deterministe et sequentiel.
   workers: 1,
@@ -54,6 +57,21 @@ export default defineConfig({
     video: 'off',
     actionTimeout: 15 * 1000,
     navigationTimeout: 30 * 1000,
+    // Locale alignee sur celle du capture (Chromium BU tourne en FR sur
+    // cette machine Windows FR-FR). Sans ca, les selecteurs captures
+    // sur du texte localise ([aria-label="Autoriser"], [aria-label="Ajouter"])
+    // ne matchent pas au replay ou le UI serait en anglais par defaut.
+    locale: process.env.PW_LOCALE ?? 'fr-FR',
+    timezoneId: process.env.PW_TZ ?? 'Europe/Paris',
+    extraHTTPHeaders: {
+      'Accept-Language': process.env.PW_ACCEPT_LANG ?? 'fr-FR,fr;q=0.9,en;q=0.8',
+    },
+    // Slow motion optionnel via env var PW_SLOWMO (ms). Utile pour la
+    // demo visuelle en headed : PW_SLOWMO=300 npx playwright test ...
+    // Sans la var, comportement production identique (aucune latence).
+    launchOptions: {
+      slowMo: process.env.PW_SLOWMO ? parseInt(process.env.PW_SLOWMO, 10) : 0,
+    },
   },
 
   projects: [
