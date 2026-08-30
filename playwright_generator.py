@@ -154,10 +154,29 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
         pl = _ts_string(parent_label)
         sv = _ts_string(sel_v or "")
         return [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
-    # PAS de .first() : Playwright en mode strict crashe sur selecteur
-    # ambigu, ce qui est le comportement voulu (faire echouer plutot que
-    # cliquer silencieusement sur le mauvais element). Le .first() ne
-    # serait justifie que pour un fallback intentionnel comme cookie().
+    # Click conditionnel : marque optional par clean_steps_builder pour les
+    # cas ou l'element peut avoir disparu entre capture et replay (ex:
+    # doublon submit apres evaluate qui a deja navigue). Pattern
+    # "if count > 0 then click" : ne casse pas si absent.
+    if isinstance(raw, dict) and raw.get("optional") is True:
+        reason = raw.get("optional_reason") or "element potentiellement absent au replay"
+        return [
+            f"    // click conditionnel : {reason}",
+            f"    const _opt = {loc};",
+            f"    if (await _opt.count() > 0) {{",
+            f"      await _opt.first().click();",
+            f"    }}",
+        ]
+    # Selecteur promu depuis BU data-attr : sur les grilles de produits,
+    # un meme data-product-id peut apparaitre 2 fois dans le DOM (bouton
+    # normal + overlay hover). BU a cliqué UN element via son index CDP -
+    # .first() reproduit le comportement sans faire crasher Playwright
+    # sur strict mode violation.
+    if step.selector is not None and getattr(step.selector, "strategy", "") == "bu-data-attr":
+        return [f"    await {loc}.first().click();"]
+    # PAS de .first() par defaut : Playwright en mode strict crashe sur
+    # selecteur ambigu, ce qui est le comportement voulu (faire echouer
+    # plutot que cliquer silencieusement sur le mauvais element).
     return [f"    await {loc}.click();"]
 
 
@@ -183,7 +202,20 @@ def _emit_select(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     loc = _locator_expr(step)
     if not loc:
         raise UnsupportedAction(step, "select sans selecteur")
+    # Preference : label visible (agnostique aux value ephemeres comme les
+    # IDs de comptes ParaBank generes a chaque register). Si le label
+    # n'etait pas unique parmi les options au moment du capture, fallback
+    # sur index (position dans la liste). Value technique en tout dernier.
+    label = getattr(step, "label", None)
+    label_unique = getattr(step, "labelIsUnique", None)
+    selected_index = getattr(step, "selectedIndex", None)
     val = step.value or ""
+    if label and label_unique is True:
+        return [f"    await {loc}.selectOption({{ label: {_ts_string(label)} }});"]
+    if label and label_unique is False and isinstance(selected_index, int) and selected_index >= 0:
+        return [f"    await {loc}.selectOption({{ index: {selected_index} }});"]
+    if label:
+        return [f"    await {loc}.selectOption({{ label: {_ts_string(label)} }});"]
     return [f"    await {loc}.selectOption({_ts_string(val)});"]
 
 
@@ -480,6 +512,7 @@ def generate_playwright_ts(
     clean_steps: CleanSteps,
     output_path: Path,
     parcours_url: str | None = None,
+    oracle: dict | None = None,
 ) -> dict[str, Any]:
     """Genere test_playwright.spec.ts a partir d'un CleanSteps valide.
 
@@ -487,6 +520,10 @@ def generate_playwright_ts(
         clean_steps: parcours valide (schema v2.0)
         output_path: chemin absolu du fichier .spec.ts a ecrire
         parcours_url: URL de depart si absente des steps (fallback goto initial)
+        oracle: dict optionnel {url_contains?, text_contains?, ...} - si fourni,
+                injecte un `test.step('[oracle]')` final avec des expect() qui
+                echoueront si l'objectif fonctionnel n'est pas atteint. Aucun
+                LLM implique - Playwright natif uniquement.
 
     Returns:
         dict avec:
@@ -495,6 +532,7 @@ def generate_playwright_ts(
           - unsupported: list[dict] des steps qu'on n'a pas pu traduire
           - included_count: nombre de steps traduits
           - skipped_count: nombre de steps marques included_in_replay=false
+          - oracle_asserted: bool
     """
     header_lines = [
         "// Genere automatiquement par DOMAutopsy - NE PAS EDITER MANUELLEMENT.",
@@ -543,15 +581,11 @@ def generate_playwright_ts(
         action_upper = (step.action or "?").upper()
         desc = (step.description or "").replace("\n", " ")[:80] or step.action
 
-        # Filtre : step conserve pour tracabilite mais non rejoue
+        # Filtre : step conserve dans le JSON pour tracabilite mais NON emit
+        # dans le TS pour eviter la pollution. La raison reste visible dans
+        # clean_steps.json (cleanup_reason) et le rapport HTML.
         if not step.included_in_replay:
             skipped_count += 1
-            reason = step.cleanup_reason or "step filtre par le nettoyage IA"
-            body_lines.append(
-                f"  // SKIPPED [{step_id}] {action_upper} - {desc}"
-            )
-            body_lines.append(f"  //   Raison : {reason}")
-            body_lines.append("")
             continue
 
         title = _ts_string(f"[{step_id}] {action_upper} - {desc}")
@@ -573,6 +607,25 @@ def generate_playwright_ts(
         body_lines.append("  });")
         body_lines.append("")
 
+    # Oracle final : injection d'assertions Playwright natives (pas de LLM).
+    # Echoue le test si l'objectif fonctionnel du scenario n'est pas atteint,
+    # meme si tous les steps ont run sans exception (protege contre les
+    # replays qui "passent" par side-effect sans avoir accompli la tache).
+    oracle_asserted = False
+    if isinstance(oracle, dict) and (oracle.get("url_contains") or oracle.get("text_contains")):
+        body_lines.append(f"  await test.step({_ts_string('[oracle] validation finale du scenario')}, async () => {{")
+        if oracle.get("url_contains"):
+            body_lines.append(
+                f"    await expect(page).toHaveURL(new RegExp({_ts_string(_re_escape(oracle['url_contains']))}), {{ timeout: 15000 }});"
+            )
+        if oracle.get("text_contains"):
+            body_lines.append(
+                f"    await expect(page.locator('body')).toContainText({_ts_string(oracle['text_contains'])}, {{ timeout: 15000 }});"
+            )
+        body_lines.append("  });")
+        body_lines.append("")
+        oracle_asserted = True
+
     body_lines.append("});")
 
     full = "\n".join(header_lines + body_lines) + "\n"
@@ -585,4 +638,13 @@ def generate_playwright_ts(
         "unsupported": unsupported,
         "included_count": included_count,
         "skipped_count": skipped_count,
+        "oracle_asserted": oracle_asserted,
     }
+
+
+def _re_escape(s: str) -> str:
+    """Echappe une chaine pour l'utiliser DANS un RegExp JavaScript.
+    Puis JSON.stringify (via _ts_string) l'echappera a nouveau pour la
+    literal string TS. Le RegExp cote JS interpretera les backslashes."""
+    import re as _re
+    return _re.escape(s)
