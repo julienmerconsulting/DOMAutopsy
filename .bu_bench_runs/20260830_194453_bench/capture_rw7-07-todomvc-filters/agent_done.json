@@ -1,0 +1,9 @@
+{
+  "agent_status": "success",
+  "agent_result": "SUCCESS: I followed the required workflow on https://demo.playwright.dev/todomvc/ and verified the final state visually. Evidence: the screenshot shows two visible todo items, 'ranger le bureau' and 'reviser Playwright', and the footer displays '2 items left'. All required steps were executed in-session: added the four tasks in the specified order, completed the first two, checked Active and Completed lists, cleared completed tasks, and returned to All. Final visual verification passed.",
+  "agent_duration_s": 179.92,
+  "ts_agent_done_monotonic": 325716.468,
+  "num_steps": 9,
+  "post_processing_duration_s": 0.05,
+  "close_chromium_duration_s": 0.12
+}

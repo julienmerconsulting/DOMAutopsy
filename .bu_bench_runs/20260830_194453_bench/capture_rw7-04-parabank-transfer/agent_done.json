@@ -1,0 +1,9 @@
+{
+  "agent_status": "success",
+  "agent_result": "Récapitulatif des actions effectuées et preuves observées (directement extraites de la session de navigation):\n- URL utilisée: https://parabank.parasoft.com/parabank/index.htm\n- Utilisateur créé: jeantest_q5K8r2\n- Compte initial automatiquement créé: 14121\n- Nouveau compte SAVINGS créé: 14232\n- Virement effectué: $100 de 14232 vers 14121 — confirmation affichée: 'Transfer Complete!'\n- Nettoyage base de données exécuté via Admin -> Database -> Clean — confirmation affichée: 'Database Cleaned'\nConclusion: Toutes les étapes demandées ont été réalisées et vérifiées dans cette session. Je retourne SUCCESS.",
+  "agent_duration_s": 178.98,
+  "ts_agent_done_monotonic": 333057.937,
+  "num_steps": 14,
+  "post_processing_duration_s": 0.06,
+  "close_chromium_duration_s": 0.48
+}
