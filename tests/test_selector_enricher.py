@@ -437,6 +437,76 @@ def test_excluded_checkbox_observation_cannot_swallow_promoted_click():
     assert excluded_check.included_in_replay is False
 
 
+def test_evaluate_pairs_delayed_check_with_identical_click_target(tmp_path):
+    evaluate_code = (
+        "document.querySelectorAll('.todo-list .toggle')[0].click()"
+    )
+    bu_history = [{
+        "metadata": {"step_start_time": 1000, "step_end_time": 1100},
+        "normalized_actions": [{
+            "action": {"evaluate": {"code": evaluate_code}},
+            "action_index": 0,
+            "interacted_element": None,
+        }],
+    }]
+
+    def _checkbox_event(action, timestamp):
+        event = {
+            "action": action,
+            "timestamp": timestamp,
+            "tag": "INPUT",
+            "value": "true" if action == "check" else None,
+            "text": "acheter du pain",
+            "parentLabel": "acheter du pain",
+            "parentLabelMatchCount": 1,
+            "isTrusted": False,
+            "attributes": {
+                "type": "checkbox",
+                "class": "toggle",
+                "aria-label": "Toggle Todo",
+            },
+            "selector": {
+                "strategy": "aria-label",
+                "value": '[aria-label="Toggle Todo"]',
+                "unique": False,
+                "matchCount": 4,
+            },
+            "url": "https://demo.playwright.dev/todomvc/",
+        }
+        if action == "click":
+            event["parentScopedMatchCount"] = 1
+        return event
+
+    # Le click tombe dans la fenetre evaluate (+500 ms), le change arrive
+    # 700 ms plus tard : ancien code promouvait seulement le click.
+    dom_log = [
+        _checkbox_event("click", 1200),
+        _checkbox_event("check", 1900),
+    ]
+    steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
+    steps, anomalies, _ = classify_steps(steps)
+
+    included_checks = [
+        step for step in steps
+        if step.action == "check" and step.included_in_replay
+    ]
+    included_clicks = [
+        step for step in steps
+        if step.action == "click" and step.included_in_replay
+    ]
+    assert len(included_checks) == 1
+    assert included_checks[0].source == "evaluate+dom"
+    assert included_checks[0].raw_payload["context_proof_from_click"]
+    assert included_clicks == []
+    assert anomalies == []
+
+    clean = CleanSteps(parcours="delayed checkbox", total_steps=len(steps), steps=steps)
+    generate_playwright_ts(clean, tmp_path / "delayed-checkbox.spec.ts")
+    body = (tmp_path / "delayed-checkbox.spec.ts").read_text(encoding="utf-8")
+    assert body.count(".setChecked(true)") == 1
+    assert '.locator("[aria-label=\\"Toggle Todo\\"]").setChecked(true)' in body
+
+
 def test_dom_event_count_replaces_duplicate_bu_click_intents(tmp_path):
     interacted = {
         "attributes": {"class": "clear-completed"},

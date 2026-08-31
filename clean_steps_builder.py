@@ -1610,6 +1610,7 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
     click compagnon afin d'emettre ``setChecked`` une seule fois.
     """
     TOLERANCE_MS = 500
+    CHECKBOX_PAIR_WINDOW_MS = 2000
     claimed: set[int] = set()
 
     for ev_index, ev in enumerate(steps):
@@ -1648,7 +1649,32 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
             (index, step) for index, step in candidates
             if step.action == "click"
         ]
-        for index, semantic_step in matching:
+        # Le change peut etre journalise apres la fenetre BU de l'evaluate
+        # alors que son click compagnon y est bien present. Chercher le
+        # check/uncheck autour du click confirme (meme fenetre que la fusion
+        # checkbox historique), pas uniquement autour du step BU.
+        semantic_matches = [
+            (index, step) for index, step in matching
+            if step.action in ("check", "uncheck")
+        ]
+        semantic_indices = {index for index, _ in semantic_matches}
+        for index, semantic_step in enumerate(steps):
+            if index == ev_index or index in claimed or index in semantic_indices:
+                continue
+            if semantic_step.action not in ("check", "uncheck"):
+                continue
+            if not _dom_orphan_matches_evaluate_target(semantic_step, selectors):
+                continue
+            if any(
+                click.timestamp is not None
+                and semantic_step.timestamp is not None
+                and abs(click.timestamp - semantic_step.timestamp) <= CHECKBOX_PAIR_WINDOW_MS
+                for _, click in strong_clicks
+            ):
+                semantic_matches.append((index, semantic_step))
+                semantic_indices.add(index)
+
+        for index, semantic_step in semantic_matches:
             if semantic_step.action not in ("check", "uncheck") or index in candidate_indices:
                 continue
             semantic_raw = (
@@ -1662,12 +1688,19 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
             companion = next((
                 click for _, click in strong_clicks
                 if click.timestamp is not None
-                and abs(click.timestamp - semantic_step.timestamp) <= TOLERANCE_MS
+                and abs(click.timestamp - semantic_step.timestamp) <= CHECKBOX_PAIR_WINDOW_MS
                 and isinstance(click.raw_payload, dict)
                 and click.raw_payload.get("parentLabel") == parent_label
                 and click.raw_payload.get("parentLabelMatchCount") == 1
                 and click.raw_payload.get("parentScopedMatchCount") == 1
-                and _steps_have_same_target(click, semantic_step)
+                and bool(_step_selector_value(click))
+                and _step_selector_value(click) == _step_selector_value(semantic_step)
+                and str(click.raw_payload.get("tag") or "").lower()
+                    == str(semantic_raw.get("tag") or "").lower()
+                and str(_step_target_attributes(click).get("type") or "").lower()
+                    == str(_step_target_attributes(semantic_step).get("type") or "").lower()
+                and str(_step_target_attributes(click).get("type") or "").lower()
+                    in ("checkbox", "radio")
             ), None)
             if companion is None:
                 continue
