@@ -1236,6 +1236,14 @@ def build_pre_cleanup_steps(
     ))
     steps = [s for _, s in steps_indexed]
 
+    # Les fusions ci-dessous inscrivent les IDs de leurs sources/cibles dans
+    # cleanup_reason et raw_payload. Stabiliser les IDs APRES le tri mais
+    # AVANT les fusions evite des references devenues fausses au renumerotage
+    # final (ex. "fusionne dans step-0022" alors que la cible est step-0020).
+    for i, step in enumerate(steps, start=1):
+        step.id = f"step-{i:04d}"
+        step.step = i
+
     # 5bis. RECONCILIATION tardive BU -> DOM : si le matching initial a
     # rate mais que le listener a observe un event trusted sur la meme cible,
     # le DOM fixe le nombre reel d'actions. Les intentions BU en doublon sont
@@ -1407,7 +1415,7 @@ def _dom_step_matches_evaluate_selector(step: Step, selector: str) -> bool:
     return False
 
 
-def _dom_orphan_is_canonical_candidate(step: Step, selectors: set[str]) -> bool:
+def _dom_orphan_matches_evaluate_target(step: Step, selectors: set[str]) -> bool:
     if step.source != "dom_orphan" or step.included_in_replay:
         return False
     if step.action not in ("click", "check", "uncheck"):
@@ -1417,8 +1425,13 @@ def _dom_orphan_is_canonical_candidate(step: Step, selectors: set[str]) -> bool:
     # isTrusted=false. Sans cette preuve causale, on ne promeut rien.
     if raw.get("isTrusted") is not False:
         return False
-    if not any(_dom_step_matches_evaluate_selector(step, selector) for selector in selectors):
+    return any(_dom_step_matches_evaluate_selector(step, selector) for selector in selectors)
+
+
+def _dom_orphan_is_canonical_candidate(step: Step, selectors: set[str]) -> bool:
+    if not _dom_orphan_matches_evaluate_target(step, selectors):
         return False
+    raw = step.raw_payload if isinstance(step.raw_payload, dict) else {}
     if step.action in ("check", "uncheck"):
         return (
             bool(raw.get("parentLabel"))
@@ -1612,14 +1625,58 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
         if not isinstance(start, int) or not isinstance(end, int):
             continue
 
+        matching: list[tuple[int, Step]] = []
         candidates: list[tuple[int, Step]] = []
         for index, candidate in enumerate(steps):
             if index == ev_index or index in claimed or candidate.timestamp is None:
                 continue
             if candidate.timestamp < start - TOLERANCE_MS or candidate.timestamp > end + TOLERANCE_MS:
                 continue
+            if _dom_orphan_matches_evaluate_target(candidate, selectors):
+                matching.append((index, candidate))
             if _dom_orphan_is_canonical_candidate(candidate, selectors):
                 candidates.append((index, candidate))
+
+        # Certains logs reels exposent la preuve contextuelle uniquement sur
+        # le click (parentScopedMatchCount=1), tandis que le change semantique
+        # check/uncheck arrive sans parentCheckboxMatchCount. Le couple est
+        # pourtant une preuve unique : meme cible, meme <li>, meme label et
+        # quelques millisecondes d'ecart. Transfere cette preuve vers le
+        # change afin d'emettre setChecked(), jamais un toggle click().
+        candidate_indices = {index for index, _ in candidates}
+        strong_clicks = [
+            (index, step) for index, step in candidates
+            if step.action == "click"
+        ]
+        for index, semantic_step in matching:
+            if semantic_step.action not in ("check", "uncheck") or index in candidate_indices:
+                continue
+            semantic_raw = (
+                semantic_step.raw_payload
+                if isinstance(semantic_step.raw_payload, dict)
+                else {}
+            )
+            parent_label = semantic_raw.get("parentLabel")
+            if not parent_label or semantic_step.timestamp is None:
+                continue
+            companion = next((
+                click for _, click in strong_clicks
+                if click.timestamp is not None
+                and abs(click.timestamp - semantic_step.timestamp) <= TOLERANCE_MS
+                and isinstance(click.raw_payload, dict)
+                and click.raw_payload.get("parentLabel") == parent_label
+                and click.raw_payload.get("parentLabelMatchCount") == 1
+                and click.raw_payload.get("parentScopedMatchCount") == 1
+                and _steps_have_same_target(click, semantic_step)
+            ), None)
+            if companion is None:
+                continue
+            semantic_raw["parentLabelMatchCount"] = 1
+            semantic_raw["parentScopedMatchCount"] = 1
+            semantic_raw["context_proof_from_click"] = companion.id
+            semantic_step.raw_payload = semantic_raw
+            candidates.append((index, semantic_step))
+            candidate_indices.add(index)
         if not candidates:
             continue
 
@@ -1702,7 +1759,10 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
     """
     FUSE_WINDOW_MS = 2000
     for i, canonical in enumerate(steps):
-        if canonical.action not in ("check", "uncheck"):
+        # Un check dom_orphan exclu n'est PAS une action canonique. L'ancienne
+        # logique pouvait s'en servir pour supprimer un click evaluate+dom
+        # valide, puis laisser les deux exclus : zero toggle au replay.
+        if canonical.action not in ("check", "uncheck") or not canonical.included_in_replay:
             continue
         ts = canonical.timestamp
         if ts is None:
@@ -1719,11 +1779,16 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
             # DOM click sur meme selecteur ou dans le meme sous-arbre
             if other.action == "click":
                 other_sel = _step_selector_value(other)
+                canonical_raw = canonical.raw_payload if isinstance(canonical.raw_payload, dict) else {}
+                other_raw = other.raw_payload if isinstance(other.raw_payload, dict) else {}
+                canonical_label = canonical_raw.get("parentLabel")
+                other_label = other_raw.get("parentLabel")
+                same_context = not canonical_label or canonical_label == other_label
                 if other_sel and canonical_sel and (
                     other_sel == canonical_sel
                     or other_sel in canonical_sel
                     or canonical_sel in other_sel
-                ):
+                ) and same_context:
                     other.included_in_replay = False
                     other.cleanup_reason = (
                         f"fusionne dans {canonical.id} (canonique check/uncheck "
@@ -1745,7 +1810,11 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
         if fused:
             raw = canonical.raw_payload or {}
             if isinstance(raw, dict):
-                raw["fused_sources"] = fused
+                merged = list(raw.get("fused_sources") or [])
+                for source_id in fused:
+                    if source_id not in merged:
+                        merged.append(source_id)
+                raw["fused_sources"] = merged
                 canonical.raw_payload = raw
 
 
@@ -1943,7 +2012,10 @@ def classify_steps(
                 and isinstance(raw.get("parentLabel"), str)
                 and bool(raw.get("parentLabel"))
                 and raw.get("parentLabelMatchCount") == 1
-                and raw.get("parentCheckboxMatchCount") == 1
+                and (
+                    raw.get("parentCheckboxMatchCount") == 1
+                    or (raw.get("parentScopedMatchCount") == 1 and bool(sel_val))
+                )
             )
             contextual_click = (
                 act == "click"

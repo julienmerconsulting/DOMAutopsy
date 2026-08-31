@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from clean_steps_builder import (
     _apply_interacted_element,
     _element_to_dict,
+    _fuse_checkbox_interactions,
     _fuse_evaluate_workarounds,
     build_pre_cleanup_steps,
     classify_steps,
@@ -334,7 +335,7 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
     }]
 
     def _event(action, timestamp, label):
-        return {
+        event = {
             "action": action,
             "timestamp": timestamp,
             "tag": "INPUT",
@@ -342,8 +343,6 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
             "text": label,
             "parentLabel": label,
             "parentLabelMatchCount": 1,
-            "parentScopedMatchCount": 1,
-            "parentCheckboxMatchCount": 1,
             "isTrusted": False,
             "attributes": {"class": "toggle", "type": "checkbox"},
             "selector": {
@@ -354,6 +353,11 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
             },
             "url": "https://demo.playwright.dev/todomvc/",
         }
+        # Reproduit le run CRD-7 reel : le click porte la preuve d'unicite
+        # dans le <li>, mais le change check n'expose pas la mesure checkbox.
+        if action == "click":
+            event["parentScopedMatchCount"] = 1
+        return event
 
     dom_log = [
         _event("click", 1100, "acheter du pain"),
@@ -373,6 +377,9 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
     ]
     assert all(step.source == "evaluate+dom" for step in checks)
     assert all(not step.replay_blocking for step in checks)
+    assert all(step.raw_payload["parentScopedMatchCount"] == 1 for step in checks)
+    assert all(step.raw_payload.get("parentCheckboxMatchCount") is None for step in checks)
+    assert all(step.raw_payload.get("context_proof_from_click") for step in checks)
     assert all(not step.included_in_replay for step in evaluates)
     assert all("fusionne en action" in step.cleanup_reason for step in evaluates)
     assert all(not step.included_in_replay for step in clicks)
@@ -382,7 +389,52 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
     generate_playwright_ts(clean, tmp_path / "evaluate-proof.spec.ts")
     body = (tmp_path / "evaluate-proof.spec.ts").read_text(encoding="utf-8")
     assert body.count(".setChecked(true)") == 2
+    assert body.count("getByRole('listitem').filter") == 2
+    assert body.count('.locator("input.toggle").setChecked(true)') == 2
     assert "page.evaluate" not in body
+
+    final_ids = {step.id for step in steps}
+    for step in evaluates:
+        referenced_id = step.cleanup_reason.rsplit(" ", 1)[-1]
+        assert referenced_id in final_ids
+
+
+def test_excluded_checkbox_observation_cannot_swallow_promoted_click():
+    selector = Selector(
+        strategy="class-scope",
+        value="input.toggle",
+        unique=False,
+        matchCount=4,
+        verifiedAtCapture=True,
+    )
+    promoted_click = Step(
+        id="step-0001",
+        action="click",
+        timestamp=1000,
+        selector=selector,
+        source="evaluate+dom",
+        included_in_replay=True,
+        raw_payload={
+            "parentLabel": "acheter du pain",
+            "parentLabelMatchCount": 1,
+            "parentScopedMatchCount": 1,
+        },
+    )
+    excluded_check = Step(
+        id="step-0002",
+        action="check",
+        timestamp=1001,
+        selector=selector,
+        source="dom_orphan",
+        included_in_replay=False,
+        cleanup_reason="observation DOM sans action Browser Use correspondante",
+        raw_payload={"parentLabel": "acheter du pain"},
+    )
+
+    _fuse_checkbox_interactions([promoted_click, excluded_check])
+
+    assert promoted_click.included_in_replay is True
+    assert excluded_check.included_in_replay is False
 
 
 def test_dom_event_count_replaces_duplicate_bu_click_intents(tmp_path):

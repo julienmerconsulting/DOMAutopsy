@@ -386,12 +386,13 @@ def _emit_check_uncheck(step: Step, sensitive_vars: dict[str, str]) -> list[str]
     au lieu de le toggle. IDEMPOTENT : rejouer 2 fois donne le meme etat,
     contrairement a check()+click() qui inverserait.
 
-    Pattern preferre quand le DOM listener a capture le contexte parent
-    (parentLabel) - typique TodoMVC :
+    Pattern prefere quand le DOM listener a mesure un seul checkbox dans le
+    parent (parentLabel) - typique TodoMVC :
         page.getByRole('listitem').filter({hasText: label})
             .getByRole('checkbox').setChecked(bool)
-    Cette forme est UNIQUE meme quand [aria-label='Toggle Todo'] matche
-    4 elements (strict mode Playwright content).
+    Si seule l'unicite du selecteur exact dans le parent a ete mesuree, on
+    conserve ce selecteur dans le meme scope au lieu d'inventer que le role
+    checkbox est lui aussi unique.
 
     Fallback sans parentLabel : locator classique .setChecked(bool).
     """
@@ -409,6 +410,18 @@ def _emit_check_uncheck(step: Step, sensitive_vars: dict[str, str]) -> list[str]
         return [
             f"    await page.getByRole('listitem').filter({{ hasText: {pl_escaped} }}).getByRole('checkbox').setChecked({checked_bool});"
         ]
+    if (
+        parent_label
+        and raw.get("parentLabelMatchCount") == 1
+        and raw.get("parentScopedMatchCount") == 1
+    ):
+        sel_v, _ = _selector_value_and_type(step)
+        if sel_v:
+            pl_escaped = _ts_string(parent_label)
+            selector_escaped = _ts_string(sel_v)
+            return [
+                f"    await page.getByRole('listitem').filter({{ hasText: {pl_escaped} }}).locator({selector_escaped}).setChecked({checked_bool});"
+            ]
     loc = _locator_expr(step)
     if not loc:
         raise UnsupportedAction(step, f"{step.action} sans selecteur ni parentLabel")
