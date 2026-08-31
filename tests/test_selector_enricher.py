@@ -308,6 +308,247 @@ def test_temporally_adjacent_evaluate_is_not_fused_without_same_target():
     assert evaluate.cleanup_reason is None
 
 
+def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
+    evaluate_first = (
+        "(function(){var firstToggle=document.querySelectorAll('.todo-list .toggle')[0];"
+        "firstToggle.checked=true;firstToggle.dispatchEvent(new Event('change',{bubbles:true}));})()"
+    )
+    evaluate_second = (
+        "(function(){var els=document.querySelectorAll('.todo-list .toggle');"
+        "els[1].click();})()"
+    )
+    bu_history = [{
+        "metadata": {"step_start_time": 1000, "step_end_time": 1300},
+        "normalized_actions": [
+            {
+                "action": {"evaluate": {"code": evaluate_first}},
+                "action_index": 0,
+                "interacted_element": None,
+            },
+            {
+                "action": {"evaluate": {"code": evaluate_second}},
+                "action_index": 1,
+                "interacted_element": None,
+            },
+        ],
+    }]
+
+    def _event(action, timestamp, label):
+        return {
+            "action": action,
+            "timestamp": timestamp,
+            "tag": "INPUT",
+            "value": "true" if action == "check" else None,
+            "text": label,
+            "parentLabel": label,
+            "parentLabelMatchCount": 1,
+            "parentScopedMatchCount": 1,
+            "parentCheckboxMatchCount": 1,
+            "isTrusted": False,
+            "attributes": {"class": "toggle", "type": "checkbox"},
+            "selector": {
+                "strategy": "class-scope",
+                "value": "input.toggle",
+                "unique": False,
+                "matchCount": 4,
+            },
+            "url": "https://demo.playwright.dev/todomvc/",
+        }
+
+    dom_log = [
+        _event("click", 1100, "acheter du pain"),
+        _event("check", 1101, "acheter du pain"),
+        _event("click", 1200, "appeler le medecin"),
+        _event("check", 1201, "appeler le medecin"),
+    ]
+    steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
+    steps, anomalies, _ = classify_steps(steps)
+
+    checks = [step for step in steps if step.action == "check" and step.included_in_replay]
+    evaluates = [step for step in steps if step.action == "evaluate"]
+    clicks = [step for step in steps if step.action == "click"]
+    assert [step.raw_payload["parentLabel"] for step in checks] == [
+        "acheter du pain",
+        "appeler le medecin",
+    ]
+    assert all(step.source == "evaluate+dom" for step in checks)
+    assert all(not step.replay_blocking for step in checks)
+    assert all(not step.included_in_replay for step in evaluates)
+    assert all("fusionne en action" in step.cleanup_reason for step in evaluates)
+    assert all(not step.included_in_replay for step in clicks)
+    assert not any("non verifie unique" in anomaly for anomaly in anomalies)
+
+    clean = CleanSteps(parcours="evaluate dom proof", total_steps=len(steps), steps=steps)
+    generate_playwright_ts(clean, tmp_path / "evaluate-proof.spec.ts")
+    body = (tmp_path / "evaluate-proof.spec.ts").read_text(encoding="utf-8")
+    assert body.count(".setChecked(true)") == 2
+    assert "page.evaluate" not in body
+
+
+def test_dom_event_count_replaces_duplicate_bu_click_intents(tmp_path):
+    interacted = {
+        "attributes": {"class": "clear-completed"},
+        "selector_candidates": [{
+            "value": "footer.footer button",
+            "strategy": "ancestor-scope",
+            "selectorType": "css",
+            "unique": True,
+            "matchCount": 1,
+            "verifiedAtCapture": True,
+            "stability": "medium",
+            "priority": 27,
+        }],
+    }
+    bu_history = []
+    for start in (1000, 1200):
+        bu_history.append({
+            "metadata": {"step_start_time": start, "step_end_time": start + 100},
+            "normalized_actions": [{
+                "action": {"click_element": {"index": 7}},
+                "action_index": 0,
+                "interacted_element": interacted,
+            }],
+        })
+    dom_log = [{
+        "action": "click",
+        "timestamp": 2000,
+        "tag": "BUTTON",
+        "text": "Clear completed",
+        "isTrusted": True,
+        "attributes": {"class": "clear-completed"},
+        "selector": {
+            "strategy": "class-scope",
+            "value": "button.clear-completed",
+            "unique": True,
+            "matchCount": 1,
+        },
+        "url": "https://demo.playwright.dev/todomvc/",
+    }]
+
+    steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
+    steps, anomalies, _ = classify_steps(steps)
+    included_clicks = [step for step in steps if step.action == "click" and step.included_in_replay]
+    bu_clicks = [step for step in steps if step.source == "browser_use_history"]
+    assert len(included_clicks) == 1
+    assert included_clicks[0].source == "bu+dom-reconciled"
+    assert all(not step.included_in_replay for step in bu_clicks)
+    assert anomalies == []
+
+    clean = CleanSteps(parcours="dedup confirmed clicks", total_steps=len(steps), steps=steps)
+    generate_playwright_ts(clean, tmp_path / "dedup-clicks.spec.ts")
+    body = (tmp_path / "dedup-clicks.spec.ts").read_text(encoding="utf-8")
+    assert body.count(".click();") == 1
+
+
+def test_matched_dom_event_absorbs_duplicate_bu_click_intent(tmp_path):
+    interacted = {
+        "attributes": {"class": "clear-completed"},
+        "selector_candidates": [{
+            "value": "footer.footer button",
+            "strategy": "ancestor-scope",
+            "selectorType": "css",
+            "unique": True,
+            "matchCount": 1,
+            "verifiedAtCapture": True,
+            "stability": "medium",
+            "priority": 27,
+        }],
+    }
+    bu_history = [
+        {
+            "metadata": {"step_start_time": 1000, "step_end_time": 1100},
+            "normalized_actions": [{
+                "action": {"click_element": {"index": 7}},
+                "action_index": 0,
+                "interacted_element": interacted,
+            }],
+        },
+        {
+            "metadata": {"step_start_time": 1200, "step_end_time": 1300},
+            "normalized_actions": [{
+                "action": {"click_element": {"index": 7}},
+                "action_index": 0,
+                "interacted_element": interacted,
+            }],
+        },
+    ]
+    dom_log = [{
+        "action": "click",
+        "timestamp": 1050,
+        "tag": "BUTTON",
+        "text": "Clear completed",
+        "isTrusted": True,
+        "attributes": {"class": "clear-completed"},
+        "selector": {
+            "strategy": "class-scope",
+            "value": "button.clear-completed",
+            "unique": True,
+            "matchCount": 1,
+        },
+        "url": "https://demo.playwright.dev/todomvc/",
+    }]
+
+    steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
+    steps, anomalies, _ = classify_steps(steps)
+    included_clicks = [step for step in steps if step.action == "click" and step.included_in_replay]
+    assert len(included_clicks) == 1
+    assert included_clicks[0].source == "bu+dom-reconciled"
+    assert included_clicks[0].selector.value == "footer.footer button"
+    assert anomalies == []
+
+    clean = CleanSteps(parcours="matched event wins", total_steps=len(steps), steps=steps)
+    generate_playwright_ts(clean, tmp_path / "matched-event.spec.ts")
+    body = (tmp_path / "matched-event.spec.ts").read_text(encoding="utf-8")
+    assert body.count(".click();") == 1
+
+
+def test_shared_button_type_is_not_target_identity():
+    interacted = {
+        "attributes": {"class": "save-profile", "type": "button"},
+        "selector_candidates": [{
+            "value": "button.save-profile",
+            "strategy": "class-scope",
+            "unique": True,
+            "matchCount": 1,
+            "verifiedAtCapture": True,
+            "stability": "medium",
+            "priority": 27,
+        }],
+    }
+    bu_history = [{
+        "metadata": {"step_start_time": 1000, "step_end_time": 1100},
+        "normalized_actions": [{
+            "action": {"click_element": {"index": 3}},
+            "action_index": 0,
+            "interacted_element": interacted,
+        }],
+    }]
+    dom_log = [{
+        "action": "click",
+        "timestamp": 1050,
+        "tag": "BUTTON",
+        "text": "Cancel",
+        "isTrusted": True,
+        "attributes": {"class": "cancel-dialog", "type": "button"},
+        "selector": {
+            "strategy": "class-scope",
+            "value": "button.cancel-dialog",
+            "unique": True,
+            "matchCount": 1,
+        },
+        "url": "https://example.test/settings",
+    }]
+
+    steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
+    included = [step for step in steps if step.included_in_replay]
+    orphans = [step for step in steps if step.source == "dom_orphan"]
+    assert len(included) == 1
+    assert included[0].source == "browser_use_history"
+    assert included[0].selector.value == "button.save-profile"
+    assert len(orphans) == 1
+    assert not orphans[0].included_in_replay
+
+
 def test_bu_data_attribute_click_never_uses_first(tmp_path):
     step = Step(
         id="step-0001",

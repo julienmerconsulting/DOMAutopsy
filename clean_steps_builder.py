@@ -395,7 +395,10 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     # parentLabel : contexte capture par le DOM listener pour les
     # change events sur checkbox/radio (permet la desambiguisation
     # ulterieure dans les listes type TodoMVC).
-    raw = {}
+    raw = {
+        "tag": entry.get("tag"),
+        "attributes": entry.get("attributes") if isinstance(entry.get("attributes"), dict) else {},
+    }
     if "isTrusted" in entry:
         raw["isTrusted"] = bool(entry.get("isTrusted"))
     if entry.get("parentLabel"):
@@ -982,9 +985,16 @@ def build_pre_cleanup_steps(
         if not isinstance(dom_attrs, dict) or not dom_attrs:
             return True
         # 1) Refus immediat si mismatch prouve sur un attr discriminant
+        # role/type ne sont que des gardes : leur egalite est trop courante
+        # pour prouver l'identite (plusieurs buttons/checkboxes par page).
+        for key in ("role", "type"):
+            bu_v = bu_attrs.get(key)
+            dom_v = dom_attrs.get(key)
+            if bu_v and dom_v and bu_v != dom_v:
+                return False
         discriminants = {
             key for key in set(bu_attrs) | set(dom_attrs)
-            if key in ("id", "name", "href", "aria-label", "placeholder", "role", "type",
+            if key in ("id", "name", "href", "aria-label", "placeholder",
                        "data-testid", "data-qa", "data-test", "data-cy")
             or key.startswith("data-")
         }
@@ -1162,6 +1172,26 @@ def build_pre_cleanup_steps(
 
             if step is None:
                 continue
+            # Fenetre d'execution BU conservee pour etablir une causalite
+            # exacte entre un evaluate et les events DOM synchrones qu'il a
+            # effectivement declenches. Le timestamp du step seul correspond
+            # au debut du lot et ne suffit pas pour les multi-actions.
+            if step.source in ("browser_use_history", "bu+dom"):
+                raw = step.raw_payload if isinstance(step.raw_payload, dict) else {}
+                # Indispensable au rapprochement tardif lorsqu'aucun event
+                # DOM n'est tombe dans la fenetre initiale.
+                if isinstance(per_action_element, dict):
+                    raw["interacted_element"] = per_action_element
+                # Ne pollue pas les anciens payloads sans metadata : certains
+                # consommateurs les utilisent comme representation brute de
+                # l'action inconnue.
+                if start_ms is not None or end_ms is not None:
+                    raw["bu_step_start_time"] = start_ms
+                    raw["bu_step_end_time"] = end_ms
+                    raw["bu_action_index"] = a_idx
+                if na.get("action_result") is not None:
+                    raw["bu_action_result"] = na.get("action_result")
+                step.raw_payload = raw
             steps.append(step)
             if step.url:
                 current_url = step.url
@@ -1206,7 +1236,19 @@ def build_pre_cleanup_steps(
     ))
     steps = [s for _, s in steps_indexed]
 
-    # 5bis. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
+    # 5bis. RECONCILIATION tardive BU -> DOM : si le matching initial a
+    # rate mais que le listener a observe un event trusted sur la meme cible,
+    # le DOM fixe le nombre reel d'actions. Les intentions BU en doublon sont
+    # absorbees dans les events confirmes.
+    _reconcile_bu_actions_with_dom_evidence(steps)
+
+    # 5ter. PROMOTION evaluate -> preuves DOM : un evaluate n'est jamais
+    # rejoue tel quel. En revanche, les events DOM non-trusted qu'il a
+    # effectivement declenches dans sa fenetre BU peuvent devenir les
+    # actions canoniques deterministes.
+    _promote_dom_events_confirmed_by_evaluate(steps)
+
+    # 5quater. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
     # arrivent proches sur la meme famille selecteur, ces 3 sources
     # observent UNE SEULE interaction utilisateur. Le change porte la
     # semantique (checked bool) + parentLabel, on le garde comme step
@@ -1214,7 +1256,7 @@ def build_pre_cleanup_steps(
     # False + raw_payload.fused_sources trace les preuves fusionnees.
     _fuse_checkbox_interactions(steps)
 
-    # 5ter. FUSION GENERIQUE : les evaluate JS BU qui font click()/type()
+    # 5quinquies. FUSION GENERIQUE : les evaluate JS BU qui font click()/type()
     # sur un element deja capture par le DOM listener (workaround agent
     # apres echec du click direct). Rejouer les 2 = double action.
     _fuse_evaluate_workarounds(steps)
@@ -1245,6 +1287,22 @@ _EVALUATE_SELECTOR_RE = re.compile(
     re.DOTALL,
 )
 _EVALUATE_ID_RE = re.compile(r"getElementById\s*\(\s*(['\"])(.*?)\1\s*\)", re.DOTALL)
+_EVALUATE_MUTATION_RE = re.compile(
+    r"(?:\.click\s*\(|\.checked\s*=|dispatchEvent\s*\(\s*new\s+(?:MouseEvent|Event)\s*\(\s*['\"](?:click|change)['\"])",
+    re.IGNORECASE | re.DOTALL,
+)
+_EVALUATE_DIRECT_INDEX_RE = re.compile(
+    r"querySelectorAll\s*\(\s*(['\"])(.*?)\1\s*\)\s*\[\s*(\d+)\s*\]",
+    re.DOTALL,
+)
+_EVALUATE_COLLECTION_RE = re.compile(
+    r"(?:var|let|const)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:Array\.from\s*\(\s*)?"
+    r"document\.querySelectorAll\s*\(\s*(['\"])(.*?)\2\s*\)\s*\)?",
+    re.DOTALL,
+)
+_CSS_ATTR_PART_RE = re.compile(
+    r"\[([A-Za-z_:][-A-Za-z0-9_:.]*)(?:\s*=\s*(['\"])(.*?)\2)?\]"
+)
 
 
 def _selectors_referenced_by_evaluate(code: str | None) -> set[str]:
@@ -1257,6 +1315,365 @@ def _selectors_referenced_by_evaluate(code: str | None) -> set[str]:
         for match in _EVALUATE_ID_RE.finditer(code)
     )
     return selectors
+
+
+def _evaluate_target_limit(code: str) -> int | None:
+    """Nombre maximal de cibles statiquement identifiables dans le JS.
+
+    ``None`` signifie une boucle explicite (forEach), auquel cas tous les
+    events compatibles de la fenetre peuvent etre consommes. Sans index
+    explicite, on reste conservateur et n'autorise qu'une cible.
+    """
+    if re.search(r"\.(?:forEach|map)\s*\(", code):
+        return None
+    indexed: set[tuple[str, int]] = {
+        (match.group(2), int(match.group(3)))
+        for match in _EVALUATE_DIRECT_INDEX_RE.finditer(code)
+    }
+    for collection in _EVALUATE_COLLECTION_RE.finditer(code):
+        var_name, selector = collection.group(1), collection.group(3)
+        use_re = re.compile(
+            rf"\b{re.escape(var_name)}\s*(?:\[\s*(\d+)\s*\]|\.item\s*\(\s*(\d+)\s*\))"
+        )
+        for use in use_re.finditer(code):
+            raw_index = use.group(1) or use.group(2)
+            indexed.add((selector, int(raw_index)))
+    return max(1, len(indexed))
+
+
+def _terminal_css_compounds(selector: str) -> list[str]:
+    """Retourne les composantes terminales simples des groupes CSS."""
+    out: list[str] = []
+    for group in selector.split(","):
+        group = group.strip()
+        if not group:
+            continue
+        # Le dernier compound suffit pour verifier l'element event target ;
+        # la causalite temporelle/non-trusted prouve le reste de la chaine.
+        parts = re.split(r"\s+|\s*[>+~]\s*", group)
+        tail = next((part for part in reversed(parts) if part), "")
+        tail = re.sub(r":(?:nth-child|nth-of-type|eq)\([^)]*\)", "", tail)
+        tail = tail.replace(":visible", "")
+        if tail:
+            out.append(tail)
+    return out
+
+
+def _dom_step_matches_evaluate_selector(step: Step, selector: str) -> bool:
+    """Verifie le compound terminal CSS contre l'event DOM capture."""
+    step_selector = _step_selector_value(step) or ""
+    if selector == step_selector:
+        return True
+
+    raw = step.raw_payload if isinstance(step.raw_payload, dict) else {}
+    attrs = raw.get("attributes") if isinstance(raw.get("attributes"), dict) else {}
+    tag = str(raw.get("tag") or "").lower()
+    classes = set(str(attrs.get("class") or "").split())
+
+    for tail in _terminal_css_compounds(selector):
+        tag_match = re.match(r"^([A-Za-z][\w-]*)", tail)
+        expected_tag = tag_match.group(1).lower() if tag_match else None
+        expected_id = next(iter(re.findall(r"#([A-Za-z0-9_-]+)", tail)), None)
+        expected_classes = set(re.findall(r"\.([A-Za-z0-9_-]+)", tail))
+        expected_attrs = [
+            (match.group(1), match.group(3))
+            for match in _CSS_ATTR_PART_RE.finditer(tail)
+        ]
+        has_signal = bool(expected_tag or expected_id or expected_classes or expected_attrs)
+        if not has_signal:
+            continue
+
+        if expected_tag and tag and expected_tag != tag:
+            continue
+        if expected_id and attrs.get("id") != expected_id:
+            continue
+        if expected_classes and classes and not expected_classes.issubset(classes):
+            continue
+        if expected_classes and not classes:
+            if not all(f".{name}" in step_selector for name in expected_classes):
+                continue
+        mismatch = False
+        for name, value in expected_attrs:
+            if name not in attrs:
+                if f"[{name}" not in step_selector:
+                    mismatch = True
+                    break
+            elif value is not None and str(attrs.get(name)) != value:
+                mismatch = True
+                break
+        if mismatch:
+            continue
+        return True
+    return False
+
+
+def _dom_orphan_is_canonical_candidate(step: Step, selectors: set[str]) -> bool:
+    if step.source != "dom_orphan" or step.included_in_replay:
+        return False
+    if step.action not in ("click", "check", "uncheck"):
+        return False
+    raw = step.raw_payload if isinstance(step.raw_payload, dict) else {}
+    # Les events declenches par element.click()/dispatchEvent() sont
+    # isTrusted=false. Sans cette preuve causale, on ne promeut rien.
+    if raw.get("isTrusted") is not False:
+        return False
+    if not any(_dom_step_matches_evaluate_selector(step, selector) for selector in selectors):
+        return False
+    if step.action in ("check", "uncheck"):
+        return (
+            bool(raw.get("parentLabel"))
+            and raw.get("parentLabelMatchCount") == 1
+            and raw.get("parentCheckboxMatchCount") == 1
+        ) or _selector_is_verified_unique(step.selector)
+    return (
+        bool(raw.get("parentLabel"))
+        and raw.get("parentLabelMatchCount") == 1
+        and raw.get("parentScopedMatchCount") == 1
+    ) or _selector_is_verified_unique(step.selector)
+
+
+_TARGET_CLASS_BLACKLIST = {
+    "active", "selected", "current", "visible", "hidden", "show", "open",
+    "btn", "button", "link", "input", "form-control", "container", "row",
+    "col", "flex", "grid", "primary", "secondary", "default",
+}
+
+
+def _step_target_attributes(step: Step) -> dict[str, Any]:
+    raw = step.raw_payload if isinstance(step.raw_payload, dict) else {}
+    direct = raw.get("attributes")
+    if isinstance(direct, dict) and direct:
+        return direct
+    interacted = raw.get("interacted_element")
+    if isinstance(interacted, dict):
+        attrs = interacted.get("attributes")
+        if isinstance(attrs, dict):
+            return attrs
+    return {}
+
+
+def _steps_have_same_target(left: Step, right: Step) -> bool:
+    """Identite de cible prouvee par locator ou attribut discriminant."""
+    left_selector = _step_selector_value(left) or ""
+    right_selector = _step_selector_value(right) or ""
+    if left_selector and right_selector and left_selector == right_selector:
+        return True
+
+    left_attrs = _step_target_attributes(left)
+    right_attrs = _step_target_attributes(right)
+    # ``type`` et ``role`` servent uniquement de gardes de compatibilite :
+    # deux boutons (ou deux checkboxes) partagent couramment ces valeurs et
+    # cela ne prouve jamais qu'ils designent le meme noeud.
+    compatibility_guards = ("type", "role")
+    for key in compatibility_guards:
+        left_value = left_attrs.get(key)
+        right_value = right_attrs.get(key)
+        if left_value and right_value and left_value != right_value:
+            return False
+
+    discriminants = {
+        key for key in set(left_attrs) | set(right_attrs)
+        if key in ("id", "name", "href", "aria-label", "placeholder")
+        or key.startswith("data-")
+    }
+    matched = False
+    for key in discriminants:
+        left_value = left_attrs.get(key)
+        right_value = right_attrs.get(key)
+        if left_value and right_value and left_value != right_value:
+            return False
+        if left_value and right_value and left_value == right_value:
+            matched = True
+    if matched:
+        return True
+
+    left_classes = set(str(left_attrs.get("class") or "").split()) - _TARGET_CLASS_BLACKLIST
+    right_classes = set(str(right_attrs.get("class") or "").split()) - _TARGET_CLASS_BLACKLIST
+    if left_classes and right_classes and left_classes & right_classes:
+        return True
+
+    # Deux locators scopes differents peuvent finir sur le meme compound
+    # exact (ex. footer.footer button.clear-completed).
+    if left_selector and right_selector:
+        left_tail = set(_terminal_css_compounds(left_selector))
+        right_tail = set(_terminal_css_compounds(right_selector))
+        if left_tail & right_tail:
+            return True
+    return False
+
+
+def _same_document(left: Step, right: Step) -> bool:
+    left_url = (left.page or left.url or "").split("#", 1)[0]
+    right_url = (right.page or right.url or "").split("#", 1)[0]
+    return not left_url or not right_url or left_url == right_url
+
+
+def _reconcile_bu_actions_with_dom_evidence(steps: list[Step]) -> None:
+    """Remplace les intentions BU dupliquees par le nombre d'events reels.
+
+    Un event DOM ``isTrusted=true`` sur la meme cible est la preuve qu'une
+    action Playwright/BU a effectivement eu lieu. Quand le premier matching
+    temporel l'a rate, on promeut l'event orphelin et on absorbe toutes les
+    copies BU de cette cible. Ainsi deux tentatives BU + un seul event DOM
+    produisent exactement un seul step de replay.
+    """
+    supported = {"click", "input", "select", "check", "uncheck"}
+    bu_steps = [
+        step for step in steps
+        if step.source == "browser_use_history"
+        and step.included_in_replay
+        and step.action in supported
+    ]
+    dom_evidence = [
+        step for step in steps
+        if step.source in ("dom_orphan", "bu+dom")
+        and step.action in supported
+        and isinstance(step.raw_payload, dict)
+        and step.raw_payload.get("isTrusted") is True
+    ]
+
+    for evidence in dom_evidence:
+        matches = [
+            bu for bu in bu_steps
+            if bu.action == evidence.action
+            and _same_document(bu, evidence)
+            and _steps_have_same_target(bu, evidence)
+        ]
+        if not matches:
+            continue
+
+        def _distance(bu: Step) -> tuple[int, int]:
+            raw = bu.raw_payload if isinstance(bu.raw_payload, dict) else {}
+            start = raw.get("bu_step_start_time")
+            end = raw.get("bu_step_end_time")
+            inside = (
+                isinstance(start, int)
+                and isinstance(end, int)
+                and evidence.timestamp is not None
+                and start - 500 <= evidence.timestamp <= end + 500
+            )
+            distance = abs((bu.timestamp or 0) - (evidence.timestamp or 0))
+            return (0 if inside else 1, distance)
+
+        best_bu = min(matches, key=_distance)
+        evidence.included_in_replay = True
+        evidence.replay_blocking = False
+        evidence.source = "bu+dom-reconciled"
+        evidence.cleanup_reason = None
+        evidence_raw = evidence.raw_payload if isinstance(evidence.raw_payload, dict) else {}
+        fused_sources = list(evidence_raw.get("fused_sources") or [])
+
+        # Reutilise le meilleur candidat live BU seulement s'il ameliore la
+        # preuve DOM, exactement comme dans le matching principal.
+        best_raw = best_bu.raw_payload if isinstance(best_bu.raw_payload, dict) else {}
+        interacted = best_raw.get("interacted_element")
+        live_selector = _verified_selector_from_element(interacted if isinstance(interacted, dict) else None)
+        if live_selector is not None and (
+            not _selector_is_verified_unique(evidence.selector)
+            or _selector_rank(live_selector) < _selector_rank(evidence.selector)
+        ):
+            evidence.selector = live_selector
+            evidence.selectorType = "xpath" if live_selector.strategy == "xpath" else "css"
+        if isinstance(interacted, dict):
+            evidence_raw["interacted_element"] = interacted
+
+        for bu in matches:
+            bu.included_in_replay = False
+            bu.replay_blocking = False
+            bu.cleanup_reason = f"fusionne dans {evidence.id} (event DOM trusted confirme)"
+            if bu.id not in fused_sources:
+                fused_sources.append(bu.id)
+        evidence_raw["fused_sources"] = fused_sources
+        evidence.raw_payload = evidence_raw
+
+
+def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
+    """Convertit l'effet DOM prouve d'un evaluate en action canonique.
+
+    Le JavaScript reste interdit dans le replay. Seuls des events DOM
+    ``isTrusted=false`` observes dans la fenetre exacte du step BU, ciblant
+    le meme compound CSS et disposant d'une preuve de ciblage unique, peuvent
+    etre promus. Pour une checkbox, ``check/uncheck`` gagne toujours sur le
+    click compagnon afin d'emettre ``setChecked`` une seule fois.
+    """
+    TOLERANCE_MS = 500
+    claimed: set[int] = set()
+
+    for ev_index, ev in enumerate(steps):
+        if ev.action != "evaluate" or not ev.included_in_replay:
+            continue
+        code = ev.value or ""
+        selectors = _selectors_referenced_by_evaluate(code)
+        if not selectors or not _EVALUATE_MUTATION_RE.search(code):
+            continue
+        raw = ev.raw_payload if isinstance(ev.raw_payload, dict) else {}
+        start = raw.get("bu_step_start_time")
+        end = raw.get("bu_step_end_time")
+        if not isinstance(start, int) or not isinstance(end, int):
+            continue
+
+        candidates: list[tuple[int, Step]] = []
+        for index, candidate in enumerate(steps):
+            if index == ev_index or index in claimed or candidate.timestamp is None:
+                continue
+            if candidate.timestamp < start - TOLERANCE_MS or candidate.timestamp > end + TOLERANCE_MS:
+                continue
+            if _dom_orphan_is_canonical_candidate(candidate, selectors):
+                candidates.append((index, candidate))
+        if not candidates:
+            continue
+
+        # check/uncheck contient l'etat final ; un click checkbox est une
+        # observation redondante qui provoquerait sinon un double toggle.
+        semantic = [(index, step) for index, step in candidates if step.action in ("check", "uncheck")]
+        chosen_pool = semantic or [(index, step) for index, step in candidates if step.action == "click"]
+        target_limit = _evaluate_target_limit(code)
+        chosen = chosen_pool if target_limit is None else chosen_pool[:target_limit]
+        if not chosen:
+            continue
+
+        promoted_ids: list[str] = []
+        for index, canonical in chosen:
+            claimed.add(index)
+            canonical.included_in_replay = True
+            canonical.replay_blocking = False
+            canonical.source = "evaluate+dom"
+            canonical.cleanup_reason = None
+            canonical_raw = canonical.raw_payload if isinstance(canonical.raw_payload, dict) else {}
+            canonical_raw["confirmed_by_evaluate"] = ev.id
+            canonical_raw["evaluate_selectors"] = sorted(selectors)
+            fused_sources = list(canonical_raw.get("fused_sources") or [])
+            if ev.id not in fused_sources:
+                fused_sources.append(ev.id)
+
+            # Absorbe le click synchrone de la meme checkbox.
+            parent_label = canonical_raw.get("parentLabel")
+            if canonical.action in ("check", "uncheck") and parent_label:
+                for companion_index, companion in candidates:
+                    if companion_index == index or companion_index in claimed:
+                        continue
+                    companion_raw = companion.raw_payload if isinstance(companion.raw_payload, dict) else {}
+                    if (
+                        companion.action == "click"
+                        and companion_raw.get("parentLabel") == parent_label
+                        and companion.timestamp is not None
+                        and canonical.timestamp is not None
+                        and abs(companion.timestamp - canonical.timestamp) <= TOLERANCE_MS
+                    ):
+                        claimed.add(companion_index)
+                        companion.cleanup_reason = f"fusionne dans {canonical.id} (click compagnon du change DOM)"
+                        if companion.id not in fused_sources:
+                            fused_sources.append(companion.id)
+            canonical_raw["fused_sources"] = fused_sources
+            canonical.raw_payload = canonical_raw
+            promoted_ids.append(canonical.id or f"dom-index-{index}")
+
+        ev.included_in_replay = False
+        ev.replay_blocking = False
+        ev.cleanup_reason = (
+            "fusionne en action(s) DOM canonique(s) confirmee(s) : "
+            + ", ".join(promoted_ids)
+        )
 
 
 def _fuse_checkbox_interactions(steps: list[Step]) -> None:
