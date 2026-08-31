@@ -30,6 +30,29 @@
         return String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
     }
 
+    // Attributs utiles au rapprochement BU/DOM. Tous les data-* sont
+    // conserves : limiter la liste a data-testid faisait perdre, entre
+    // autres, data-product-id sur les grilles e-commerce.
+    function captureAttributes(el) {
+        if (!el || !el.getAttribute) return {};
+        const out = {
+            id: el.id || null,
+            name: el.getAttribute('name'),
+            type: el.getAttribute('type'),
+            class: (typeof el.className === 'string') ? el.className : null,
+            href: el.getAttribute('href'),
+            placeholder: el.getAttribute('placeholder'),
+            'aria-label': el.getAttribute('aria-label'),
+            role: el.getAttribute('role')
+        };
+        if (el.attributes) {
+            for (const attr of Array.from(el.attributes)) {
+                if (attr.name.startsWith('data-')) out[attr.name] = attr.value;
+            }
+        }
+        return out;
+    }
+
     // -- ECHAPPEMENT LITTERAL XPATH (gere quotes mixtes via concat) --
     function xpathString(s) {
         s = String(s);
@@ -67,14 +90,23 @@
     function getShadowSelector(el) {
         let chain = [];
         let current = el;
+        let allSegmentsUnique = true;
         while (current) {
             let root = current.getRootNode();
             let localSel = getQuickSelector(current);
+            let localCount = 0;
+            try {
+                const localMatches = Array.from(root.querySelectorAll(localSel));
+                localCount = localMatches.length;
+                if (localCount !== 1 || localMatches[0] !== current) allSegmentsUnique = false;
+            } catch(e) {
+                allSegmentsUnique = false;
+            }
             if (root instanceof ShadowRoot) {
-                chain.unshift({selector: localSel, shadow: true});
+                chain.unshift({selector: localSel, shadow: true, matchCount: localCount});
                 current = root.host;
             } else {
-                chain.unshift({selector: localSel, shadow: false});
+                chain.unshift({selector: localSel, shadow: false, matchCount: localCount});
                 break;
             }
         }
@@ -90,8 +122,9 @@
             shadowChain: chain,
             playwrightSelector: pwSel,
             jsSelector: jsSel,
-            unique: true,
-            matchCount: 1
+            unique: allSegmentsUnique,
+            matchCount: allSegmentsUnique ? 1 : null,
+            verifiedAtCapture: true
         };
     }
 
@@ -127,6 +160,22 @@
         let best = null;
         let strategy = 'unknown';
         const tag = el.tagName.toLowerCase();
+        const countCssTarget = (candidate) => {
+            try {
+                const nodes = Array.from(document.querySelectorAll(candidate));
+                return nodes.includes(el) ? nodes.length : 0;
+            } catch(e) { return -1; }
+        };
+        const countXPathTarget = (candidate) => {
+            try {
+                const xr = document.evaluate(candidate, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                let containsTarget = false;
+                for (let i = 0; i < xr.snapshotLength; i++) {
+                    if (xr.snapshotItem(i) === el) { containsTarget = true; break; }
+                }
+                return containsTarget ? xr.snapshotLength : 0;
+            } catch(e) { return -1; }
+        };
 
         // === Tier 1 : Attributs stables (fiabilite max) ===
         if (el.getAttribute('data-testid')) {
@@ -247,14 +296,11 @@
 
         // === VALIDATION : est-ce que le selecteur matche 1 seul element ? ===
         let matchCount = 0;
-        try {
-            if (strategy === 'label-xpath' || best.startsWith('//')) {
-                let xr = document.evaluate(best, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                matchCount = xr.snapshotLength;
-            } else {
-                matchCount = document.querySelectorAll(best).length;
-            }
-        } catch(e) { matchCount = -1; }
+        if (strategy === 'label-xpath' || best.startsWith('//')) {
+            matchCount = countXPathTarget(best);
+        } else {
+            matchCount = countCssTarget(best);
+        }
 
         // Si multi-match ET c'est un input/button avec 'value' visible
         // (ex: <input type="submit" value="Register">), enrichir avec le
@@ -265,7 +311,7 @@
             if (val && val.length > 0 && val.length < 60) {
                 let valSel = tag + '[value="' + attrValue(val) + '"]';
                 try {
-                    let valCount = document.querySelectorAll(valSel).length;
+                    let valCount = countCssTarget(valSel);
                     if (valCount === 1) {
                         best = valSel;
                         strategy = 'value-attr';
@@ -273,7 +319,7 @@
                     } else if (valCount > 0 && valCount < matchCount) {
                         // Combiner class actuelle + value pour affiner
                         let combined = best + '[value="' + attrValue(val) + '"]';
-                        let combCount = document.querySelectorAll(combined).length;
+                        let combCount = countCssTarget(combined);
                         if (combCount === 1) {
                             best = combined;
                             strategy = 'class-value';
@@ -291,7 +337,7 @@
         if (matchCount !== 1 && tag === 'input') {
             const tryRefine = (candidate, strat) => {
                 try {
-                    const c = document.querySelectorAll(candidate).length;
+                    const c = countCssTarget(candidate);
                     if (c === 1) { best = candidate; strategy = strat; matchCount = 1; return true; }
                     if (c > 0 && c < matchCount) { best = candidate; strategy = strat; matchCount = c; }
                 } catch(e) {}
@@ -314,13 +360,10 @@
                     }
                 }
             }
-            if (matchCount !== 1 && el.parentElement) {
-                const same = Array.from(document.querySelectorAll(best));
-                const idx = same.indexOf(el);
-                if (idx >= 0) {
-                    tryRefine(best + ':nth-of-type(' + (idx + 1) + ')', 'input-nth');
-                }
-            }
+            // Pas de fallback `best:nth-of-type(globalIndex)`: nth-of-type
+            // est relatif aux freres, pas a document.querySelectorAll(best).
+            // Une telle conversion pouvait produire un locator unique mais
+            // pointant vers un autre champ.
         }
 
         // Si multi-match -> tenter XPath text-based
@@ -328,10 +371,7 @@
         if (matchCount !== 1 && text && text.length > 0 && text.length < 50 && text.indexOf('\n') === -1) {
             let xpathText = '//' + tag + '[contains(text(),' + xpathString(text) + ')]';
             let xpathCount = 0;
-            try {
-                let xr = document.evaluate(xpathText, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-                xpathCount = xr.snapshotLength;
-            } catch(e) {}
+            xpathCount = countXPathTarget(xpathText);
             if (xpathCount === 1) {
                 best = xpathText;
                 strategy = 'xpath-text';
@@ -356,7 +396,7 @@
                 if (!a.value || a.value.length === 0 || a.value.length > 60) continue;
                 const cand = '[' + a.name + '="' + attrValue(a.value) + '"]';
                 try {
-                    const c = document.querySelectorAll(cand).length;
+                    const c = countCssTarget(cand);
                     if (c === 1) {
                         best = cand;
                         strategy = 'self-data-attr';
@@ -396,7 +436,7 @@
                 for (const ancSel of ancCandidates) {
                     const scoped = ancSel + ' ' + best;
                     try {
-                        const c = document.querySelectorAll(scoped).length;
+                        const c = countCssTarget(scoped);
                         if (c === 1) {
                             best = scoped;
                             strategy = 'ancestor-scope';
@@ -416,7 +456,8 @@
             value: best,
             inShadowDOM: false,
             unique: matchCount === 1,
-            matchCount: matchCount
+            matchCount: matchCount,
+            verifiedAtCapture: true
         };
     }
 
@@ -447,6 +488,40 @@
         return el;
     }
 
+    function getParentListItemContext(el, selector) {
+        const li = el && el.closest ? el.closest('li') : null;
+        if (!li) return {label: null, matchCount: null, scopedMatchCount: null, checkboxMatchCount: null};
+        const labelEl = li.querySelector('label');
+        const label = labelEl
+            ? (labelEl.innerText || labelEl.textContent || '').trim().substring(0, 200)
+            : null;
+        if (!label) return {label: null, matchCount: null, scopedMatchCount: null, checkboxMatchCount: null};
+        let matchCount = null;
+        let scopedMatchCount = null;
+        let checkboxMatchCount = null;
+        try {
+            const root = li.getRootNode();
+            matchCount = Array.from(root.querySelectorAll('li')).filter(candidate => {
+                const candidateLabel = candidate.querySelector('label');
+                const text = candidateLabel
+                    ? (candidateLabel.innerText || candidateLabel.textContent || '').trim().substring(0, 200)
+                    : null;
+                return text === label;
+            }).length;
+            checkboxMatchCount = li.querySelectorAll('input[type="checkbox"], [role="checkbox"]').length;
+            if (selector && selector.value && !selector.value.startsWith('//') && !selector.inShadowDOM) {
+                const scoped = Array.from(li.querySelectorAll(selector.value));
+                if (scoped.includes(el)) scopedMatchCount = scoped.length;
+            }
+        } catch(e) {}
+        return {
+            label: label,
+            matchCount: matchCount,
+            scopedMatchCount: scopedMatchCount,
+            checkboxMatchCount: checkboxMatchCount
+        };
+    }
+
     // -- EVENT LISTENERS --
     document.addEventListener('click', (e) => {
         let el = getRealTarget(e);
@@ -458,31 +533,21 @@
         // On garde le click (pas de skip meme sur checkbox) : le change
         // event le complete avec la semantique on/off, mais le click
         // reste l'action canonique de reference.
-        let parentLabel = null;
-        let li = el.closest ? el.closest('li') : null;
-        if (li) {
-            let labelEl = li.querySelector('label');
-            if (labelEl) parentLabel = (labelEl.innerText || labelEl.textContent || '').trim().substring(0, 200);
-        }
+        const parentContext = getParentListItemContext(el, sel);
+        let parentLabel = parentContext.label;
         saveEntry({
             action: 'click',
             timestamp: Date.now(),
+            isTrusted: e.isTrusted === true,
             tag: el.tagName,
             text: text,
             parentLabel: parentLabel,
+            parentLabelMatchCount: parentContext.matchCount,
+            parentScopedMatchCount: parentContext.scopedMatchCount,
             selector: sel,
             url: location.href,
             inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                class: (typeof el.className === 'string') ? el.className : null,
-                href: el.getAttribute ? el.getAttribute('href') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null,
-                role: el.getAttribute ? el.getAttribute('role') : null
-            }
+            attributes: captureAttributes(el)
         });
     }, true);
 
@@ -518,6 +583,7 @@
             saveEntry({
                 action: 'select',
                 timestamp: Date.now(),
+                isTrusted: e.isTrusted === true,
                 tag: 'SELECT',
                 value: optionValue,           // value technique (peut etre ephemere)
                 label: optionLabel,           // texte visible - source de verite au replay
@@ -527,31 +593,21 @@
                 selector: sel,
                 url: location.href,
                 inShadowDOM: sel.inShadowDOM,
-                attributes: {
-                    id: el.id || null,
-                    name: el.getAttribute ? el.getAttribute('name') : null,
-                    'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
-                }
+                attributes: captureAttributes(el)
             });
             return;
         }
         saveEntry({
             action: 'input',
             timestamp: Date.now(),
+            isTrusted: e.isTrusted === true,
             tag: el.tagName,
             value: sensitive ? '<redacted>' : (el.value || ''),
             sensitive: sensitive,
             selector: sel,
             url: location.href,
             inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-                placeholder: el.getAttribute ? el.getAttribute('placeholder') : null,
-                'data-testid': el.getAttribute ? el.getAttribute('data-testid') : null,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
-            }
+            attributes: captureAttributes(el)
         });
     }, true);
 
@@ -573,11 +629,15 @@
         let sel = getBestSelector(el);
         // Contexte parent li (TodoMVC) pour desambiguisation
         let parentLabel = null;
+        let parentLabelMatchCount = null;
+        let parentCheckboxMatchCount = null;
         let parentSelector = null;
         let li = el.closest ? el.closest('li') : null;
         if (li) {
-            let labelEl = li.querySelector('label');
-            if (labelEl) parentLabel = (labelEl.innerText || labelEl.textContent || '').trim().substring(0, 200);
+            const parentContext = getParentListItemContext(el, sel);
+            parentLabel = parentContext.label;
+            parentLabelMatchCount = parentContext.matchCount;
+            parentCheckboxMatchCount = parentContext.checkboxMatchCount;
             parentSelector = getQuickSelector(li);
         }
         // Accessible name : aria-label, label associe ou nearest text
@@ -593,6 +653,7 @@
         saveEntry({
             action: el.checked ? 'check' : 'uncheck',
             timestamp: Date.now(),
+            isTrusted: e.isTrusted === true,
             tag: el.tagName,
             checked: !!el.checked,        // etat cible boolean explicite
             value: el.checked ? 'true' : 'false',
@@ -601,14 +662,11 @@
             url: location.href,
             inShadowDOM: sel.inShadowDOM,
             parentLabel: parentLabel,
+            parentLabelMatchCount: parentLabelMatchCount,
+            parentCheckboxMatchCount: parentCheckboxMatchCount,
             parentSelector: parentSelector,
             accessibleName: accessibleName,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: elType,
-                'aria-label': el.getAttribute ? el.getAttribute('aria-label') : null
-            }
+            attributes: captureAttributes(el)
         });
     }, true);
 
@@ -627,16 +685,13 @@
         saveEntry({
             action: 'keyboard',
             timestamp: Date.now(),
+            isTrusted: e.isTrusted === true,
             tag: el.tagName,
             value: e.key,
             selector: sel,
             url: location.href,
             inShadowDOM: sel.inShadowDOM,
-            attributes: {
-                id: el.id || null,
-                name: el.getAttribute ? el.getAttribute('name') : null,
-                type: el.getAttribute ? el.getAttribute('type') : null,
-            }
+            attributes: captureAttributes(el)
         });
     }, true);
 

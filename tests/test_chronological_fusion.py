@@ -5,8 +5,7 @@ fin, produisant l'ordre 'click -> click -> navigate -> wait' pour une
 execution reelle 'navigate -> click -> wait -> click'. Ces tests
 verifient que la nouvelle logique respecte l'ordre temporel effectif.
 
-Note : on court-circuite ai_classify_steps (qui appelle un LLM externe)
-en testant directement build_pre_cleanup_steps.
+Ces tests ciblent directement la fusion locale avant classification.
 """
 import pytest
 
@@ -95,7 +94,8 @@ def test_bu_click_without_dom_uses_interacted_element():
     assert s.source == "browser_use_history"
     assert s.selector is not None
     assert s.selector.value == "button.dashboard-refresh"
-    assert s.selector.strategy == "bu-css"
+    assert s.selector.strategy == "bu-unverified-css"
+    assert s.selector.verifiedAtCapture is False
 
 
 def test_bu_click_no_dom_no_interacted_element_kept_without_selector():

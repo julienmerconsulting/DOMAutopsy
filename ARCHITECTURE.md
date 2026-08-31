@@ -89,11 +89,11 @@ Le différenciateur architectural majeur : **la couche de capture (DOM listener 
 │  4. Crée BrowserProfile(min_wait, max_wait, network_idle) — fix SPA timing   │
 │  5. Crée BrowserSession(cdp_url=...) connectée au Chromium déjà ouvert       │
 │  6. Instancie Agent(task, llm, use_vision selon provider/modèle)             │
-│  7. await agent.run(max_steps) — browser-use pilote, le listener observe     │
+│  7. agent.run() — callback pré-action mesure les cibles BU via CDP           │
 │  8. Lit localStorage.__qaLocatorLog depuis chaque page (3 fallbacks)         │
 │  9. Dédup (clics consécutifs, dernière valeur input par sélecteur+url)       │
-│ 10. AI cleanup via OpenAI/Groq compat (filtre bruit, ordonne, anomalies)     │
-│ 11. Génère le code de test dans le format demandé via prompt spécifique     │
+│ 10. Enrichit les sélecteurs live via backend_node_id + CDP                   │
+│ 11. Classe localement et génère les exports déterministes                    │
 │ 12. Génère qa_report_<ts>.html via report_generator.py                      │
 │ 13. Écrit meta.json (timestamp, status, agent_result, counts, etc.)          │
 │ 14. try/finally : ferme browser + Playwright proprement                      │
@@ -306,10 +306,10 @@ Le différenciateur architectural majeur : **la couche de capture (DOM listener 
   │ 18. Écrit runs/<id>/locator_log.json (brut)
   │ 19. dedup_log() : retire clics consécutifs identiques, garde dernière valeur input
   │ 20. Écrit runs/<id>/locator_dedup.json
-  │ 21. ai_cleanup() :
-  │      - prompt avec scenario_steps + log dedup + format-specific code instructions
-  │      - response_format JSON
-  │      - parse, retourne dict {parcours, total_steps, anomalies, filtered_noise, steps[], katalon_code}
+  │ 21. enrich_browser_use_step_snapshot() puis classify_steps() :
+  │      - résolution du nœud exact via backend_node_id avant chaque lot d'actions
+  │      - mesure querySelectorAll/XPath des candidats dans le DOM vivant
+  │      - inclusion locale stricte, sans appel LLM post-capture
   │ 22. Écrit runs/<id>/clean_steps.json
   │ 23. Écrit runs/<id>/test_<format>.<ext>
   │ 24. generate_report() : produit qa_report_<ts>.html dans runs/<id>/
@@ -760,7 +760,7 @@ Le serveur garde uniquement le screencast (forwarding pur, pas de logique métie
 
 ## 14. Pitch en 30 secondes
 
-> *"DOMAutopsy capture les sélecteurs DOM réels d'un parcours QA — exécuté par un agent IA ou un humain — via un listener JavaScript injecté dans Chromium. L'IA filtre le bruit (sans inventer de sélecteur, c'est important), valide l'unicité runtime de chaque locator, et génère un fichier de test rejouable dans Katalon, Playwright, Cypress ou Selenium au choix. Les credentials sont automatiquement détectés et purgés avant tout traitement. Le rapport HTML est self-service, le code est commité-prêt. L'architecture est entièrement basée sur Chrome DevTools Protocol, ce qui ouvre l'observabilité totale (DOM, network, console, performance, coverage) — feature roadmap V3."*
+> *"DOMAutopsy fait exécuter le parcours par un agent, puis retrouve chaque nœud exact via CDP et mesure ses candidats de locator dans le DOM vivant. Le nettoyage et la classification post-capture sont locaux, déterministes et fail-closed : aucun LLM n'invente un sélecteur ou ne décide silencieusement quoi rejouer. Le résultat canonique est un test Playwright TypeScript sans LLM au replay, avec assertions fonctionnelles natives."*
 
 ---
 
@@ -782,14 +782,15 @@ Résultat : le format généré n'était jamais exécuté en interne, `qa_player
 Depuis le refactor :
 - **Toujours généré** par `qa_explorer` (même si l'export livrable demandé est Katalon/Cypress/Selenium)
 - **Rejoué directement** par `/api/replay/{run_id}` via `npx playwright test <spec-relatif> --workers=1`
-- **Format canonique interne**, indépendant du choix d'export utilisateur (l'export livrable reste géré séparément par le LLM)
+- **Format canonique interne**, indépendant du choix d'export utilisateur
 
 ### 15.3 Nouveaux modules
 
 | Fichier | Rôle |
 |---|---|
 | `schemas.py` | Modèles Pydantic v2 versionnés (`schema_version="2.0"`), 25+ champs par step, migration transparente des anciens JSON |
-| `clean_steps_builder.py` | Pipeline unifié : `extract_browser_use_history` (3 fallbacks défensifs) → fusion multi-sources (scenario + BU history + DOM listener + network) → détection sensitive → **classification LLM** (le LLM annote `included_in_replay`, il ne construit plus les steps) |
+| `selector_enricher.py` | Résolution `backend_node_id` → nœud exact via CDP, génération et mesure live des candidats, cache des preuves par step |
+| `clean_steps_builder.py` | Pipeline unifié : extraction BU → fusion multi-sources → détection sensitive → **classification locale stricte sans LLM** |
 | `playwright_generator.py` | Traduction **déterministe** JSON→TS (15 actions, encapsulation `test.step("[step-XXXX] ...")` pour rapprochement rapport, sensitive→`process.env`, action inconnue→`throw`) |
 | `replay_reporter.py` | Rapport HTML self-contained pour les runs replay (rapproche `[step-XXXX]` du JSON reporter Playwright avec les données du `clean_steps.json` source) |
 
@@ -804,12 +805,12 @@ Depuis le refactor :
    -> CleanSteps Pydantic v1.0 → clean_steps.json (toutes actions)
 5. generate_playwright_ts(clean_steps, spec.ts)   # NOUVEAU : toujours
    -> test_playwright.spec.ts (format canonique)
-6. generate_export_code(...)   # NOUVEAU : si output_format != playwright
-   -> test_<format>.<ext> (Katalon / Cypress / Selenium via LLM)
+6. deterministic_exporters     # si output_format != playwright
+   -> test_<format>.<ext> (Katalon / Cypress / Selenium sans LLM)
 7. generate_report(clean_data_dict, ...)   # étendu : all actions + Rejoué col
    -> qa_report_<ts>.html
 8. meta.json enrichi : schema_version, bu_history_count, sensitive_env_vars,
-   clean_steps_included/filtered, playwright_spec_present
+   clean_steps_included/filtered, replay_blocking_steps, playwright_spec_present
 ```
 
 ### 15.5 Nouveau flow `/api/replay/{run_id}`

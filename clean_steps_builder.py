@@ -11,12 +11,9 @@ Pipeline (dans cet ordre) :
         rapprochee par timestamp au DOM listener quand possible, source tracee
   3. detect_and_flag_sensitive(steps)
      -> assigne env_var aux steps input sensitive (le TS pointera dessus)
-  4. ai_classify_steps(steps, scenario_steps, ...)
-     -> le LLM annote chaque step (included_in_replay + cleanup_reason) et
-        remonte les anomalies globales - il NE CONSTRUIT PLUS les steps
-  5. generate_export_code(steps, format, ...)  [optionnel, si format != playwright]
-     -> IA genere le code Katalon/Cypress/Selenium pour l'export livrable
-  6. CleanSteps.model_validate(...)
+  4. classify_steps(steps)
+     -> politique locale stricte : aucune decision LLM, aucun reseau
+  5. CleanSteps.model_validate(...)
      -> validation Pydantic finale avant ecriture disque
 
 Regle du cahier des charges strictement appliquee :
@@ -30,8 +27,6 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Optional
-
-from openai import OpenAI
 
 from schemas import (
     CURRENT_SCHEMA_VERSION,
@@ -271,6 +266,17 @@ def _element_to_dict(elem: Any) -> dict[str, Any]:
     """Serialise defensivement un DOMHistoryElement browser-use."""
     if isinstance(elem, dict):
         return dict(elem)
+    # BU 0.13.8 fournit la representation canonique sur la dataclass elle-
+    # meme. Elle contient notamment backend_node_id, frame_id, x_path,
+    # element_hash, stable_hash, bounds et ax_name. La consulter AVANT un
+    # eventuel model_dump partiel evite de ne conserver que ``attributes``.
+    if hasattr(elem, "to_dict"):
+        try:
+            value = elem.to_dict()
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            pass
     if hasattr(elem, "model_dump"):
         try:
             return elem.model_dump(exclude_none=True)
@@ -281,9 +287,11 @@ def _element_to_dict(elem: Any) -> dict[str, Any]:
     # backend_node_id, node_name en plus des champs BU 0.12 legacy.
     # On extrait tout - _apply_interacted_element choisira le meilleur
     # selecteur selon une cascade priorisee.
-    for attr in ("xpath", "x_path", "css_selector", "tag_name", "node_name",
-                 "attributes", "is_visible", "is_interactive", "shadow_root",
-                 "highlight_index", "ax_name", "stable_hash", "backend_node_id"):
+    for attr in ("node_id", "backend_node_id", "frame_id", "node_type",
+                 "node_value", "node_name", "attributes", "xpath", "x_path",
+                 "css_selector", "tag_name", "element_hash", "stable_hash",
+                 "bounds", "ax_name", "is_visible", "is_interactive",
+                 "shadow_root", "highlight_index"):
         v = getattr(elem, attr, None)
         if v is not None:
             out[attr] = v
@@ -351,6 +359,7 @@ def _dom_selector_to_pydantic(sel: dict[str, Any] | None) -> Optional[Selector]:
     """Convertit un selector du DOM listener en Selector Pydantic."""
     if not sel or not isinstance(sel, dict):
         return None
+    measured = sel.get("unique") is not None and sel.get("matchCount") is not None
     return Selector(
         strategy=sel.get("strategy"),
         value=sel.get("value"),
@@ -360,6 +369,8 @@ def _dom_selector_to_pydantic(sel: dict[str, Any] | None) -> Optional[Selector]:
         shadowChain=sel.get("shadowChain"),
         playwrightSelector=sel.get("playwrightSelector"),
         jsSelector=sel.get("jsSelector"),
+        verifiedAtCapture=measured,
+        captureSource="dom_listener" if measured else "dom_listener_unverified",
     )
 
 
@@ -385,8 +396,13 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
     # change events sur checkbox/radio (permet la desambiguisation
     # ulterieure dans les listes type TodoMVC).
     raw = {}
+    if "isTrusted" in entry:
+        raw["isTrusted"] = bool(entry.get("isTrusted"))
     if entry.get("parentLabel"):
         raw["parentLabel"] = entry["parentLabel"]
+        raw["parentLabelMatchCount"] = entry.get("parentLabelMatchCount")
+        raw["parentScopedMatchCount"] = entry.get("parentScopedMatchCount")
+        raw["parentCheckboxMatchCount"] = entry.get("parentCheckboxMatchCount")
     step = Step(
         id=f"step-{index:04d}",
         step=index,
@@ -407,7 +423,7 @@ def _step_from_dom_entry(entry: dict[str, Any], index: int) -> Step:
         deltaY=entry.get("deltaY"),
         scrollY=entry.get("scrollY"),
         source="dom_listener",
-        included_in_replay=True,  # sera potentiellement passe a false par ai_classify_steps
+        included_in_replay=True,  # sera valide ou exclu par classify_steps
         raw_payload=raw or None,
         # Champs SELECT (extra="allow" sur Step) : le generateur TS les lit
         # via getattr pour emettre .selectOption({label|index}) au lieu de
@@ -536,9 +552,8 @@ def _step_from_bu_action(
             "reload": "Recharge la page",
         }[normalized]
     elif normalized == "evaluate":
-        # Execution JS brute (workaround click BU quand selecteur ambigu).
-        # Preserve le code JS pour l'emitter TS qui le passera a page.evaluate().
-        # Rejouable = true : c'est une vraie interaction (peut modifier le DOM).
+        # Conserve le code pour le diagnostic, mais classify_steps l'exclut
+        # systematiquement : un script arbitraire n'est pas un replay canonique.
         code = params.get("code") or params.get("script") or params.get("js")
         step.description = f"Evaluate JS : {(code or '')[:80]}"
         step.value = code
@@ -550,7 +565,7 @@ def _step_from_bu_action(
         step.description = f"Extract LLM : {params.get('goal') or params.get('query') or 'lecture DOM'}"
         step.included_in_replay = False
         step.cleanup_reason = "action extract (lecture LLM only, pas d'interaction utilisateur reproductible)"
-    elif normalized in ("click", "input", "select", "scroll", "hover"):
+    elif normalized in ("click", "input", "select", "scroll", "hover", "check", "uncheck"):
         # Actions interactives BU sans correspondance DOM listener.
         # interacted_element a peut-etre fourni le selecteur.
         if normalized == "input":
@@ -560,16 +575,21 @@ def _step_from_bu_action(
         elif normalized == "scroll":
             step.direction = "down" if (params.get("direction") in (None, "down", "bas")) else "up"
             step.deltaY = params.get("amount") or params.get("delta") or 650
+        elif normalized in ("check", "uncheck"):
+            step.value = "true" if normalized == "check" else "false"
         step.description = f"{normalized.capitalize()} (BU-only, sans DOM event)"
         # Regle cahier : "action sans selecteur conservee comme anomalie".
         # Le step est GARDE dans le JSON (tracabilite) mais marque
         # included_in_replay=False + cleanup_reason quand aucun selecteur
         # n'a pu etre extrait (ni DOM ni interacted_element BU). Le TS
         # emit un commentaire SKIPPED, pas un throw fatal.
-        if step.selector is None or (
-            hasattr(step.selector, "value") and not step.selector.value
+        if normalized != "scroll" and (
+            step.selector is None or (
+                hasattr(step.selector, "value") and not step.selector.value
+            )
         ):
             step.included_in_replay = False
+            step.replay_blocking = True
             step.cleanup_reason = (
                 f"action {normalized} sans selecteur (BU sans interacted_element "
                 f"ni correspondance DOM listener)"
@@ -582,20 +602,92 @@ def _step_from_bu_action(
     return step
 
 
+def _css_attr_selector(name: str, value: str) -> str:
+    """Construit un selecteur d'attribut CSS correctement echappe.
+
+    ``[id="customer.firstName"]`` reste valide alors que
+    ``#customer.firstName`` ne cible pas le meme identifiant.
+    """
+    return f"[{name}={json.dumps(str(value), ensure_ascii=False)}]"
+
+
+def _verified_selector_from_element(elem: dict[str, Any] | None) -> Selector | None:
+    """Choisit le meilleur candidat *mesure* pendant la capture.
+
+    La stabilite et la priorite ne sont que des criteres de tri. La preuve
+    indispensable est ``verifiedAtCapture=true, unique=true, matchCount=1``.
+    """
+    if not elem or not isinstance(elem, dict):
+        return None
+    candidates = elem.get("selector_candidates") or []
+    valid = [
+        candidate for candidate in candidates
+        if isinstance(candidate, dict)
+        and isinstance(candidate.get("value"), str)
+        and candidate.get("value")
+        and candidate.get("verifiedAtCapture") is True
+        and candidate.get("unique") is True
+        and candidate.get("matchCount") == 1
+        and candidate.get("stability") in ("high", "medium")
+    ]
+    if not valid:
+        return None
+    stability_rank = {"high": 0, "medium": 1, "low": 2}
+    valid.sort(key=lambda candidate: (
+        stability_rank.get(candidate.get("stability"), 9),
+        int(candidate.get("priority", 999)),
+        len(candidate["value"]),
+    ))
+    candidate = valid[0]
+    return Selector(
+        strategy=candidate.get("strategy") or "browser-use-live",
+        value=candidate["value"],
+        unique=True,
+        matchCount=1,
+        inShadowDOM=bool(candidate.get("inShadowDOM")),
+        shadowChain=candidate.get("shadowChain"),
+        verifiedAtCapture=True,
+        stability=candidate.get("stability"),
+        priority=candidate.get("priority"),
+        captureSource="browser_use_live_cdp",
+    )
+
+
+def _selector_is_verified_unique(selector: Selector | str | None) -> bool:
+    if selector is None or isinstance(selector, str):
+        return False
+    return (
+        selector.verifiedAtCapture is True
+        and selector.unique is True
+        and selector.matchCount == 1
+    )
+
+
+def _selector_rank(selector: Selector | str | None) -> tuple[int, int, int]:
+    """Classe deux preuves uniques sans inventer de nouveau locator."""
+    if selector is None or isinstance(selector, str):
+        return (99, 999, 9999)
+    explicit = {"high": 0, "medium": 1, "low": 2}.get(selector.stability)
+    strategy = (selector.strategy or "").lower()
+    if explicit is None:
+        if any(token in strategy for token in ("testid", "data-test", "data-qa", "id", "name", "aria")):
+            explicit = 0
+        elif any(token in strategy for token in ("placeholder", "href", "data-attr", "ancestor", "title")):
+            explicit = 1
+        else:
+            explicit = 2
+    priority = selector.priority if selector.priority is not None else 999
+    return (explicit, priority, len(selector.value or ""))
+
+
 def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
-    """Extrait un selecteur robuste depuis state.interacted_element de BU.
+    """Applique une preuve live BU, ou conserve un indice non verifie.
 
-    Cascade priorisee par fiabilite (BU 0.13+ expose bien plus qu'attributes) :
-      1. #id                              - unique par definition W3C
-      2. [data-testid|data-qa]            - conventions test explicites
-      3. [data-*] discriminant            - data-product-id, data-item-id...
-      4. [aria-label] (issu de ax_name)   - accessibility, stable sur redesign
-      5. bu-css / bu-xpath fournis        - si BU les a poses (rare)
-      6. x_path complet (BU 0.13)         - dernier recours, position-sensible
-
-    Le `stable_hash` de BU sert de fingerprint interne pour valider la
-    stabilite ; ax_name est le texte accessible visible (plus stable
-    qu'un xpath positionnel).
+    Les attributs de ``DOMInteractedElement`` ne prouvent pas qu'un locator
+    est unique. Sans candidat mesure live, on garde donc un locator de trace
+    marque ``verifiedAtCapture=False`` ; le classificateur local l'exclura du
+    replay. ``ax_name`` n'est jamais transforme en ``aria-label`` : ces deux
+    notions ne sont pas equivalentes.
     """
     if not elem or not isinstance(elem, dict):
         return
@@ -604,51 +696,45 @@ def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
         attrs = {}
     ax_name = elem.get("ax_name") if isinstance(elem.get("ax_name"), str) else None
 
-    def _set(strategy: str, value: str, selector_type: str = "css") -> None:
-        escaped = value if selector_type == "xpath" else value
-        step.selector = Selector(strategy=strategy, value=escaped, unique=None, matchCount=None)
-        step.selectorType = selector_type  # type: ignore[assignment]
-
-    # 1. id
-    eid = attrs.get("id")
-    if isinstance(eid, str) and eid.strip():
-        _set("bu-id", f"#{eid}")
-    # 2. data-testid / data-qa
-    elif isinstance(attrs.get("data-testid"), str) and attrs["data-testid"]:
-        _set("bu-data-testid", f'[data-testid="{attrs["data-testid"]}"]')
-    elif isinstance(attrs.get("data-qa"), str) and attrs["data-qa"]:
-        _set("bu-data-qa", f'[data-qa="{attrs["data-qa"]}"]')
+    verified = _verified_selector_from_element(elem)
+    if verified is not None:
+        step.selector = verified
+        candidate = next(
+            candidate for candidate in elem.get("selector_candidates", [])
+            if isinstance(candidate, dict) and candidate.get("value") == verified.value
+        )
+        step.selectorType = candidate.get("selectorType", "css")
     else:
-        # 3. Autre data-* non-vide (product-id, item-id, index, key...)
-        promoted = False
-        for name, val in attrs.items():
-            if not isinstance(name, str) or not name.startswith("data-"):
-                continue
-            if not val or not isinstance(val, str) or len(val) > 60:
-                continue
-            escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-            _set("bu-data-attr", f'[{name}="{escaped}"]')
-            promoted = True
-            break
-        if not promoted:
-            # 4. aria-label ou ax_name (accessibility name = texte visible)
-            aria = attrs.get("aria-label")
-            if isinstance(aria, str) and aria.strip():
-                escaped = aria.replace("\\", "\\\\").replace('"', '\\"')
-                _set("bu-aria-label", f'[aria-label="{escaped}"]')
-            elif ax_name and ax_name.strip():
-                escaped = ax_name.replace("\\", "\\\\").replace('"', '\\"')
-                _set("bu-ax-name", f'[aria-label="{escaped}"]')
-            else:
-                # 5. css_selector explicitement fourni par BU
-                css = elem.get("css_selector")
-                xpath = elem.get("xpath") or elem.get("x_path")
-                if isinstance(css, str) and css:
-                    _set("bu-css", css)
-                elif isinstance(xpath, str) and xpath:
-                    # 6. x_path complet en dernier recours (position-sensible,
-                    # peut casser si le site insere des elements dynamiques)
-                    _set("bu-xpath", xpath, "xpath")
+        def _set_unverified(strategy: str, value: str, selector_type: str = "css") -> None:
+            step.selector = Selector(
+                strategy=strategy,
+                value=value,
+                unique=None,
+                matchCount=None,
+                verifiedAtCapture=False,
+                captureSource="browser_use_unverified_hint",
+            )
+            step.selectorType = selector_type  # type: ignore[assignment]
+
+        css = elem.get("css_selector")
+        xpath = elem.get("xpath") or elem.get("x_path")
+        eid = attrs.get("id")
+        if isinstance(css, str) and css:
+            _set_unverified("bu-unverified-css", css)
+        elif isinstance(eid, str) and eid.strip():
+            _set_unverified("bu-unverified-id", _css_attr_selector("id", eid))
+        else:
+            attribute_hint = next((
+                (name, value) for name, value in attrs.items()
+                if isinstance(name, str)
+                and (name.startswith("data-") or name in ("aria-label", "name"))
+                and isinstance(value, str) and value and len(value) <= 100
+            ), None)
+            if attribute_hint:
+                name, value = attribute_hint
+                _set_unverified("bu-unverified-attr", _css_attr_selector(name, value))
+            elif isinstance(xpath, str) and xpath:
+                _set_unverified("bu-unverified-xpath", xpath, "xpath")
 
     # target = label lisible pour humain (rapport)
     if not step.target:
@@ -709,42 +795,16 @@ def _mark_ad_related(step: Step, elem: dict[str, Any] | None) -> None:
 
 
 def _promote_from_bu_data_attrs(step: Step, elem: dict[str, Any] | None) -> bool:
-    """Promeut le selecteur du step vers un [data-*="Y"] quand BU expose
-    un attribut data-* dans interacted_element.attributes.
-
-    Cas d'usage : le DOM listener a produit un selecteur non-unique
-    (ex: 'a.btn.btn-default' matchCount=68 sur une grille produits), mais
-    BU voit l'element cible avec ses attributs et expose data-product-id="1".
-    Un data-attr non-vide est semantiquement discriminant (product-id,
-    item-id, row-key, index) - source de verite plus fiable que la cascade
-    heuristique DOM sur un container generique.
-
-    Ne promeut que si le selecteur courant est non-unique (unique is False).
-    Retourne True si une promotion a eu lieu.
-    """
-    if not elem or not isinstance(elem, dict):
-        return False
-    attrs = elem.get("attributes") or {}
-    if not isinstance(attrs, dict):
-        return False
+    """Promeut uniquement vers un candidat BU mesure unique live."""
     cur = step.selector
-    if cur is not None and getattr(cur, "unique", None) is True:
+    if _selector_is_verified_unique(cur):
         return False
-    for name, val in attrs.items():
-        if not isinstance(name, str) or not name.startswith("data-"):
-            continue
-        if not val or not isinstance(val, str):
-            continue
-        if len(val) > 60:
-            continue
-        escaped = val.replace("\\", "\\\\").replace('"', '\\"')
-        cand = f'[{name}="{escaped}"]'
-        step.selector = Selector(
-            strategy="bu-data-attr", value=cand, unique=None, matchCount=None
-        )
-        step.selectorType = "css"
-        return True
-    return False
+    verified = _verified_selector_from_element(elem)
+    if verified is None:
+        return False
+    step.selector = verified
+    step.selectorType = "xpath" if verified.strategy == "xpath" else "css"
+    return True
 
 
 def _normalize_bu_action_name(name: str) -> str | None:
@@ -841,9 +901,8 @@ def _normalize_bu_action_name(name: str) -> str | None:
         "search_page": "extract",
         "read_dom": "extract",
         "get_page_content": "extract",
-        # BU 0.13 evaluate : execution JS brute (workaround click quand
-        # selecteur ambigu ou element hors-flow). Rejouable en TS via
-        # page.evaluate() - c'est une vraie interaction reproductible.
+        # BU 0.13 evaluate : conserve pour audit, puis exclu du replay par
+        # classify_steps (aucun JavaScript arbitraire dans le TS canonique).
         "evaluate": "evaluate",
         "execute_javascript": "evaluate",
         "run_js": "evaluate",
@@ -923,14 +982,20 @@ def build_pre_cleanup_steps(
         if not isinstance(dom_attrs, dict) or not dom_attrs:
             return True
         # 1) Refus immediat si mismatch prouve sur un attr discriminant
-        for key in ("id", "name", "href", "aria-label", "data-testid"):
+        discriminants = {
+            key for key in set(bu_attrs) | set(dom_attrs)
+            if key in ("id", "name", "href", "aria-label", "placeholder", "role", "type",
+                       "data-testid", "data-qa", "data-test", "data-cy")
+            or key.startswith("data-")
+        }
+        for key in discriminants:
             bu_v = bu_attrs.get(key)
             dom_v = dom_attrs.get(key)
             if bu_v and dom_v and bu_v != dom_v:
                 return False
         # 2) Exige AU MOINS UN signal commun : soit un attr discriminant
         #    identique non-vide, soit une intersection de class.
-        for key in ("id", "name", "href", "aria-label", "data-testid"):
+        for key in discriminants:
             bu_v = bu_attrs.get(key)
             dom_v = dom_attrs.get(key)
             if bu_v and dom_v and bu_v == dom_v:
@@ -971,6 +1036,9 @@ def build_pre_cleanup_steps(
                 continue
             if not _elements_compatible(bu_elem, d["entry"]):
                 continue
+            # Les actions d'un meme step BU partagent souvent la meme grande
+            # fenetre temporelle. Les consommer dans l'ordre DOM conserve
+            # alors l'alignement action[0] -> event[0], action[1] -> event[1].
             return i
         return None
 
@@ -1052,19 +1120,29 @@ def build_pre_cleanup_steps(
                     # Conserver interacted_element COMPLET dans raw_payload
                     # (attributes, ax_name, x_path, stable_hash, backend_node_id,
                     # bounds, node_name, node_value...). Source de verite BU.
+                    dom_context = step.raw_payload if isinstance(step.raw_payload, dict) else {}
                     step.raw_payload = {
+                        **dom_context,
                         "bu_action": action_dict,
                         "action_index": na.get("action_index"),
                         "interacted_element": per_action_element,
                     }
-                    # BU = source de verite : sa cascade prioritaire (id >
-                    # data-testid > data-qa > data-* > aria-label > ax_name)
-                    # ecrase le selecteur DOM heuristique quand disponible.
-                    # Le sel DOM reste en fallback si BU n'a rien.
+                    # Un selecteur DOM deja mesure unique est une preuve et
+                    # ne doit jamais etre ecrase par un simple attribut BU.
+                    # Le candidat BU ne gagne que s'il a lui aussi ete mesure
+                    # live et que le DOM listener n'avait pas cette preuve.
                     _saved_sel = step.selector
-                    _apply_interacted_element(step, per_action_element)
-                    if step.selector is None:
+                    _saved_type = step.selectorType
+                    live_selector = _verified_selector_from_element(per_action_element)
+                    if live_selector is not None and (
+                        not _selector_is_verified_unique(_saved_sel)
+                        or _selector_rank(live_selector) < _selector_rank(_saved_sel)
+                    ):
+                        step.selector = live_selector
+                        step.selectorType = "xpath" if live_selector.strategy == "xpath" else "css"
+                    else:
                         step.selector = _saved_sel
+                        step.selectorType = _saved_type
                     _mark_ad_related(step, per_action_element)
                 else:
                     # Pas de correspondance DOM demontree - construit depuis
@@ -1088,14 +1166,17 @@ def build_pre_cleanup_steps(
             if step.url:
                 current_url = step.url
 
-    # 3. DOM entries orphelins : capture DOM sans correspondance BU.
-    #    Sources possibles : event auto-fire du site (JS interne, animation),
-    #    event bubble d'un click BU capte sur un parent, bug de matching
-    #    temporel BU/DOM. Aucun cas legitime a rejouer -> supprimes du
-    #    clean_steps. Regle deterministe : pas de trace BU derriere ->
-    #    pas dans le clean_steps ni dans le TS. Le LLM ne decide rien ici.
-    #    (Les DOM entries consommes par un BU step restent visibles en tant
-    #    que source='bu+dom' des steps existants.)
+    # 3. DOM entries orphelins : conserves pour l'audit, jamais rejoues sans
+    #    une action BU correspondante. Les supprimer rendait le diagnostic
+    #    impossible et contredisait la regle "ne rien inventer/perdre".
+    for i, dom in enumerate(dom_entries):
+        if dom_consumed[i]:
+            continue
+        orphan = _step_from_dom_entry(dom["entry"], _next_index())
+        orphan.source = "dom_orphan"
+        orphan.included_in_replay = False
+        orphan.cleanup_reason = "observation DOM sans action Browser Use correspondante"
+        steps.append(orphan)
 
     # 4. Verify/cookie du scenario (declaratifs, non captes par DOM)
     for s in (scenario_steps or []):
@@ -1118,10 +1199,6 @@ def build_pre_cleanup_steps(
     # 5. Tri final chronologique STABLE : timestamp croissant, les steps
     #    sans timestamp gardent leur ordre d'insertion (verify/cookie
     #    scenario tombent en fin, ce qui reflete leur nature declarative).
-    for i, s in enumerate(steps):
-        # Ordre d'insertion memorise dans un attribut prive stable via
-        # step-number initial ; on n'attache rien de nouveau au schema.
-        pass
     steps_indexed = list(enumerate(steps))
     steps_indexed.sort(key=lambda pair: (
         pair[1].timestamp if pair[1].timestamp is not None else 10 ** 18,
@@ -1161,6 +1238,25 @@ def _step_selector_value(step: Step) -> str | None:
     if isinstance(sel, str):
         return sel
     return getattr(sel, "value", None)
+
+
+_EVALUATE_SELECTOR_RE = re.compile(
+    r"(?:querySelector|querySelectorAll)\s*\(\s*(['\"])(.*?)\1\s*\)",
+    re.DOTALL,
+)
+_EVALUATE_ID_RE = re.compile(r"getElementById\s*\(\s*(['\"])(.*?)\1\s*\)", re.DOTALL)
+
+
+def _selectors_referenced_by_evaluate(code: str | None) -> set[str]:
+    """Extrait seulement les cibles DOM explicites d'un evaluate brut."""
+    if not code:
+        return set()
+    selectors = {match.group(2) for match in _EVALUATE_SELECTOR_RE.finditer(code)}
+    selectors.update(
+        _css_attr_selector("id", match.group(2))
+        for match in _EVALUATE_ID_RE.finditer(code)
+    )
+    return selectors
 
 
 def _fuse_checkbox_interactions(steps: list[Step]) -> None:
@@ -1217,17 +1313,18 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
                         f"avec semantique checked + parentLabel)"
                     )
                     fused.append(other.id)
-            # BU evaluate qui touche a un toggle/checkbox
+            # Evaluate fusionne UNIQUEMENT s'il reference exactement le
+            # selecteur canonique. La simple proximite temporelle ou le mot
+            # "checkbox" ne prouvent pas qu'il s'agit du meme element.
             elif other.action == "evaluate":
-                code = ((other.value or "") + " " + (other.description or "")).lower()
-                if any(kw in code for kw in (".toggle", ".checked", "checkbox", "querySelectorAll".lower())):
-                    if ".click()" in code or ".checked" in code:
-                        other.included_in_replay = False
-                        other.cleanup_reason = (
-                            f"fusionne dans {canonical.id} (workaround JS "
-                            f"pour la meme interaction, deja capturee par le change)"
-                        )
-                        fused.append(other.id)
+                referenced = _selectors_referenced_by_evaluate(other.value)
+                if canonical_sel and canonical_sel in referenced:
+                    other.included_in_replay = False
+                    other.cleanup_reason = (
+                        f"fusionne dans {canonical.id} (evaluate cible exactement "
+                        "le checkbox canonique deja capture)"
+                    )
+                    fused.append(other.id)
         if fused:
             raw = canonical.raw_payload or {}
             if isinstance(raw, dict):
@@ -1236,91 +1333,38 @@ def _fuse_checkbox_interactions(steps: list[Step]) -> None:
 
 
 def _fuse_evaluate_workarounds(steps: list[Step]) -> None:
-    """Fusion generique : un evaluate BU qui manipule un element (via
-    .click(), .value=, .checked=, .dispatchEvent...) alors qu'un DOM
-    click/input/check/uncheck adjacent dans la meme fenetre a deja
-    capture l'interaction reelle -> l'evaluate est le WORKAROUND du meme
-    intent user. Le rejouer PLUS le DOM canonique = double action.
+    """Fusionne un evaluate seulement avec une preuve d'identite de cible.
 
-    Regle : garder le DOM canonique (source riche, selecteur validee
-    runtime), marquer l'evaluate included_in_replay=False + reason.
-
-    Ne s'applique QUE si l'evaluate n'a pas deja ete fusionne par le
-    passe checkbox (car le pattern _fuse_checkbox_interactions est plus
-    strict avec le contexte parentLabel).
+    L'ancienne version supprimait des blobs selon leur proximite temporelle
+    et la presence de ``.click()``. Deux actions voisines ne sont pas pour
+    autant la meme action. Ici un evaluate est fusionne uniquement lorsqu'un
+    selecteur explicite dans son code est identique au selecteur canonique.
+    Les evaluate restants seront exclus par :func:`classify_steps`.
     """
     FUSE_WINDOW_MS = 3000
     for i, ev in enumerate(steps):
-        if ev.action != "evaluate":
+        if ev.action != "evaluate" or not ev.included_in_replay or ev.timestamp is None:
             continue
-        if not ev.included_in_replay:
-            continue  # deja fusionne par le passe checkbox
-        code_raw = (ev.value or "") + " " + (ev.description or "")
-        code = code_raw.lower()
-        # REGLE INCONDITIONNELLE : evaluate qui contient un workflow entier
-        # (multi-clicks ou primitives async) => JAMAIS rejouable en TS.
-        # Ces blobs font plusieurs actions en background via setTimeout,
-        # sans coordination avec le driver Playwright -> race conditions
-        # garanties avec les steps canoniques suivants (cas todomvc step 12
-        # qui click Clear completed via setTimeout avant que Playwright
-        # atteigne le step 17 canonique -> bouton disparu -> timeout).
-        n_clicks = code.count(".click(")
-        has_async = ("settimeout" in code or "setinterval" in code
-                     or "await " in code or ".then(" in code or "promise" in code)
-        if n_clicks >= 2 or has_async:
-            ev.included_in_replay = False
-            reasons = []
-            if n_clicks >= 2:
-                reasons.append(f"multi-clicks dans le blob ({n_clicks})")
-            if has_async:
-                reasons.append("primitives async (setTimeout/Promise) non attendues par Playwright")
-            ev.cleanup_reason = (
-                "evaluate workflow non-rejouable : "
-                + ", ".join(reasons)
-                + " - les steps canoniques adjacents couvrent l'intent"
-            )
+        referenced = _selectors_referenced_by_evaluate(ev.value)
+        if not referenced:
             continue
-        ts = ev.timestamp
-        if ts is None:
-            continue
-        # Heuristique : l'evaluate manipule un element interactif
-        touches_dom = (
-            ".click()" in code or ".value" in code or ".checked" in code
-            or ".dispatchevent" in code or ".submit()" in code or ".focus()" in code
-        )
-        if not touches_dom:
-            continue
-        # PROTECTION : un evaluate qui ecrit >=2 champs (.value= ou .checked=)
-        # est un blob de remplissage formulaire complet (ex: gender radio +
-        # password + adresse + submit d'un signup). Intent DIFFERENT d'un
-        # simple click canonique adjacent. Le fusionner avec le click qui
-        # ouvre le formulaire laisserait le form vide au replay.
-        n_field_writes = code.count(".value =") + code.count(".value=") + code.count(".checked =") + code.count(".checked=")
-        if n_field_writes >= 2:
-            # Blob remplissage formulaire complet : intent different d'un
-            # click canonique adjacent. Ne pas fusionner l'evaluate (il
-            # doit rester actif pour remplir les champs au replay). Les
-            # eventuels doublons du click interne .click() sont deja
-            # elimines : ils apparaissent comme dom_orphan (pas de BU action
-            # correspondante) et sont supprimes par la regle dom_orphan.
-            continue
-        # Cherche un step DOM canonique (click/input/check/uncheck)
-        # dans la fenetre temporelle qui refleterait le meme intent
         for j, other in enumerate(steps):
             if j == i or not other.included_in_replay:
                 continue
-            if other.timestamp is None or abs(other.timestamp - ts) > FUSE_WINDOW_MS:
+            if other.timestamp is None or abs(other.timestamp - ev.timestamp) > FUSE_WINDOW_MS:
                 continue
-            # Source riche : DOM listener direct ou BU+DOM fusionne
             if other.source not in ("dom_listener", "bu+dom"):
                 continue
-            if other.action in ("click", "input", "check", "uncheck", "select"):
+            selector = _step_selector_value(other)
+            if (
+                other.action in ("click", "input", "check", "uncheck", "select")
+                and selector and selector in referenced
+            ):
                 ev.included_in_replay = False
                 ev.cleanup_reason = (
-                    f"fusionne avec {other.id} (evaluate JS workaround dont "
-                    f"l'intent est deja capture par un {other.action} canonique)"
+                    f"fusionne avec {other.id} (evaluate et step canonique "
+                    "ciblent exactement le meme selecteur)"
                 )
-                # Trace inverse sur le canonique
                 raw = other.raw_payload or {}
                 if isinstance(raw, dict):
                     fused = list(raw.get("fused_sources") or [])
@@ -1400,67 +1444,18 @@ def detect_and_flag_sensitive(steps: list[Step]) -> list[dict]:
 
 
 # ============================================================
-# 4. LLM en mode classificateur (pas constructeur)
+# 4. Classification locale stricte
 # ============================================================
 
-CLASSIFIER_SYSTEM_PROMPT = """Tu es un classificateur QA. On te fournit une liste
-de steps DEJA CONSTRUITS a partir de captures runtime (DOM listener + browser-use
-history). Ton role N'EST PAS de reconstruire les steps ni d'inventer des selecteurs.
-
-Ton role est UNIQUEMENT :
-1. Pour chaque step, decider s'il doit etre inclus dans le replay ou marque
-   comme parasite (included_in_replay: false + cleanup_reason court).
-2. Lister les anomalies detectees au niveau global (sans modifier les steps).
-3. Fournir une courte liste filtered_noise resumant ce qui a ete ecarte.
-
-Regles de filtrage :
-- CONSERVE : click sur bouton/lien/input/select interactifs, input, select,
-  navigate, verify, scroll, hover, wait, screenshot, cookie, keyboard, upload,
-  go_back/forward/reload, open_tab/switch_tab.
-- MARQUE PARASITE (included_in_replay=false) : clics consecutifs identiques,
-  clics sur backdrop/overlay/modal non interactif, clics sur conteneur div/section
-  sans role/aria-label, saisies successives redondantes sur le meme champ.
-- NE FILTRE PAS un scroll : le scroll est significatif pour reveler du contenu.
-
-Ne modifie JAMAIS le champ selector d'un step. Tu es en lecture uniquement pour
-ces valeurs. Toute correction se fait via anomalies + cleanup_reason.
-
-Reponds UNIQUEMENT en JSON strict :
-{
-  "classifications": [
-    {"step_id": "step-0001", "included_in_replay": true},
-    {"step_id": "step-0002", "included_in_replay": false, "cleanup_reason": "clic sur overlay modal"},
-    ...
-  ],
-  "anomalies": ["selecteur non-unique sur step-0004 (matchCount=3)", "..."],
-  "filtered_noise": ["3 clics consecutifs sur #login-btn (garde le 1er)"]
-}
-"""
-
-
-def deterministic_classify_steps(
+def classify_steps(
     steps: list[Step],
 ) -> tuple[list[Step], list[str], list[str]]:
-    """Classifie included_in_replay + anomalies + filtered_noise SANS AUCUN
-    appel LLM ni reseau. Retourne (steps annotes, anomalies, filtered_noise).
+    """Decide le replay sans LLM, uniquement a partir de preuves capturees.
 
-    Regles conservatrices : par defaut included_in_replay=True. Marque False
-    UNIQUEMENT quand une regle explicite matche. Preserve les fusions deja
-    posees en amont (checkbox setChecked, evaluate) qui ont deja pose False.
-
-    Regles de rejet :
-      R1  clics consecutifs identiques (meme selector, meme page, < 500ms) :
-          garde le premier, marque les suivants False + "clic consecutif redondant"
-      R2  click sans selector exploitable : action=click ET selector absent /
-          value vide -> False + "clic sans selecteur"
-      R3  input sans valeur : action in {input, setText} ET value vide -> False
-          + "saisie vide"
-
-    Anomalies remontees (sans modifier les steps) :
-      A1  selector non-unique (unique=False OR matchCount > 1) :
-          "step-XXXX : selecteur non-unique (matchCount=N)"
-      A2  step interactif sans selector : "step-XXXX : action X sans selecteur"
-      A3  source cdp_fallback : "step-XXXX : capture via fallback CDP (fragile)"
+    Une action interactive n'est incluse que si son locator a ete mesure
+    unique (ou si elle dispose d'une primitive contextuelle explicite telle
+    que ``parentLabel`` pour un checkbox). Une absence de preuve devient une
+    anomalie auditable, jamais un ``.first()`` silencieux.
     """
     if not steps:
         return steps, [], []
@@ -1476,20 +1471,10 @@ def deterministic_classify_steps(
             return sel or None
         return getattr(sel, "value", None) or None
 
-    def _sel_unique(s: Step) -> bool | None:
-        sel = s.selector
-        if sel is None or isinstance(sel, str):
-            return None
-        return getattr(sel, "unique", None)
-
-    def _sel_matchcount(s: Step) -> int | None:
-        sel = s.selector
-        if sel is None or isinstance(sel, str):
-            return None
-        return getattr(sel, "matchCount", None)
-
-    INTERACTIVE_ACTIONS = {"click", "input", "setText", "select", "hover",
-                           "check", "uncheck", "setChecked", "upload"}
+    interactive_actions = {
+        "click", "input", "settext", "select", "hover",
+        "check", "uncheck", "setchecked", "upload", "cookie",
+    }
 
     prev_click_key = None
     prev_click_ts: int | None = None
@@ -1497,9 +1482,10 @@ def deterministic_classify_steps(
         if getattr(s, "included_in_replay", True) is False:
             continue
 
-        act = s.action
+        act = s.action.lower()
         sel_val = _sel_value(s)
         val = getattr(s, "value", None)
+        sid = s.id or f"step-?({act})"
 
         # R1 : clic consecutif identique
         if act == "click" and sel_val:
@@ -1516,27 +1502,53 @@ def deterministic_classify_steps(
             prev_click_key = None
             prev_click_ts = None
 
-        # R2 : click sans selector
-        if act == "click" and not sel_val:
+        # Le JS arbitraire n'est pas un format de replay canonique : il peut
+        # masquer ses erreurs, lancer plusieurs actions et contourner les
+        # garanties strictes de Playwright.
+        if act == "evaluate":
             s.included_in_replay = False
-            s.cleanup_reason = "clic sans selecteur exploitable"
+            s.replay_blocking = True
+            s.cleanup_reason = "evaluate JavaScript brut non canonique"
+            anomalies.append(f"{sid} : evaluate brut exclu du replay")
             continue
 
-        # R3 : input vide
-        if act in ("input", "setText") and (val is None or val == ""):
+        if act in ("input", "settext") and (val is None or val == ""):
             s.included_in_replay = False
+            s.replay_blocking = True
             s.cleanup_reason = "saisie vide"
+            anomalies.append(f"{sid} : saisie vide exclue du replay")
             continue
 
-        # Anomalies (sans modifier included_in_replay)
-        sid = s.id or f"step-?({act})"
-        if act in INTERACTIVE_ACTIONS:
-            unique = _sel_unique(s)
-            mc = _sel_matchcount(s)
-            if unique is False or (mc is not None and mc > 1):
-                anomalies.append(f"{sid} : selecteur non-unique (matchCount={mc})")
-            if sel_val is None and act != "upload":
-                anomalies.append(f"{sid} : {act} sans selecteur")
+        if act in interactive_actions:
+            raw = s.raw_payload if isinstance(s.raw_payload, dict) else {}
+            contextual_checkbox = (
+                act in ("check", "uncheck", "setchecked")
+                and isinstance(raw.get("parentLabel"), str)
+                and bool(raw.get("parentLabel"))
+                and raw.get("parentLabelMatchCount") == 1
+                and raw.get("parentCheckboxMatchCount") == 1
+            )
+            contextual_click = (
+                act == "click"
+                and isinstance(raw.get("parentLabel"), str)
+                and bool(raw.get("parentLabel"))
+                and raw.get("parentLabelMatchCount") == 1
+                and raw.get("parentScopedMatchCount") == 1
+            )
+            contextual_scope = contextual_checkbox or contextual_click
+            if not sel_val and not contextual_scope:
+                s.included_in_replay = False
+                s.replay_blocking = True
+                s.cleanup_reason = f"action {act} sans selecteur mesure"
+                anomalies.append(f"{sid} : {act} sans selecteur mesure")
+                continue
+            if not contextual_scope and not _selector_is_verified_unique(s.selector):
+                mc = getattr(s.selector, "matchCount", None) if not isinstance(s.selector, str) else None
+                s.included_in_replay = False
+                s.replay_blocking = True
+                s.cleanup_reason = "selecteur non verifie unique pendant la capture"
+                anomalies.append(f"{sid} : selecteur non verifie unique (matchCount={mc})")
+                continue
         if getattr(s, "source", None) == "cdp_fallback":
             anomalies.append(f"{sid} : capture via fallback CDP (selecteur fragile)")
 
@@ -1547,201 +1559,12 @@ def deterministic_classify_steps(
     return steps, anomalies, filtered_noise
 
 
-def ai_classify_steps(
-    steps: list[Step],
-    scenario_steps: list[dict[str, Any]] | None,
-    model: str,
-    base_url: str | None,
-    api_key: str | None,
-    use_llm: bool = False,
-    llm_timeout_s: float = 30.0,
-) -> tuple[list[Step], list[str], list[str]]:
-    """Classifie les steps. Par defaut (use_llm=False) : 100% deterministe,
-    zero appel reseau, retourne en <1s meme sur 200 steps.
-
-    Si use_llm=True : lance d'abord la classif deterministe (baseline safe),
-    puis un appel LLM avec TIMEOUT COURT (30s default) pour raffiner sur les
-    steps ambigus. En cas d'echec/timeout LLM, le baseline deterministe est
-    garanti - le JSON, le TS et les exports restent generables meme si
-    OpenAI ne repond pas apres la fin de Browser Use.
-    """
-    if not steps:
-        return steps, [], []
-
-    # Phase 1 : classification deterministe (toujours, garantie 0 reseau)
-    steps, det_anomalies, det_noise = deterministic_classify_steps(steps)
-
-    if not use_llm:
-        return steps, det_anomalies, det_noise
-
-    # Phase 2 (optionnelle) : raffinement LLM sur les steps encore inclus
-    # (les False deterministes sont ACQUIS et ne sont jamais reevalues).
-    ambiguous = [s for s in steps if getattr(s, "included_in_replay", True) is True]
-    if not ambiguous:
-        return steps, det_anomalies, det_noise
-
-    projected = [
-        {
-            "step_id": s.id,
-            "action": s.action,
-            "description": s.description,
-            "selector": (s.selector.value if s.selector and not isinstance(s.selector, str) else s.selector),
-            "unique": _sel_unique_flat(s),
-            "matchCount": _sel_matchcount_flat(s),
-            "page": s.page,
-            "source": s.source,
-        }
-        for s in ambiguous
-    ]
-
-    user_content = (
-        (f"SCENARIO ATTENDU :\n{json.dumps(scenario_steps, ensure_ascii=False)}\n\n" if scenario_steps else "")
-        + f"STEPS A CLASSIFIER :\n{json.dumps(projected, ensure_ascii=False)}"
-    )
-
-    client_kwargs = {"timeout": llm_timeout_s}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    try:
-        client = OpenAI(**client_kwargs)
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": CLASSIFIER_SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0,
-            timeout=llm_timeout_s,
-        )
-        raw = response.choices[0].message.content.strip()
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
-        parsed = json.loads(raw.strip())
-    except Exception as e:
-        # Fallback : deterministic baseline garde ses decisions,
-        # les steps ambigus restent inclus (needs_review implicite via anomalie)
-        return steps, det_anomalies + [
-            f"[needs_review] Raffinement LLM en echec sur {len(ambiguous)} steps ambigus : {type(e).__name__}"
-        ], det_noise
-
-    # Applique les classifications LLM sur les steps ambigus UNIQUEMENT
-    by_id = {s.id: s for s in ambiguous}
-    for c in (parsed.get("classifications") or []):
-        sid = c.get("step_id")
-        s = by_id.get(sid)
-        if not s:
-            continue
-        included = c.get("included_in_replay")
-        if included is False:
-            s.included_in_replay = False
-            if c.get("cleanup_reason"):
-                s.cleanup_reason = c["cleanup_reason"][:200]
-
-    llm_anomalies = [a for a in (parsed.get("anomalies") or []) if isinstance(a, str)]
-    llm_noise = [f for f in (parsed.get("filtered_noise") or []) if isinstance(f, str)]
-    return steps, det_anomalies + llm_anomalies, det_noise + llm_noise
-
-
-def _sel_unique_flat(s: Step) -> bool | None:
-    sel = s.selector
-    if sel is None or isinstance(sel, str):
-        return None
-    return getattr(sel, "unique", None)
-
-
-def _sel_matchcount_flat(s: Step) -> int | None:
-    sel = s.selector
-    if sel is None or isinstance(sel, str):
-        return None
-    return getattr(sel, "matchCount", None)
+# Alias historique purement local conserve pour les integrations existantes.
+deterministic_classify_steps = classify_steps
 
 
 # ============================================================
-# 5. Generation d'export code (Katalon/Cypress/Selenium)
-# ============================================================
-
-EXPORT_SYSTEM_PROMPT_TEMPLATE = """Tu es un generateur de code test QA. On te fournit
-une liste de steps DEJA VALIDES issus d'une capture DOMAutopsy. Ton role est de
-generer un test fonctionnel dans le format {format_label}.
-
-REGLES STRICTES :
-- Ne modifie JAMAIS un selecteur qui a unique: true. Utilise-le tel quel.
-- Pour les steps sensitive: true, remplace la valeur par une variable d'environnement
-  (ex: process.env.NOM_VAR ou System.getenv, selon le langage).
-- Utilise les selecteurs XPath (commencant par //) via l'API xpath du framework.
-- Skip les steps included_in_replay: false : ils sont marques comme parasites.
-- Commentaires en francais, code fonctionnel, imports en tete.
-
-{code_instructions}
-
-Reponds UNIQUEMENT avec le code, pas de markdown, pas d'explication.
-"""
-
-
-def generate_export_code(
-    clean_steps: CleanSteps,
-    output_format: str,
-    model: str,
-    base_url: str | None,
-    api_key: str | None,
-    output_formats_map: dict[str, dict[str, str]],
-) -> str | None:
-    """Genere le code d'export dans le format demande (Katalon/Cypress/Selenium/Playwright).
-
-    Pour 'playwright', le TS canonique est deja produit par playwright_generator
-    (deterministe) - on renvoie None pour eviter de doublonner.
-    """
-    if output_format == "playwright":
-        return None
-    fmt = output_formats_map.get(output_format)
-    if fmt is None:
-        return None
-    steps_projected = [
-        s.model_dump(exclude_none=True) for s in clean_steps.steps
-        if s.included_in_replay
-    ]
-    system = EXPORT_SYSTEM_PROMPT_TEMPLATE.format(
-        format_label=fmt["label"],
-        code_instructions=fmt["code_instructions"],
-    )
-    user = json.dumps({
-        "parcours": clean_steps.parcours,
-        "scenario_url": clean_steps.scenario_url,
-        "steps": steps_projected,
-    }, ensure_ascii=False, indent=2)
-
-    client_kwargs = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    try:
-        client = OpenAI(**client_kwargs)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0,
-        )
-        raw = resp.choices[0].message.content.strip()
-        # Nettoyage markdown fences si presents
-        if raw.startswith("```"):
-            raw = raw.split("\n", 1)[1]
-        if raw.endswith("```"):
-            raw = raw.rsplit("```", 1)[0]
-        return raw.strip()
-    except Exception as e:
-        return f"// [DOMAutopsy] Generation code {output_format} en echec : {e}\n"
-
-
-# ============================================================
-# 6. Orchestration complete
+# 5. Orchestration complete
 # ============================================================
 
 def build_clean_steps(
@@ -1760,12 +1583,9 @@ def build_clean_steps(
 ) -> tuple[CleanSteps, list[str]]:
     """Orchestration complete de la construction du clean_steps.json enrichi.
 
-    Par defaut (use_llm=False) : 100% DETERMINISTE, ZERO appel reseau.
-    Le JSON, le TS et les exports sont generables meme si OpenAI ne repond
-    plus apres la fin de Browser Use. Termine en <1s meme sur 200 steps.
-
-    Si use_llm=True : classif deterministe d'abord (baseline safe),
-    puis raffinement LLM avec timeout court + fallback needs_review.
+    ``model``, ``base_url``, ``api_key``, ``use_llm`` et ``llm_timeout_s``
+    restent dans la signature pour compatibilite API, mais ne sont jamais
+    utilises : tout le post-traitement est local et deterministe.
 
     Retourne (CleanSteps valide, list des env_vars sensibles a configurer).
     """
@@ -1779,11 +1599,8 @@ def build_clean_steps(
     # ...) sont deja publiques dans le confirmed_task.
     sensitive_env_vars = detect_and_flag_sensitive(steps) if detect_sensitive else []
 
-    # 3. Classification : deterministe garantie + LLM optionnel avec timeout
-    steps, anomalies, filtered_noise = ai_classify_steps(
-        steps, scenario_steps, model=model, base_url=base_url, api_key=api_key,
-        use_llm=use_llm, llm_timeout_s=llm_timeout_s,
-    )
+    # 3. Classification locale stricte, sans appel reseau.
+    steps, anomalies, filtered_noise = classify_steps(steps)
 
     # 4. Construction du CleanSteps
     clean = CleanSteps(

@@ -197,6 +197,24 @@ def test_scenario_verify_and_cookie_added_as_steps():
     assert "cookie" in actions
 
 
+def test_bu_scroll_without_selector_remains_replayable():
+    steps = build_pre_cleanup_steps(
+        scenario_steps=None,
+        bu_history=[{
+            "normalized_actions": [{
+                "action": {"scroll": {"direction": "down", "amount": 650}},
+                "action_index": 0,
+                "interacted_element": None,
+            }],
+        }],
+        dom_log=[],
+        network_log=None,
+    )
+    scroll = next(step for step in steps if step.action == "scroll")
+    assert scroll.included_in_replay is True
+    assert scroll.replay_blocking is False
+
+
 # --------------------------------------------------------------------
 # detect_and_flag_sensitive() : #9 (sensitive protection)
 # --------------------------------------------------------------------
@@ -210,7 +228,7 @@ def test_sensitive_inputs_get_env_var_assigned():
         Step(id="step-0003", step=3, action="click"),
     ]
     env_vars = detect_and_flag_sensitive(steps)
-    assert "DOMAUTOPSY_STEP_0002" in env_vars
+    assert any(item["name"] == "DOMAUTOPSY_STEP_0002" for item in env_vars)
     assert steps[1].env_var == "DOMAUTOPSY_STEP_0002"
     assert steps[0].env_var is None  # pas sensitive
     assert steps[2].env_var is None  # pas input

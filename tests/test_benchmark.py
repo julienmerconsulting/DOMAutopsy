@@ -249,11 +249,14 @@ def test_deterministic_classify_filters_duplicate_clicks():
     from schemas import Step, Selector
     steps = [
         Step(id="step-0001", action="click", page="p1", timestamp=1000,
-             selector=Selector(value="#login-btn", unique=True)),
+             selector=Selector(value="#login-btn", unique=True, matchCount=1,
+                               verifiedAtCapture=True)),
         Step(id="step-0002", action="click", page="p1", timestamp=1100,
-             selector=Selector(value="#login-btn", unique=True)),
+             selector=Selector(value="#login-btn", unique=True, matchCount=1,
+                               verifiedAtCapture=True)),
         Step(id="step-0003", action="click", page="p1", timestamp=1250,
-             selector=Selector(value="#login-btn", unique=True)),
+             selector=Selector(value="#login-btn", unique=True, matchCount=1,
+                               verifiedAtCapture=True)),
     ]
     out, anomalies, noise = deterministic_classify_steps(steps)
     assert out[0].included_in_replay is True
@@ -261,6 +264,49 @@ def test_deterministic_classify_filters_duplicate_clicks():
     assert out[2].included_in_replay is False
     assert "redondant" in out[1].cleanup_reason
     assert any("#login-btn" in n for n in noise)
+
+
+def test_replayable_requires_success_agent_oracle_and_zero_unsupported(tmp_path):
+    from benchmark_runner import _is_replayable
+
+    (tmp_path / "test_playwright.spec.ts").write_text("// spec", encoding="utf-8")
+    valid = {
+        "capture_result": "success",
+        "agent_status": "success",
+        "clean_steps_included": 3,
+        "replay_blocking_steps": 0,
+        "playwright_unsupported_count": 0,
+        "oracle_required": True,
+        "oracle_asserted": True,
+        "output_dir": str(tmp_path),
+    }
+    assert _is_replayable(valid) is True
+    for key, value in (
+        ("agent_status", "unknown"),
+        ("clean_steps_included", 0),
+        ("replay_blocking_steps", 1),
+        ("playwright_unsupported_count", 1),
+        ("oracle_asserted", False),
+    ):
+        invalid = dict(valid, **{key: value})
+        assert _is_replayable(invalid) is False
+
+
+def test_successful_replay_without_oracle_is_not_oracle_pass(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    import benchmark_runner
+
+    spec = tmp_path / "plain.spec.ts"
+    spec.write_text("test('plain', async () => {});", encoding="utf-8")
+    monkeypatch.setattr(
+        benchmark_runner.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="ok", stderr=""),
+    )
+    result = benchmark_runner._run_replay(spec, tmp_path / "out", timeout_s=2)
+    assert result["status"] == "pass"
+    assert result["oracle_present"] is False
+    assert result["oracle_pass"] is None
 
 
 def test_generate_playwright_ts_injects_oracle_assertions(tmp_path):

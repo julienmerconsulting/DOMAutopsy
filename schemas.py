@@ -60,6 +60,10 @@ class Selector(BaseModel):
     shadowChain: Optional[list[dict[str, Any]]] = None
     playwrightSelector: Optional[str] = None
     jsSelector: Optional[str] = None
+    verifiedAtCapture: Optional[bool] = None
+    stability: Optional[Literal["high", "medium", "low"]] = None
+    priority: Optional[int] = None
+    captureSource: Optional[str] = None
 
 
 class NetworkRef(BaseModel):
@@ -153,6 +157,7 @@ class Step(BaseModel):
     # Filtrage
     included_in_replay: bool = True
     cleanup_reason: Optional[str] = None
+    replay_blocking: bool = False
 
     # Payload brut si action inconnue
     raw_payload: Optional[dict[str, Any]] = None

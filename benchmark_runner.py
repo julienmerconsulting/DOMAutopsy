@@ -223,6 +223,10 @@ def _run_replay(spec_path: Path, replay_output_dir: Path, timeout_s: float) -> d
         spec_rel = str(spec_path)
     output_rel = replay_output_dir.relative_to(ROOT).as_posix() if replay_output_dir.is_relative_to(ROOT) else str(replay_output_dir)
     cmd = ["npx", "playwright", "test", spec_rel, "--workers=1", f"--output={output_rel}"]
+    try:
+        oracle_present = "[oracle]" in spec_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        oracle_present = False
     t0 = time.monotonic()
     try:
         if sys.platform == "win32":
@@ -244,13 +248,9 @@ def _run_replay(spec_path: Path, replay_output_dir: Path, timeout_s: float) -> d
         stdout = proc.stdout or ""
         stderr = proc.stderr or ""
         combined = stdout + "\n" + stderr
-        # Un oracle est present si le TS contient le marqueur "[oracle]"
-        # (heuristique : Playwright reporter l'imprime dans la sortie qu'il
-        # matche ou non). Sur une reussite complete, on ne le voit pas
-        # explicitement dans line reporter, mais le exit=0 vaut oracle_pass=True.
-        oracle_step_failed = ("[oracle]" in combined) and (proc.returncode != 0)
+        oracle_step_failed = oracle_present and ("[oracle]" in combined) and (proc.returncode != 0)
         oracle_pass: bool | None
-        if proc.returncode == 0:
+        if proc.returncode == 0 and oracle_present:
             oracle_pass = True
         elif oracle_step_failed:
             oracle_pass = False
@@ -259,9 +259,10 @@ def _run_replay(spec_path: Path, replay_output_dir: Path, timeout_s: float) -> d
         return {
             "status": "pass" if proc.returncode == 0 else "fail",
             "returncode": proc.returncode,
+            "oracle_present": oracle_present,
             "oracle_pass": oracle_pass,
             "duration_s": round(time.monotonic() - t0, 1),
-            "error": None if proc.returncode == 0 else stdout[-500:],
+            "error": None if proc.returncode == 0 else combined[-1000:],
         }
     except subprocess.TimeoutExpired:
         return {
@@ -272,9 +273,18 @@ def _run_replay(spec_path: Path, replay_output_dir: Path, timeout_s: float) -> d
 
 
 def _is_replayable(capture_result: dict) -> bool:
-    """Un run est rejouable si la capture BU a reussi (success ou fail
-    fonctionnel) ET qu'un test_playwright.spec.ts a ete genere."""
+    """Valide qu'un artefact merite reellement d'entrer dans le replay."""
     if capture_result.get("capture_result") != "success":
+        return False
+    if capture_result.get("agent_status") != "success":
+        return False
+    if not capture_result.get("clean_steps_included"):
+        return False
+    if int(capture_result.get("replay_blocking_steps") or 0) > 0:
+        return False
+    if int(capture_result.get("playwright_unsupported_count") or 0) > 0:
+        return False
+    if capture_result.get("oracle_required") and capture_result.get("oracle_asserted") is not True:
         return False
     od = capture_result.get("output_dir")
     if not od:

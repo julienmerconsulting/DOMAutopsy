@@ -26,7 +26,9 @@
 
 Les outils existants (Selenium IDE, Katalon Recorder, Cypress Studio) font du **record/replay** : ils enregistrent ce qu'ils voient, avec les sélecteurs qu'ils trouvent — souvent des XPath absolus ou des classes CSS générées qui cassent au premier refactoring.
 
-DOMAutopsy fait de l'**autopsie intelligente** : un agent IA navigue comme un humain, un listener JS intercepte chaque interaction et applique une **cascade de 7 niveaux** pour choisir le sélecteur le plus robuste. L'IA nettoie le bruit. Tu reçois du code prod.
+DOMAutopsy fait de l'**autopsie intelligente** : un agent IA navigue comme un humain, puis le nœud exact est retrouvé avant fermeture du navigateur. Les candidats de sélecteurs sont mesurés dans le DOM vivant et le nettoyage est local, déterministe et fail-closed. Tu reçois du code prod.
+
+Si une interaction ne possède aucune preuve live unique et stable, elle reste visible dans les artefacts mais porte `replay_blocking=true` : le replay est refusé au lieu d'exécuter silencieusement un scénario partiel.
 
 Et depuis la v0.5, c'est un **serveur web async multi-run** : tu lances N runs en parallèle, tu regardes chacun en live screencast dans ton navigateur, tu intègres tout ça à ton CI/CD via le CLI et le dashboard `/ci/{run_id}` partageable.
 
@@ -35,7 +37,7 @@ Et depuis la v0.5, c'est un **serveur web async multi-run** : tu lances N runs e
 | Approche | Record/replay | Record/replay | Record/replay | **Agent IA + DOM Listener découplés** |
 | Sélecteurs | XPath absolu / CSS fragile | XPath / CSS | XPath / CSS | **Cascade 7 niveaux, validée runtime** |
 | Shadow DOM | ❌ | ❌ | ⚠️ partiel | **✅ natif (chaîne `>>>`)** |
-| Nettoyage IA | ❌ | ❌ | ❌ | **✅ OpenAI/Groq, filtre bruit + anomalies** |
+| Nettoyage post-capture | ❌ | ❌ | ❌ | **✅ local, déterministe, sans LLM** |
 | Redacting credentials | ❌ | ❌ | ❌ | **✅ automatique (sélecteur conservé)** |
 | 4 formats sortie | ❌ | ❌ Katalon seul | ❌ PW seul | **✅ Katalon / Playwright / Cypress / Selenium** |
 | Multi-run parallèle | ❌ | ❌ | ❌ | **✅ 50 simultanés, port CDP unique chacun** |

@@ -5,14 +5,10 @@ lors du run R9 real produit :
 - 4 saisies distinctes avec les 4 valeurs exactes des taches
 - 4 Enter (pas 8 via dedup BU+DOM, pas 1 via fusion input globale bugguee)
 - 0 saisie "on" sur checkbox (filtre listener)
-- 1 seule interaction canonique sur la checkbox 'Verifier les selecteurs'
-- Click ambigu fusionne dans le check canonique via parentLabel
-- Le TS canonique genere passe reellement dans Chromium via
-  `npx playwright test` (test E2E) - stabilite 3x consecutif
+- Les contournements evaluate positionnels de cette ancienne capture sont
+  refuses : elle doit etre recapturee pour obtenir les preuves live
 """
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -33,8 +29,7 @@ def r9_rebuild(tmp_path):
     bu = json.loads((FIXTURE_DIR / "browser_use_history.json").read_text(encoding="utf-8"))
     dom = json.loads((FIXTURE_DIR / "locator_dedup.json").read_text(encoding="utf-8"))
     net = json.loads((FIXTURE_DIR / "network_log.json").read_text(encoding="utf-8"))
-    # api_key=None -> ai_classify_steps echoue silencieusement, on garde
-    # les steps tels quels (pipeline deterministe pur).
+    # Post-traitement local strict : api_key/model sont ignores.
     clean, _ = build_clean_steps(
         scenario_name="r9 regression",
         scenario_url="https://demo.playwright.dev/todomvc/",
@@ -89,36 +84,31 @@ def test_r9_no_parasitic_on_input_from_checkbox(r9_rebuild):
     assert parasitic == [], f"Saisie 'on' parasite trouvee : {parasitic}"
 
 
-def test_r9_single_canonical_checkbox_interaction(r9_rebuild):
-    """Une SEULE interaction canonique sur la checkbox, pas 3 (click +
-    change + evaluate) qui aurait produit 3 toggles au replay."""
+def test_r9_legacy_checkbox_without_live_proof_is_not_replayable(r9_rebuild):
+    """Cette fixture predatant les comptages contextuels live ne doit pas
+    etre promue artificiellement en interaction checkbox fiable."""
     clean, _, _ = r9_rebuild
     canonical_checks = [
         s for s in clean.steps
         if s.action in ("check", "uncheck") and s.included_in_replay
     ]
-    assert len(canonical_checks) == 1, (
-        f"Attendu 1 canonique check/uncheck, obtenu {len(canonical_checks)}"
-    )
-    # Doit porter le parentLabel de la bonne tache
-    raw = canonical_checks[0].raw_payload or {}
-    assert raw.get("parentLabel") == "Verifier les selecteurs"
+    assert canonical_checks == []
+    legacy_checks = [s for s in clean.steps if s.action in ("check", "uncheck")]
+    assert len(legacy_checks) == 1
+    assert legacy_checks[0].source == "dom_orphan"
+    assert legacy_checks[0].included_in_replay is False
 
 
-def test_r9_ambiguous_click_fused_into_canonical_check(r9_rebuild):
-    """Le click DOM sur [aria-label='Toggle Todo'] doit etre fusionne
-    (included_in_replay=False) car son intent est deja capture par
-    le check canonique."""
+def test_r9_positional_evaluate_is_excluded(r9_rebuild):
+    """Le evaluate querySelectorAll(...)[1] ne devient jamais du TS."""
     clean, _, _ = r9_rebuild
-    ambiguous_clicks = [
+    evaluates = [
         s for s in clean.steps
-        if s.action == "click"
-        and not s.included_in_replay
-        and "fusionne dans" in (s.cleanup_reason or "")
+        if s.action == "evaluate"
     ]
-    assert len(ambiguous_clicks) >= 1, (
-        "Attendu au moins 1 click DOM fusionne dans le check canonique"
-    )
+    assert evaluates
+    assert all(not step.included_in_replay for step in evaluates)
+    assert all("non canonique" in (step.cleanup_reason or "") for step in evaluates)
 
 
 def test_r9_katalon_export_matches_json_counts(r9_rebuild):
@@ -143,42 +133,9 @@ def _has_node_modules():
     return (ROOT / "node_modules" / "@playwright" / "test").exists()
 
 
-@pytest.mark.skipif(not _has_npx() or not _has_node_modules(),
-                    reason="npx ou @playwright/test absent")
-def test_r9_ts_replay_passes_on_real_chromium(r9_rebuild):
-    """Le TS canonique regenere depuis les artifacts R9 doit passer
-    reellement dans Chromium via `npx playwright test`. Preuve que la
-    fusion + parentLabel + setChecked eliminent les strict mode violations
-    sur les selecteurs ambigus TodoMVC."""
-    clean, spec_path, tmp_path = r9_rebuild
-    # spec_path est dans tmp_path : on doit le placer sous ROOT/runs/
-    # pour que le chemin relatif marche pour npx playwright test.
-    dst_dir = ROOT / "runs" / "_r9_regression_tmp"
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    dst_spec = dst_dir / "test_playwright.spec.ts"
-    dst_spec.write_text(spec_path.read_text(encoding="utf-8"), encoding="utf-8")
-    spec_rel = dst_spec.relative_to(ROOT).as_posix()
-
-    try:
-        cmd = ["npx", "playwright", "test", spec_rel, "--workers=1", "--reporter=list"]
-        if sys.platform == "win32":
-            cmd_str = " ".join(f'"{c}"' if " " in c else c for c in cmd)
-            result = subprocess.run(
-                cmd_str, shell=True, cwd=str(ROOT),
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=120,
-            )
-        else:
-            result = subprocess.run(
-                cmd, cwd=str(ROOT),
-                capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=120,
-            )
-        assert result.returncode == 0, (
-            f"Replay R9 fail (exit {result.returncode})\n"
-            f"stdout: {(result.stdout or '')[-2000:]}\n"
-            f"stderr: {(result.stderr or '')[-1000:]}"
-        )
-    finally:
-        import shutil as _sh
-        _sh.rmtree(dst_dir, ignore_errors=True)
+def test_r9_generated_ts_contains_no_raw_evaluate(r9_rebuild):
+    """L'ancien workaround JS reste visible dans le JSON mais pas dans le TS."""
+    _, spec_path, _ = r9_rebuild
+    body = spec_path.read_text(encoding="utf-8")
+    assert "page.evaluate" not in body
+    assert "SKIPPED" in body

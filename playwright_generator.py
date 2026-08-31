@@ -149,7 +149,11 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     # le <li> contenant 'Verifier les selecteurs').
     raw = step.raw_payload or {}
     parent_label = raw.get("parentLabel") if isinstance(raw, dict) else None
-    if parent_label:
+    if (
+        parent_label
+        and raw.get("parentLabelMatchCount") == 1
+        and raw.get("parentScopedMatchCount") == 1
+    ):
         sel_v, _ = _selector_value_and_type(step)
         pl = _ts_string(parent_label)
         sv = _ts_string(sel_v or "")
@@ -163,20 +167,14 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
         return [
             f"    // click conditionnel : {reason}",
             f"    const _opt = {loc};",
-            f"    if (await _opt.count() > 0) {{",
-            f"      await _opt.first().click();",
+            f"    const _optCount = await _opt.count();",
+            f'    if (_optCount > 1) throw new Error("click optionnel ambigu: " + _optCount + " elements");',
+            f"    if (_optCount === 1) {{",
+            f"      await _opt.click();",
             f"    }}",
         ]
-    # Selecteur promu depuis BU data-attr : sur les grilles de produits,
-    # un meme data-product-id peut apparaitre 2 fois dans le DOM (bouton
-    # normal + overlay hover). BU a cliqué UN element via son index CDP -
-    # .first() reproduit le comportement sans faire crasher Playwright
-    # sur strict mode violation.
-    if step.selector is not None and getattr(step.selector, "strategy", "") == "bu-data-attr":
-        return [f"    await {loc}.first().click();"]
-    # PAS de .first() par defaut : Playwright en mode strict crashe sur
-    # selecteur ambigu, ce qui est le comportement voulu (faire echouer
-    # plutot que cliquer silencieusement sur le mauvais element).
+    # Playwright strict doit echouer si le DOM du replay rend le locator
+    # ambigu. Aucun `.first()` ne choisit silencieusement un autre element.
     return [f"    await {loc}.click();"]
 
 
@@ -283,20 +281,17 @@ def _emit_screenshot(step: Step, sensitive_vars: dict[str, str], index: int) -> 
 
 
 def _emit_cookie(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
-    # Cookie banner : clic conditionnel avec timeout court, ne pas faire echouer
-    # si absent
+    # Cookie banner : action conditionnelle, mais jamais ambigue. Le locator
+    # doit venir de la capture ; aucun pattern generique n'est invente ici.
     loc = _locator_expr(step)
-    if loc:
-        return [
-            f"    try {{",
-            f"      await {loc}.first().click({{ timeout: 3000 }});",
-            f"    }} catch (_e) {{ /* cookie banner absente */ }}",
-        ]
-    # Sans selecteur : tentative sur les patterns communs
+    if not loc:
+        raise UnsupportedAction(step, "cookie sans selecteur mesure")
     return [
-        f"    try {{",
-        f'      await page.getByRole("button", {{ name: /accept|accepter|autoriser|ok/i }}).first().click({{ timeout: 3000 }});',
-        f"    }} catch (_e) {{ /* cookie banner absente */ }}",
+        f"    const _cookie = {loc};",
+        f"    try {{ await _cookie.waitFor({{ state: 'visible', timeout: 3000 }}); }} catch (_e) {{ /* cookie banner absente */ }}",
+        f"    const _cookieCount = await _cookie.count();",
+        f'    if (_cookieCount > 1) throw new Error("cookie locator ambigu: " + _cookieCount + " elements");',
+        f"    if (_cookieCount === 1) await _cookie.click();",
     ]
 
 
@@ -405,7 +400,11 @@ def _emit_check_uncheck(step: Step, sensitive_vars: dict[str, str]) -> list[str]
     parent_label = None
     if isinstance(raw, dict):
         parent_label = raw.get("parentLabel")
-    if parent_label:
+    if (
+        parent_label
+        and raw.get("parentLabelMatchCount") == 1
+        and raw.get("parentCheckboxMatchCount") == 1
+    ):
         pl_escaped = _ts_string(parent_label)
         return [
             f"    await page.getByRole('listitem').filter({{ hasText: {pl_escaped} }}).getByRole('checkbox').setChecked({checked_bool});"
@@ -417,26 +416,8 @@ def _emit_check_uncheck(step: Step, sensitive_vars: dict[str, str]) -> list[str]
 
 
 def _emit_evaluate(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
-    """evaluate : execution JS brute via page.evaluate(). BU 0.13 utilise
-    cette action pour les workaround clicks quand un selecteur est
-    ambigu (ex: document.querySelectorAll('.toggle')[1].click()). Le JS
-    original est stocke dans raw_payload.evaluate.code."""
-    raw = step.raw_payload or {}
-    code = None
-    if isinstance(raw, dict):
-        for k in ("evaluate", "execute_javascript", "run_js"):
-            v = raw.get(k)
-            if isinstance(v, dict):
-                code = v.get("code") or v.get("script") or v.get("js")
-                if code:
-                    break
-    if not code:
-        code = step.value or ""
-    if not code:
-        raise UnsupportedAction(step, "evaluate sans code JS")
-    # Escape backticks pour template literal TS
-    safe = code.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
-    return [f"    await page.evaluate(`{safe}`);"]
+    """Le JavaScript brut n'est jamais un step canonique de replay."""
+    raise UnsupportedAction(step, "evaluate JavaScript brut interdit dans le replay canonique")
 
 
 def _emit_extract(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
@@ -566,7 +547,10 @@ def generate_playwright_ts(
 
     # Fallback : si aucun navigate initial mais on a une URL scenario, on injecte
     has_initial_navigate = any(
-        s.action == "navigate" and s.included_in_replay for s in steps[:2]
+        s.action in ("navigate", "open_tab")
+        and s.included_in_replay
+        and bool(s.url or s.target or s.value)
+        for s in steps[:2]
     )
     if not has_initial_navigate and parcours_url:
         body_lines.append(
@@ -586,6 +570,10 @@ def generate_playwright_ts(
         # clean_steps.json (cleanup_reason) et le rapport HTML.
         if not step.included_in_replay:
             skipped_count += 1
+            reason = (step.cleanup_reason or "exclu du replay").replace("\n", " ")[:180]
+            body_lines.append(f"  // SKIPPED [{step_id}] {action_upper} - {desc}")
+            body_lines.append(f"  //   Raison : {reason}")
+            body_lines.append("")
             continue
 
         title = _ts_string(f"[{step_id}] {action_upper} - {desc}")

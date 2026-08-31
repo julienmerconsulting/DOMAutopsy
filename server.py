@@ -576,8 +576,37 @@ async def replay_run(run_id: str, headless: bool = True):
     source_dir = _find_run_dir(run_id)
     if source_dir is None or not source_dir.exists():
         raise HTTPException(404, f"Run source introuvable: {run_id}")
-    if not (source_dir / "clean_steps.json").exists():
+    clean_steps_file = source_dir / "clean_steps.json"
+    if not clean_steps_file.exists():
         raise HTTPException(400, f"clean_steps.json absent dans {source_dir.name}, replay impossible")
+
+    # Ne jamais lancer sciemment un TS partiel. Les steps de lecture/bruit
+    # peuvent etre SKIPPED, mais une interaction exclue faute de preuve live
+    # porte replay_blocking=true et invalide l'artefact canonique.
+    try:
+        clean_payload = json.loads(clean_steps_file.read_text(encoding="utf-8"))
+        blocking_steps = [
+            step for step in (clean_payload.get("steps") or [])
+            if isinstance(step, dict) and step.get("replay_blocking") is True
+        ]
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(400, f"clean_steps.json invalide: {exc}") from exc
+    if blocking_steps:
+        raise HTTPException(
+            409,
+            f"Replay refuse: {len(blocking_steps)} interaction(s) sans preuve deterministe; recapture requise",
+        )
+
+    try:
+        source_meta = json.loads((source_dir / "meta.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        source_meta = {}
+    unsupported_count = int(source_meta.get("playwright_unsupported_count") or 0)
+    if unsupported_count:
+        raise HTTPException(
+            409,
+            f"Replay refuse: {unsupported_count} step(s) Playwright non traduisible(s)",
+        )
 
     replay_id = uuid4().hex[:12]
     ts = __import__("datetime").datetime.now().strftime("%Y%m%d_%H%M%S")

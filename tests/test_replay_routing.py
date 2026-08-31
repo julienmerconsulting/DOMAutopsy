@@ -147,6 +147,20 @@ def test_replay_400_when_clean_steps_missing(app_with_stub_popen):
     assert resp.status_code == 400
 
 
+def test_replay_refuses_partial_spec_with_blocking_step(app_with_stub_popen):
+    srv, captured, tmp_path = app_with_stub_popen
+    run_dir = _make_run_dir(tmp_path, "blocked", with_ts=True)
+    payload = json.loads((run_dir / "clean_steps.json").read_text(encoding="utf-8"))
+    payload["steps"][0]["replay_blocking"] = True
+    (run_dir / "clean_steps.json").write_text(json.dumps(payload), encoding="utf-8")
+
+    client = TestClient(srv.app)
+    resp = client.post("/api/replay/blocked")
+    assert resp.status_code == 409
+    assert "recapture requise" in resp.json()["detail"]
+    assert captured["calls"] == []
+
+
 def test_replay_writes_initial_meta_with_engine(app_with_stub_popen):
     """meta.json initial doit contenir engine + is_replay + source_run_id
     des le POST, avant meme la fin du subprocess."""

@@ -1,6 +1,6 @@
 """
-QA Explorer - Browser-Use + DOM Listener + AI Cleanup
-=====================================================
+QA Explorer - Browser-Use + DOM Listener + Replay deterministe
+===============================================================
 Par Julien Mer / JMer Consulting - POC Browser-Use -> Katalon
 
 Pipeline :
@@ -9,8 +9,8 @@ Pipeline :
   3. browser-use se connecte au meme Chromium via CDP et execute le parcours
   4. Recupere le log brut des locateurs captures
   5. Deduplique les inputs (garde la derniere valeur par champ)
-  6. Envoie a GPT-4.1-mini pour nettoyer/ordonner les steps
-  7. Sauvegarde : locator_log.json (brut) + clean_steps.json (nettoye)
+  6. Enrichit et classe localement les steps a partir de preuves runtime
+  7. Sauvegarde : locator_log.json + clean_steps.json + Playwright TS
 
 Usage :
   # Depuis le Scenario Builder (JSON)
@@ -35,10 +35,19 @@ Exemples avec Groq :
   python qa_explorer.py --provider groq --model llama-3.3-70b-versatile scenario.json
 """
 
-from browser_use import Agent, BrowserSession, ChatOpenAI
-from playwright.async_api import async_playwright
-from openai import OpenAI
-from dotenv import load_dotenv
+try:
+    from browser_use import Agent, BrowserSession, ChatOpenAI
+except ModuleNotFoundError:  # permet les tests purs du post-traitement
+    Agent = BrowserSession = ChatOpenAI = None  # type: ignore[assignment]
+try:
+    from playwright.async_api import async_playwright
+except ModuleNotFoundError:
+    async_playwright = None  # type: ignore[assignment]
+try:
+    from dotenv import load_dotenv
+except ModuleNotFoundError:
+    def load_dotenv(*_args, **_kwargs):
+        return False
 import asyncio
 import json
 import os
@@ -52,9 +61,12 @@ from schemas import CURRENT_SCHEMA_VERSION
 from clean_steps_builder import (
     extract_browser_use_history,
     build_clean_steps,
-    generate_export_code,
 )
 from playwright_generator import generate_playwright_ts
+from selector_enricher import (
+    enrich_browser_use_history_selectors,
+    enrich_browser_use_step_snapshot,
+)
 
 # Charger les variables du .env (OPENAI_API_KEY notamment)
 load_dotenv()
@@ -610,175 +622,6 @@ def dedup_log(raw_log):
 
 
 # ============================================================
-# NETTOYAGE IA
-# ============================================================
-
-def ai_cleanup(deduped_log, scenario_steps=None, model=LLM_MODEL, base_url=None, api_key=None, output_format="katalon", network_log=None):
-    """
-    Envoie le log deduplique a GPT-4.1-mini pour :
-    - Reconstituer le parcours ideal dans l'ordre
-    - Supprimer les actions en double / inutiles
-    - Comparer avec le scenario attendu si fourni
-    - Signaler les anomalies
-    """
-    client_kwargs = {}
-    if base_url:
-        client_kwargs["base_url"] = base_url
-    if api_key:
-        client_kwargs["api_key"] = api_key
-    client = OpenAI(**client_kwargs)
-
-    # Format de sortie : recupere le bloc d'instructions code-gen + label/extension
-    fmt = OUTPUT_FORMATS.get(output_format, OUTPUT_FORMATS["katalon"])
-    code_instructions_block = fmt["code_instructions"]
-    print(f"  Format de sortie : {fmt['label']} ({fmt['extension']})")
-
-    # Bloc optionnel : scenario attendu pour comparaison
-    scenario_block = ""
-    if scenario_steps:
-        scenario_block = f"""
-SCENARIO ATTENDU (ce que l'utilisateur a demande) :
-{json.dumps(scenario_steps, indent=2, ensure_ascii=False)}
-
-REGLE IMPORTANTE :
-- Compare chaque action capturee avec le scenario attendu
-- Si une action capturee ne correspond a aucune etape du scenario (ex: clic sur un overlay,
-  un modal, un conteneur div, un fond de page), c'est du BRUIT → supprime-la
-- Si une etape du scenario n'a pas d'action correspondante dans le log, signale-la en anomalie
-- Le parcours nettoye doit correspondre au scenario attendu, pas au log brut
-"""
-
-    # Bloc optionnel : network log pour generation d'API assertions (V3 phase 3)
-    network_block = ""
-    if network_log:
-        # Garde uniquement les API calls (Fetch/XHR) avec status >= 200, max 30 entrees
-        api_calls = [
-            {
-                "method": r.get("method"),
-                "url": r.get("url", "")[:200],
-                "status": r.get("status"),
-                "type": r.get("type"),
-                "duration_ms": r.get("duration_ms"),
-            }
-            for r in network_log
-            if r.get("type") in ("Fetch", "XHR") and r.get("status")
-        ][:30]
-        if api_calls:
-            network_block = f"""
-API CALLS CAPTURES PENDANT LE PARCOURS (Network.* via CDP) :
-{json.dumps(api_calls, indent=2, ensure_ascii=False)}
-
-REGLE POUR ENRICHIR LE CODE GENERE AVEC DES ASSERTIONS API :
-- Apres chaque action 'click' qui declenche probablement un appel API (login, submit form,
-  add to cart, etc.), AJOUTE une assertion qui verifie que l'API a bien repondu en 2xx.
-- Utilise la syntaxe native du framework de sortie pour intercepter ou attendre la reponse :
-    * Playwright : await page.waitForResponse(url => url.includes('/api/...'))
-                   puis expect(response.status()).toBe(200)
-    * Cypress : cy.intercept('POST', '/api/...').as('login') AVANT le click,
-                puis cy.wait('@login').its('response.statusCode').should('eq', 200)
-    * Selenium : pas d'API simple, ajoute un commentaire '# TODO: assert API call here'
-    * Katalon : WS.verifyResponseStatusCode(response, 200) si applicable, sinon commentaire
-- Si une URL d'API call contient un domain tier (analytics, ads), NE PAS generer d'assertion
-  dessus, c'est du tracking pas du contrat metier.
-- Signale dans 'anomalies' si tu vois un status >= 400 dans les API calls : c'est probablement
-  un bug du SUT ou un endpoint deprecie.
-"""
-
-    prompt = f"""Tu es un expert QA automation Katalon Studio. Voici le log des actions capturees 
-pendant un parcours automatise par un agent IA (browser-use).
-
-L'agent a potentiellement fait des erreurs : clics dans le desordre, 
-etapes recommencees, clics parasites sur des overlays/modals/conteneurs, etc.
-{scenario_block}
-{network_block}
-ACTIONS CAPTUREES (deja dedupliquees pour les inputs) :
-{json.dumps(deduped_log, indent=2, ensure_ascii=False)}
-
-REGLES DE FILTRAGE DU BRUIT :
-- Ignore les clics sur des elements NON INTERACTIFS : div, span, section, modal, overlay,
-  backdrop, conteneur generique (sauf s'ils ont un role="button" ou un aria-label explicite)
-- Ignore les clics dont le selecteur est un ID de modal (#menuModal, #overlay, #backdrop, etc.)
-- Ignore les clics en double sur le meme element
-- Garde UNIQUEMENT les clics sur : button, a, input, select, textarea, [role="button"],
-  elements avec aria-label, data-testid, ou un texte significatif
-- Si deux clics se suivent sur la meme zone (meme URL, tags proches), garde celui
-  qui a le selecteur le plus precis et le tag le plus interactif
-
-CONSIGNE :
-1. Reconstitue le parcours E2E IDEAL dans l'ordre logique (sans les erreurs ni le bruit)
-2. Supprime les actions parasites, en double ou les retours arriere inutiles
-3. Pour chaque step, donne :
-   - step : numero
-   - action : "click" ou "input"
-   - description : description humaine en francais
-   - selector : le champ selector.value EXACTEMENT tel quel (NE MODIFIE JAMAIS les selecteurs)
-   - selectorType : "xpath" si le selecteur commence par "//" sinon "css"
-   - value : valeur saisie (pour les inputs uniquement)
-   - page : URL de la page
-   - unique : copier selector.unique (true/false)
-4. Si un selecteur a "unique": false, signale-le dans les anomalies
-5. Liste les anomalies detectees :
-   - Selecteurs non uniques
-   - Clics parasites supprimes (indiquer lesquels et pourquoi)
-   - Etapes du scenario non couvertes par le log
-   - Tout ecart entre le scenario attendu et le parcours reconstitue
-{code_instructions_block}
-
-Reponds UNIQUEMENT en JSON valide, pas de markdown, pas de commentaires.
-Structure attendue :
-{{
-  "parcours": "nom du parcours",
-  "date": "date du test",
-  "total_steps": nombre,
-  "filtered_noise": ["description du bruit supprime 1", "description 2"],
-  "anomalies": ["anomalie 1", "anomalie 2"],
-  "steps": [
-    {{
-      "step": 1,
-      "action": "click",
-      "description": "...",
-      "selector": "...",
-      "selectorType": "css ou xpath",
-      "value": null,
-      "page": "...",
-      "unique": true
-    }}
-  ],
-  "katalon_code": "// Code complet ici en une seule string avec des \\n pour les sauts de ligne (peu importe le langage demande, on garde la cle 'katalon_code' pour compatibilite)"
-}}"""
-
-    print("\n  Nettoyage IA en cours...")
-    response = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0
-    )
-
-    raw_response = response.choices[0].message.content
-
-    # Nettoyer la reponse (enlever les backticks markdown si presents)
-    cleaned = raw_response.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[1]
-    if cleaned.endswith("```"):
-        cleaned = cleaned.rsplit("```", 1)[0]
-    cleaned = cleaned.strip()
-
-    try:
-        result = json.loads(cleaned)
-        # Afficher le bruit filtre si present
-        filtered = result.get('filtered_noise', [])
-        if filtered:
-            print(f"  Bruit filtre ({len(filtered)} actions parasites supprimees) :")
-            for f_item in filtered:
-                print(f"    - {f_item}")
-        return result
-    except json.JSONDecodeError:
-        print("  Reponse IA pas en JSON valide, sauvegarde brute")
-        return {"raw_response": cleaned}
-
-
-# ============================================================
 # AFFICHAGE
 # ============================================================
 
@@ -876,7 +719,9 @@ def print_clean_steps(clean_data):
 # ============================================================
 
 async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenario_url="", scenario_steps=None, timing_opts=None):
-    """Fonction principale d'execution du QA Explorer"""
+    """Fonction principale d'execution du QA Explorer."""
+    if async_playwright is None or Agent is None or BrowserSession is None or ChatOpenAI is None:
+        raise RuntimeError("Dependances runtime absentes : lancer pip install -r requirements.txt")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     timing_opts = timing_opts or {}
     started_at = datetime.now().isoformat()
@@ -1174,6 +1019,32 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         except Exception:
             pass
         llm = ChatOpenAI(**llm_kwargs)
+
+        # Preuves de selecteurs capturees AVANT chaque lot d'actions BU.
+        # Le callback est declenche une fois le model_output connu, alors que
+        # tous les backend_node_id du selector_map pointent encore vers des
+        # noeuds attaches. Le cache sera rattache a l'historique final.
+        live_selector_evidence: dict = {}
+        live_selector_hook_errors: list[str] = []
+
+        async def _capture_planned_selector_evidence(
+            browser_state_summary,
+            model_output,
+            _step_number,
+        ) -> None:
+            try:
+                await enrich_browser_use_step_snapshot(
+                    browser_state_summary,
+                    model_output,
+                    context,
+                    live_selector_evidence,
+                )
+            except Exception as exc:
+                # L'observabilite ne doit jamais modifier le comportement de
+                # l'agent. L'absence de preuve fera echouer la classification
+                # fermee, et l'erreur restera visible dans meta.json.
+                live_selector_hook_errors.append(f"{type(exc).__name__}: {exc}"[:300])
+
         # Construire le BrowserProfile (browser-use 0.12+) qui porte les params de timing
         # Avant 0.12 : kwargs directement sur BrowserSession. Apres : via BrowserProfile.
         browser_session = None
@@ -1243,6 +1114,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "use_judge": False,
                 "max_actions_per_step": 4,
                 "llm_timeout": 300,
+                "register_new_step_callback": _capture_planned_selector_evidence,
             }
             print(f"  [BENCH_MODE] Agent = Browser(cdp_url) + use_judge=False + max_actions_per_step=4 + llm_timeout=300s")
         else:
@@ -1252,6 +1124,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 "browser_session": browser_session,
                 "use_vision": use_vision,
                 "max_actions_per_step": 10,
+                "register_new_step_callback": _capture_planned_selector_evidence,
             }
             step_timeout_override = (timing_opts or {}).get("step_timeout")
             llm_timeout_override = (timing_opts or {}).get("llm_timeout")
@@ -1281,8 +1154,8 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             except Exception as e:
                 print(f"  [WARN] Performance.getMetrics avant : {e}")
 
-        # BENCH : agent.run() sans args = defaut BU officiel. Mode standard :
-        # on garde max_steps garde-fou anti-boucle.
+        # BENCH : aucun max_steps impose, comme le runner BU officiel. Mode
+        # standard : on garde max_steps comme garde-fou anti-boucle.
         import time as _t
         _phase_agent_start = _t.monotonic()
         if bench_mode:
@@ -1298,12 +1171,17 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         # pour les etapes 3-7 qui ont besoin du DOM/CDP - la fermeture
         # precoce se fait plus bas, juste avant build_clean_steps).
         try:
-            _agent_status = "success"
+            _agent_status = "unknown"
             _agent_result_str = ""
             try:
                 _agent_result_str = str(result.final_result() or "")[:2000]
-                if _agent_result_str.upper().startswith("FAIL"):
+                _verdict = _agent_result_str.lstrip().upper()
+                if _verdict.startswith("SUCCESS"):
+                    _agent_status = "success"
+                elif _verdict.startswith(("FAIL", "ERROR")):
                     _agent_status = "fail"
+                elif _verdict.startswith(("INTERRUPT", "STOP")):
+                    _agent_status = "interrupted"
             except Exception:
                 pass
             _agent_done = {
@@ -1465,6 +1343,27 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         # perd les actions non captees par le DOM listener (navigate, wait,
         # keyboard, upload, tabs, go_back, ...).
         bu_history = extract_browser_use_history(agent, result)
+        selector_enrichment_stats = {"elements": 0, "resolved": 0, "unique": 0, "unresolved": 0}
+        try:
+            enrichment_context = bu_context if 'bu_context' in locals() and bu_context else context
+            selector_enrichment_stats = await enrich_browser_use_history_selectors(
+                bu_history,
+                enrichment_context,
+                evidence_cache=live_selector_evidence,
+            )
+            print(
+                "  Preuves selecteurs live : "
+                f"{selector_enrichment_stats['unique']} elements avec candidat unique / "
+                f"{selector_enrichment_stats['elements']} observes"
+            )
+            if live_selector_hook_errors:
+                print(
+                    "  [WARN] Collecte pre-action : "
+                    f"{len(live_selector_hook_errors)} erreur(s), premiere : "
+                    f"{live_selector_hook_errors[0]}"
+                )
+        except Exception as e:
+            print(f"  [WARN] Enrichissement live des selecteurs echoue : {e}")
         bu_history_file = output_dir / "browser_use_history.json"
         try:
             bu_history_file.write_text(
@@ -1477,8 +1376,8 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
 
         # -- ETAPE 8 : Construction du clean_steps.json enrichi (schema v2.0) --
         # Nouveau pipeline unifie : fusion multi-sources (scenario + BU history +
-        # DOM listener + network) -> classification LLM (included_in_replay +
-        # anomalies, PAS de construction de selecteurs) -> validation Pydantic.
+        # DOM listener + network) -> classification locale stricte ->
+        # validation Pydantic. Aucun LLM n'intervient apres Browser Use.
         clean_steps = None
         sensitive_env_vars: list[str] = []
         if len(deduped) > 0 or bu_history:
@@ -1524,10 +1423,8 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             print(f"  [PHASE close] Chromium ferme en {round(_phase_close_end - _phase_close_start, 2)}s")
             _phase_post_start = _t.monotonic()
 
-            # bench_mode = 100% deterministe, zero appel LLM en post-processing.
-            # Le JSON, TS et exports sont produits meme si OpenAI ne repond plus
-            # apres la fin de Browser Use. Mode standard : LLM refinement avec
-            # timeout court + fallback needs_review sur les steps ambigus.
+            # Post-processing 100% local et deterministe, en bench comme en
+            # mode standard. Browser Use reste le seul consommateur de LLM.
             clean_steps, sensitive_env_vars = build_clean_steps(
                 scenario_name=scenario_name,
                 scenario_url=scenario_url,
@@ -1538,8 +1435,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 model=model,
                 base_url=base_url,
                 api_key=api_key,
-                use_llm=(not bench_mode),
-                llm_timeout_s=30.0,
+                use_llm=False,
                 detect_sensitive=(not bench_mode),
             )
 
@@ -1685,7 +1581,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             else:
                 print("\n  report_generator.py absent, pas de rapport HTML")
         else:
-            print("\n  Aucune entree capturee, pas de nettoyage IA")
+            print("\n  Aucune entree capturee, aucun step a construire")
 
         # -- ETAPE 10bis : Sauvegarder les captures observabilite (V3 phases 1+2) --
         try:
@@ -1779,11 +1675,15 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 # Refactor Aout 2026 : pipeline unifie Playwright TS
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "bu_history_count": len(bu_history) if 'bu_history' in locals() else 0,
+                "selector_enrichment": selector_enrichment_stats if 'selector_enrichment_stats' in locals() else {},
+                "selector_enrichment_hook_errors": live_selector_hook_errors if 'live_selector_hook_errors' in locals() else [],
                 "clean_steps_total": len(clean_steps.steps) if 'clean_steps' in locals() and clean_steps else 0,
                 "clean_steps_included": sum(1 for s in clean_steps.steps if s.included_in_replay) if 'clean_steps' in locals() and clean_steps else 0,
                 "clean_steps_filtered": sum(1 for s in clean_steps.steps if not s.included_in_replay) if 'clean_steps' in locals() and clean_steps else 0,
+                "replay_blocking_steps": sum(1 for s in clean_steps.steps if s.replay_blocking) if 'clean_steps' in locals() and clean_steps else 0,
                 "sensitive_env_vars": sensitive_env_vars if 'sensitive_env_vars' in locals() else [],
                 "playwright_spec_present": (output_dir / "test_playwright.spec.ts").exists(),
+                "playwright_unsupported_count": len(gen_result.get("unsupported", [])) if 'gen_result' in locals() else 0,
             }
             # R6 : statuts DISTINCTS agent vs pipeline (review round 2).
             # agent_status : verdict fonctionnel de l'agent BU (a-t-il
@@ -1794,12 +1694,12 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             #   reussi ? On est arrive jusqu'ici sans exception non-catche,
             #   donc "success" (les erreurs partielles sont dans warnings).
             # status : overall = worst(agent, pipeline)
-            agent_result_str = str(meta.get("agent_result") or "").upper()
-            if "SUCCESS" in agent_result_str:
+            agent_result_str = str(meta.get("agent_result") or "").lstrip().upper()
+            if agent_result_str.startswith("SUCCESS"):
                 agent_status = "success"
-            elif "FAIL" in agent_result_str or "ERROR" in agent_result_str:
+            elif agent_result_str.startswith(("FAIL", "ERROR")):
                 agent_status = "fail"
-            elif "INTERRUPT" in agent_result_str or "STOP" in agent_result_str:
+            elif agent_result_str.startswith(("INTERRUPT", "STOP")):
                 agent_status = "interrupted"
             else:
                 agent_status = "unknown"
