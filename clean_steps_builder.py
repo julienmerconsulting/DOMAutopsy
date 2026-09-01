@@ -749,14 +749,16 @@ _AD_TOKEN_RE = re.compile(r"\bad\b", re.IGNORECASE)
 
 def _mark_ad_related(step: Step, elem: dict[str, Any] | None) -> None:
     """Detecte les clicks sur elements ad-related (overlays publicitaires
-    aleatoires). Ne rentrent PAS dans la timeline replay : au lieu de ca,
-    le generator installe un `page.addLocatorHandler()` global qui se
-    declenche automatiquement des que l'overlay apparait et bloque un
-    click canonique.
+    aleatoires). Ne rentrent PAS dans la timeline replay : les overlays pub
+    ne bloquent pas Playwright en pratique (qui cible par selecteur, pas
+    par coordonnees ecran), donc rejouer ce click n'apporte rien - il
+    tente d'interagir avec un element potentiellement absent au replay.
 
-    Marque le step included_in_replay=False + stocke dans raw_payload
-    ['ad_handler_selector'] le selecteur a installer dans le handler
-    global (le generator collecte tous ces selectors uniques).
+    Marque le step included_in_replay=False. Pas de handler global emis :
+    reintroduire un ``page.addLocatorHandler()`` non teste risquerait de
+    cliquer un mauvais bouton, mal gerer une iframe pub, ou masquer un
+    vrai blocage. Si un replay demontre plus tard qu'un overlay bloque
+    reellement une action, un handler cible sera concu avec preuve live.
 
     Detection : token 'ad' isole (word-boundary) dans les attributs.
     """
@@ -768,32 +770,8 @@ def _mark_ad_related(step: Step, elem: dict[str, Any] | None) -> None:
     for v in attrs.values():
         if not isinstance(v, str) or not _AD_TOKEN_RE.search(v):
             continue
-        # Construit le selecteur de l'element ad depuis ses attrs discriminants
-        # (aria-label, id, class). Priorite aux plus specifiques.
-        ad_sel = None
-        aria = attrs.get("aria-label")
-        eid = attrs.get("id")
-        cls = attrs.get("class")
-        if isinstance(aria, str) and aria:
-            escaped = aria.replace("\\", "\\\\").replace('"', '\\"')
-            ad_sel = f'[aria-label="{escaped}"]'
-        elif isinstance(eid, str) and eid:
-            ad_sel = f'#{eid}'
-        elif isinstance(cls, str) and cls:
-            first_cls = cls.split()[0]
-            ad_sel = f'.{first_cls}'
         step.included_in_replay = False
-        step.cleanup_reason = (
-            "click ad-related : gere par un page.addLocatorHandler global "
-            "installe au debut du test (declenche automatiquement si l'overlay "
-            "apparait au replay et bloque un click canonique)"
-        )
-        raw = step.raw_payload or {}
-        if not isinstance(raw, dict):
-            raw = {"legacy_raw": raw}
-        if ad_sel:
-            raw["ad_handler_selector"] = ad_sel
-        step.raw_payload = raw
+        step.cleanup_reason = "interaction ad-related volatile ignoree au replay deterministe"
         return
 
 
@@ -1260,7 +1238,7 @@ def build_pre_cleanup_steps(
     # click d'une checkbox, mais que le change check/uncheck correspondant
     # est le prochain event DOM de la meme cible, transfere la preuve vers
     # le change. Cette relation structurelle ne depend pas des timings BU.
-    _prefer_semantic_checkbox_changes(steps)
+    _attach_semantic_checkbox_evidence(steps)
 
     # 5quinquies. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
     # arrivent proches sur la meme famille selecteur, ces 3 sources
@@ -1735,14 +1713,25 @@ def _same_checkbox_event_target(click: Step, semantic: Step) -> bool:
     return _same_document(click, semantic)
 
 
-def _prefer_semantic_checkbox_changes(steps: list[Step]) -> None:
-    """Remplace un click evaluate+dom par son prochain change DOM identique.
+def _attach_semantic_checkbox_evidence(steps: list[Step]) -> None:
+    """Attache au click evaluate+dom une preuve semantique (change DOM), sans transferer l'inclusion.
 
-    La sequence DOM ``click -> change(check/uncheck)`` porte deux niveaux de
-    preuve : le click a ete relie a l'intention BU, le change porte l'etat
-    final idempotent. Si ces deux events sont consecutifs dans le flux DOM et
-    ont une identite stricte, le change herite de la preuve et devient le seul
-    step rejouable.
+    Historique : cette fonction s'appelait ``_prefer_semantic_checkbox_changes``
+    et transferait l'inclusion vers le change (setChecked(true) au TS). Elle
+    cassait sur les vues filtrees ou le click retire l'element de la vue :
+    setChecked attend ``checked === true`` sur un noeud detache -> timeout.
+
+    Nouvelle regle : le click reste l'action rejouable (evaluate+dom, included=True).
+    Le change DOM (check/uncheck) reste dom_orphan, exclu, mais on l'attache au
+    click comme preuve semantique (raw_payload.semantic_effect) pour :
+      - audit / rapport HTML : "expected state" a cote de l'action
+      - tracabilite intent BU vs replay
+    Aucun postcondition Playwright fragile n'est emis.
+
+    Contrainte : ne pas modifier ``_emit_check_uncheck`` -- les vrais steps CHECK
+    (utilisateur qui coche via input.click natif, sans evaluate JS derriere) doivent
+    continuer a emettre ``setChecked()``. Cette fonction n'agit QUE sur la paire
+    evaluate -> click -> check.
     """
     for click_index, click in enumerate(steps):
         if (
@@ -1774,39 +1763,36 @@ def _prefer_semantic_checkbox_changes(steps: list[Step]) -> None:
         if semantic is None:
             continue
 
+        # Attache la preuve semantique au click (audit only, non emis au TS).
         semantic_raw = semantic.raw_payload if isinstance(semantic.raw_payload, dict) else {}
-        semantic_raw["confirmed_by_evaluate"] = evaluate_id
-        semantic_raw["evaluate_selectors"] = list(click_raw.get("evaluate_selectors") or [])
-        semantic_raw["context_proof_from_click"] = click.id
-        if click_raw.get("parentLabelMatchCount") == 1:
-            semantic_raw["parentLabelMatchCount"] = 1
-        if click_raw.get("parentScopedMatchCount") == 1:
-            semantic_raw["parentScopedMatchCount"] = 1
-        fused_sources = list(semantic_raw.get("fused_sources") or [])
-        for source_id in list(click_raw.get("fused_sources") or []) + [click.id]:
-            if source_id and source_id not in fused_sources:
-                fused_sources.append(source_id)
-        semantic_raw["fused_sources"] = fused_sources
-        semantic.raw_payload = semantic_raw
-        semantic.included_in_replay = True
-        semantic.replay_blocking = False
-        semantic.source = "evaluate+dom"
-        semantic.cleanup_reason = None
+        checked_state = None
+        if isinstance(semantic_raw.get("checked"), bool):
+            checked_state = semantic_raw["checked"]
+        elif semantic.action == "check":
+            checked_state = True
+        elif semantic.action == "uncheck":
+            checked_state = False
+        click_raw["semantic_effect"] = {
+            "step_id": semantic.id,
+            "action": semantic.action,
+            "checked": checked_state,
+        }
+        click.raw_payload = click_raw
 
-        click.included_in_replay = False
-        click.replay_blocking = False
-        click.cleanup_reason = (
-            f"fusionne dans {semantic.id} (change DOM canonique avec etat checked)"
+        # Le check reste exclu mais avec une raison explicite qui pointe vers le click.
+        semantic.cleanup_reason = (
+            f"preuve semantique du resultat de {click.id}, "
+            "non emise comme action de replay"
         )
 
-        # L'evaluate doit pointer vers la cible finale, pas vers le click
-        # intermediaire desormais exclu.
-        for evaluate in steps:
-            if evaluate.id == evaluate_id:
-                evaluate.cleanup_reason = (
-                    "fusionne en action DOM canonique confirmee : " + str(semantic.id)
-                )
-                break
+        # L'evaluate continue de pointer vers le CLICK (pas vers le check).
+        # Aucune modification de cleanup_reason de l'evaluate ici : l'evaluate
+        # a deja "fusionne en action(s) DOM canonique(s) confirmee(s) : {click.id}"
+        # pose par _promote_dom_events_confirmed_by_evaluate.
+
+
+# Retro-compat : ancien nom conserve pour les tests / callers exterieurs.
+_prefer_semantic_checkbox_changes = _attach_semantic_checkbox_evidence
 
 
 def _fuse_checkbox_interactions(steps: list[Step]) -> None:
