@@ -1256,7 +1256,13 @@ def build_pre_cleanup_steps(
     # actions canoniques deterministes.
     _promote_dom_events_confirmed_by_evaluate(steps)
 
-    # 5quater. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
+    # 5quater. PREFERENCE SEMANTIQUE : si l'evaluate a d'abord promu le
+    # click d'une checkbox, mais que le change check/uncheck correspondant
+    # est le prochain event DOM de la meme cible, transfere la preuve vers
+    # le change. Cette relation structurelle ne depend pas des timings BU.
+    _prefer_semantic_checkbox_changes(steps)
+
+    # 5quinquies. FUSION checkbox/radio : quand un click + change (+ evaluate BU)
     # arrivent proches sur la meme famille selecteur, ces 3 sources
     # observent UNE SEULE interaction utilisateur. Le change porte la
     # semantique (checked bool) + parentLabel, on le garde comme step
@@ -1264,7 +1270,7 @@ def build_pre_cleanup_steps(
     # False + raw_payload.fused_sources trace les preuves fusionnees.
     _fuse_checkbox_interactions(steps)
 
-    # 5quinquies. FUSION GENERIQUE : les evaluate JS BU qui font click()/type()
+    # 5sexies. FUSION GENERIQUE : les evaluate JS BU qui font click()/type()
     # sur un element deja capture par le DOM listener (workaround agent
     # apres echec du click direct). Rejouer les 2 = double action.
     _fuse_evaluate_workarounds(steps)
@@ -1606,11 +1612,10 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
     Le JavaScript reste interdit dans le replay. Seuls des events DOM
     ``isTrusted=false`` observes dans la fenetre exacte du step BU, ciblant
     le meme compound CSS et disposant d'une preuve de ciblage unique, peuvent
-    etre promus. Pour une checkbox, ``check/uncheck`` gagne toujours sur le
-    click compagnon afin d'emettre ``setChecked`` une seule fois.
+    etre promus. La preference structurelle click -> change checkbox est
+    appliquee ensuite par :func:`_prefer_semantic_checkbox_changes`.
     """
     TOLERANCE_MS = 500
-    CHECKBOX_PAIR_WINDOW_MS = 2000
     claimed: set[int] = set()
 
     for ev_index, ev in enumerate(steps):
@@ -1626,90 +1631,14 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
         if not isinstance(start, int) or not isinstance(end, int):
             continue
 
-        matching: list[tuple[int, Step]] = []
         candidates: list[tuple[int, Step]] = []
         for index, candidate in enumerate(steps):
             if index == ev_index or index in claimed or candidate.timestamp is None:
                 continue
             if candidate.timestamp < start - TOLERANCE_MS or candidate.timestamp > end + TOLERANCE_MS:
                 continue
-            if _dom_orphan_matches_evaluate_target(candidate, selectors):
-                matching.append((index, candidate))
             if _dom_orphan_is_canonical_candidate(candidate, selectors):
                 candidates.append((index, candidate))
-
-        # Certains logs reels exposent la preuve contextuelle uniquement sur
-        # le click (parentScopedMatchCount=1), tandis que le change semantique
-        # check/uncheck arrive sans parentCheckboxMatchCount. Le couple est
-        # pourtant une preuve unique : meme cible, meme <li>, meme label et
-        # quelques millisecondes d'ecart. Transfere cette preuve vers le
-        # change afin d'emettre setChecked(), jamais un toggle click().
-        candidate_indices = {index for index, _ in candidates}
-        strong_clicks = [
-            (index, step) for index, step in candidates
-            if step.action == "click"
-        ]
-        # Le change peut etre journalise apres la fenetre BU de l'evaluate
-        # alors que son click compagnon y est bien present. Chercher le
-        # check/uncheck autour du click confirme (meme fenetre que la fusion
-        # checkbox historique), pas uniquement autour du step BU.
-        semantic_matches = [
-            (index, step) for index, step in matching
-            if step.action in ("check", "uncheck")
-        ]
-        semantic_indices = {index for index, _ in semantic_matches}
-        for index, semantic_step in enumerate(steps):
-            if index == ev_index or index in claimed or index in semantic_indices:
-                continue
-            if semantic_step.action not in ("check", "uncheck"):
-                continue
-            if not _dom_orphan_matches_evaluate_target(semantic_step, selectors):
-                continue
-            if any(
-                click.timestamp is not None
-                and semantic_step.timestamp is not None
-                and abs(click.timestamp - semantic_step.timestamp) <= CHECKBOX_PAIR_WINDOW_MS
-                for _, click in strong_clicks
-            ):
-                semantic_matches.append((index, semantic_step))
-                semantic_indices.add(index)
-
-        for index, semantic_step in semantic_matches:
-            if semantic_step.action not in ("check", "uncheck") or index in candidate_indices:
-                continue
-            semantic_raw = (
-                semantic_step.raw_payload
-                if isinstance(semantic_step.raw_payload, dict)
-                else {}
-            )
-            parent_label = semantic_raw.get("parentLabel")
-            if not parent_label or semantic_step.timestamp is None:
-                continue
-            companion = next((
-                click for _, click in strong_clicks
-                if click.timestamp is not None
-                and abs(click.timestamp - semantic_step.timestamp) <= CHECKBOX_PAIR_WINDOW_MS
-                and isinstance(click.raw_payload, dict)
-                and click.raw_payload.get("parentLabel") == parent_label
-                and click.raw_payload.get("parentLabelMatchCount") == 1
-                and click.raw_payload.get("parentScopedMatchCount") == 1
-                and bool(_step_selector_value(click))
-                and _step_selector_value(click) == _step_selector_value(semantic_step)
-                and str(click.raw_payload.get("tag") or "").lower()
-                    == str(semantic_raw.get("tag") or "").lower()
-                and str(_step_target_attributes(click).get("type") or "").lower()
-                    == str(_step_target_attributes(semantic_step).get("type") or "").lower()
-                and str(_step_target_attributes(click).get("type") or "").lower()
-                    in ("checkbox", "radio")
-            ), None)
-            if companion is None:
-                continue
-            semantic_raw["parentLabelMatchCount"] = 1
-            semantic_raw["parentScopedMatchCount"] = 1
-            semantic_raw["context_proof_from_click"] = companion.id
-            semantic_step.raw_payload = semantic_raw
-            candidates.append((index, semantic_step))
-            candidate_indices.add(index)
         if not candidates:
             continue
 
@@ -1764,6 +1693,120 @@ def _promote_dom_events_confirmed_by_evaluate(steps: list[Step]) -> None:
             "fusionne en action(s) DOM canonique(s) confirmee(s) : "
             + ", ".join(promoted_ids)
         )
+
+
+_DOM_EVENT_SOURCES = {
+    "dom_listener", "dom_orphan", "bu+dom", "bu+dom-reconciled", "evaluate+dom",
+}
+
+
+def _same_checkbox_event_target(click: Step, semantic: Step) -> bool:
+    """Identite stricte click/change sans inference temporelle."""
+    click_selector = _step_selector_value(click)
+    semantic_selector = _step_selector_value(semantic)
+    if not click_selector or click_selector != semantic_selector:
+        return False
+
+    click_raw = click.raw_payload if isinstance(click.raw_payload, dict) else {}
+    semantic_raw = semantic.raw_payload if isinstance(semantic.raw_payload, dict) else {}
+    click_label = click_raw.get("parentLabel")
+    semantic_label = semantic_raw.get("parentLabel")
+    if not click_label or click_label != semantic_label:
+        return False
+
+    click_tag = str(click_raw.get("tag") or "").lower()
+    semantic_tag = str(semantic_raw.get("tag") or "").lower()
+    if not click_tag or click_tag != semantic_tag:
+        return False
+
+    click_attrs = _step_target_attributes(click)
+    semantic_attrs = _step_target_attributes(semantic)
+    click_type = str(click_attrs.get("type") or "").lower()
+    semantic_type = str(semantic_attrs.get("type") or "").lower()
+    if click_type not in ("checkbox", "radio") or click_type != semantic_type:
+        return False
+
+    # Mismatch explicite sur une caracteristique capturee = cible differente.
+    for key in ("aria-label", "class", "id", "name"):
+        click_value = click_attrs.get(key)
+        semantic_value = semantic_attrs.get(key)
+        if click_value and semantic_value and click_value != semantic_value:
+            return False
+    return _same_document(click, semantic)
+
+
+def _prefer_semantic_checkbox_changes(steps: list[Step]) -> None:
+    """Remplace un click evaluate+dom par son prochain change DOM identique.
+
+    La sequence DOM ``click -> change(check/uncheck)`` porte deux niveaux de
+    preuve : le click a ete relie a l'intention BU, le change porte l'etat
+    final idempotent. Si ces deux events sont consecutifs dans le flux DOM et
+    ont une identite stricte, le change herite de la preuve et devient le seul
+    step rejouable.
+    """
+    for click_index, click in enumerate(steps):
+        if (
+            click.action != "click"
+            or click.source != "evaluate+dom"
+            or not click.included_in_replay
+        ):
+            continue
+        click_raw = click.raw_payload if isinstance(click.raw_payload, dict) else {}
+        evaluate_id = click_raw.get("confirmed_by_evaluate")
+        if not evaluate_id:
+            continue
+
+        semantic: Step | None = None
+        for candidate in steps[click_index + 1:]:
+            if candidate.source not in _DOM_EVENT_SOURCES:
+                continue
+            if (
+                candidate.source == "dom_orphan"
+                and not candidate.included_in_replay
+                and candidate.action in ("check", "uncheck")
+                and _same_checkbox_event_target(click, candidate)
+            ):
+                semantic = candidate
+            # Le premier event DOM suivant clot la paire, qu'il corresponde
+            # ou non : aucune recherche lointaine susceptible de fusionner
+            # deux interactions distinctes sur la meme checkbox.
+            break
+        if semantic is None:
+            continue
+
+        semantic_raw = semantic.raw_payload if isinstance(semantic.raw_payload, dict) else {}
+        semantic_raw["confirmed_by_evaluate"] = evaluate_id
+        semantic_raw["evaluate_selectors"] = list(click_raw.get("evaluate_selectors") or [])
+        semantic_raw["context_proof_from_click"] = click.id
+        if click_raw.get("parentLabelMatchCount") == 1:
+            semantic_raw["parentLabelMatchCount"] = 1
+        if click_raw.get("parentScopedMatchCount") == 1:
+            semantic_raw["parentScopedMatchCount"] = 1
+        fused_sources = list(semantic_raw.get("fused_sources") or [])
+        for source_id in list(click_raw.get("fused_sources") or []) + [click.id]:
+            if source_id and source_id not in fused_sources:
+                fused_sources.append(source_id)
+        semantic_raw["fused_sources"] = fused_sources
+        semantic.raw_payload = semantic_raw
+        semantic.included_in_replay = True
+        semantic.replay_blocking = False
+        semantic.source = "evaluate+dom"
+        semantic.cleanup_reason = None
+
+        click.included_in_replay = False
+        click.replay_blocking = False
+        click.cleanup_reason = (
+            f"fusionne dans {semantic.id} (change DOM canonique avec etat checked)"
+        )
+
+        # L'evaluate doit pointer vers la cible finale, pas vers le click
+        # intermediaire desormais exclu.
+        for evaluate in steps:
+            if evaluate.id == evaluate_id:
+                evaluate.cleanup_reason = (
+                    "fusionne en action DOM canonique confirmee : " + str(semantic.id)
+                )
+                break
 
 
 def _fuse_checkbox_interactions(steps: list[Step]) -> None:

@@ -477,11 +477,12 @@ def test_evaluate_pairs_delayed_check_with_identical_click_target(tmp_path):
             event["parentScopedMatchCount"] = 1
         return event
 
-    # Le click tombe dans la fenetre evaluate (+500 ms), le change arrive
-    # 700 ms plus tard : ancien code promouvait seulement le click.
+    # Le click tombe dans la fenetre evaluate (+500 ms), mais le change est
+    # tres eloigne dans les timestamps BU. Il reste neanmoins le prochain
+    # event DOM, avec une identite de cible strictement identique.
     dom_log = [
         _checkbox_event("click", 1200),
-        _checkbox_event("check", 1900),
+        _checkbox_event("check", 5000),
     ]
     steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
     steps, anomalies, _ = classify_steps(steps)
