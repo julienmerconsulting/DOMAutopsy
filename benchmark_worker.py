@@ -153,18 +153,9 @@ async def _run_capture(task: dict) -> dict:
     # inclure about:blank dans les instructions - BU interpretait
     # "premiere action navigate" comme incluant about:blank et bouclait.
     task_prompt = (
-        f"URL DU TEST (obligatoire, publique et fonctionnelle) : {start_url}\n\n"
-        f"Ta premiere action utile doit etre : navigate vers cette URL exacte.\n"
-        f"Ne cherche pas d'URL alternative (pas de todomvc.com, pas de netlify.app,\n"
-        f"pas de recherche moteur). Si cette URL repond 404, retourne FAIL\n"
-        f"immediatement sans tenter d'autres URLs.\n\n"
-        "IMPORTANT : Si un element n'est pas visible ou cliquable, "
-        "scroll pour le trouver. Si un popup de cookies apparait, "
-        "accepte-le d'abord. Si un element visible n'a pas d'interactive "
-        "index dans browser_state (checkbox dans liste, toggle shadow, "
-        "etc.), tu es AUTORISE a utiliser evaluate() JavaScript pour "
-        "cliquer directement - mais UN SEUL click par appel evaluate(), "
-        "pas de setTimeout, pas de boucle, pas de multi-click chaine.\n\n"
+        f"URL DU TEST : {start_url}\n"
+        f"Ta premiere action : navigate vers cette URL exacte. Ne cherche pas "
+        f"d'URL alternative ; si elle repond 404, retourne FAIL immediatement.\n\n"
         f"{scenario_prompt}\n\n"
         "Retourne SUCCESS si tout s'est bien passe, FAIL avec la raison sinon."
     )
