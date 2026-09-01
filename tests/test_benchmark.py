@@ -266,6 +266,48 @@ def test_deterministic_classify_filters_duplicate_clicks():
     assert any("#login-btn" in n for n in noise)
 
 
+def test_deterministic_classify_preserves_same_selector_with_distinct_contexts():
+    """Un selector de collection ne rend pas deux lignes interchangeables."""
+    from clean_steps_builder import deterministic_classify_steps
+    from schemas import Step, Selector
+
+    selector = Selector(
+        value='[aria-label="Toggle Todo"]',
+        unique=False,
+        matchCount=4,
+        verifiedAtCapture=True,
+    )
+    steps = [
+        Step(
+            id="step-0001",
+            action="click",
+            page="todos",
+            timestamp=1000,
+            selector=selector,
+            raw_payload={
+                "parentLabel": "acheter du pain",
+                "parentLabelMatchCount": 1,
+                "parentScopedMatchCount": 1,
+            },
+        ),
+        Step(
+            id="step-0002",
+            action="click",
+            page="todos",
+            timestamp=1100,
+            selector=selector,
+            raw_payload={
+                "parentLabel": "appeler le medecin",
+                "parentLabelMatchCount": 1,
+                "parentScopedMatchCount": 1,
+            },
+        ),
+    ]
+
+    out, _, _ = deterministic_classify_steps(steps)
+    assert [step.included_in_replay for step in out] == [True, True]
+
+
 def test_replayable_requires_success_agent_oracle_and_zero_unsupported(tmp_path):
     from benchmark_runner import _is_replayable
 

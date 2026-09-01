@@ -368,29 +368,41 @@ def test_evaluate_promotes_confirmed_dom_checkbox_events(tmp_path):
     steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
     steps, anomalies, _ = classify_steps(steps)
 
-    checks = [step for step in steps if step.action == "check" and step.included_in_replay]
+    checks = [step for step in steps if step.action == "check"]
     evaluates = [step for step in steps if step.action == "evaluate"]
     clicks = [step for step in steps if step.action == "click"]
-    assert [step.raw_payload["parentLabel"] for step in checks] == [
+    included_clicks = [step for step in clicks if step.included_in_replay]
+    assert [step.raw_payload["parentLabel"] for step in included_clicks] == [
         "acheter du pain",
         "appeler le medecin",
     ]
-    assert all(step.source == "evaluate+dom" for step in checks)
-    assert all(not step.replay_blocking for step in checks)
-    assert all(step.raw_payload["parentScopedMatchCount"] == 1 for step in checks)
-    assert all(step.raw_payload.get("parentCheckboxMatchCount") is None for step in checks)
-    assert all(step.raw_payload.get("context_proof_from_click") for step in checks)
+    assert all(step.source == "evaluate+dom" for step in included_clicks)
+    assert all(not step.replay_blocking for step in included_clicks)
+    assert all(
+        step.raw_payload["parentScopedMatchCount"] == 1
+        for step in included_clicks
+    )
+    assert all(not step.included_in_replay for step in checks)
+    assert all("preuve semantique" in step.cleanup_reason for step in checks)
+    assert [step.raw_payload["semantic_effect"]["step_id"] for step in included_clicks] == [
+        step.id for step in checks
+    ]
+    assert all(
+        step.raw_payload["semantic_effect"]["action"] == "check"
+        and step.raw_payload["semantic_effect"]["checked"] is True
+        for step in included_clicks
+    )
     assert all(not step.included_in_replay for step in evaluates)
     assert all("fusionne en action" in step.cleanup_reason for step in evaluates)
-    assert all(not step.included_in_replay for step in clicks)
     assert not any("non verifie unique" in anomaly for anomaly in anomalies)
 
     clean = CleanSteps(parcours="evaluate dom proof", total_steps=len(steps), steps=steps)
     generate_playwright_ts(clean, tmp_path / "evaluate-proof.spec.ts")
     body = (tmp_path / "evaluate-proof.spec.ts").read_text(encoding="utf-8")
-    assert body.count(".setChecked(true)") == 2
+    assert ".setChecked(" not in body
     assert body.count("getByRole('listitem').filter") == 2
-    assert body.count('.locator("input.toggle").setChecked(true)') == 2
+    assert body.count('.locator("input.toggle").click()') == 2
+    assert body.count("canonicalise depuis evaluate JS - effet attendu : checked=true") == 2
     assert "page.evaluate" not in body
 
     final_ids = {step.id for step in steps}
@@ -487,25 +499,32 @@ def test_evaluate_pairs_delayed_check_with_identical_click_target(tmp_path):
     steps = build_pre_cleanup_steps(None, bu_history, dom_log, None)
     steps, anomalies, _ = classify_steps(steps)
 
-    included_checks = [
+    checks = [
         step for step in steps
-        if step.action == "check" and step.included_in_replay
+        if step.action == "check"
     ]
     included_clicks = [
         step for step in steps
         if step.action == "click" and step.included_in_replay
     ]
-    assert len(included_checks) == 1
-    assert included_checks[0].source == "evaluate+dom"
-    assert included_checks[0].raw_payload["context_proof_from_click"]
-    assert included_clicks == []
+    assert len(checks) == 1
+    assert checks[0].included_in_replay is False
+    assert "preuve semantique" in checks[0].cleanup_reason
+    assert len(included_clicks) == 1
+    assert included_clicks[0].source == "evaluate+dom"
+    assert included_clicks[0].raw_payload["semantic_effect"] == {
+        "step_id": checks[0].id,
+        "action": "check",
+        "checked": True,
+    }
     assert anomalies == []
 
     clean = CleanSteps(parcours="delayed checkbox", total_steps=len(steps), steps=steps)
     generate_playwright_ts(clean, tmp_path / "delayed-checkbox.spec.ts")
     body = (tmp_path / "delayed-checkbox.spec.ts").read_text(encoding="utf-8")
-    assert body.count(".setChecked(true)") == 1
-    assert '.locator("[aria-label=\\"Toggle Todo\\"]").setChecked(true)' in body
+    assert ".setChecked(" not in body
+    assert '.locator("[aria-label=\\"Toggle Todo\\"]").click()' in body
+    assert "canonicalise depuis evaluate JS - effet attendu : checked=true" in body
 
 
 def test_dom_event_count_replaces_duplicate_bu_click_intents(tmp_path):
