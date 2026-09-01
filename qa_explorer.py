@@ -51,8 +51,17 @@ except ModuleNotFoundError:
 import asyncio
 import json
 import os
+import re
 import sys
 import argparse
+
+# Force stdout/stderr UTF-8 sur Windows : sinon un char PUA (ex: icones Font
+# Awesome '') dans un print() crash cp1252 -> UnicodeEncodeError.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 from datetime import datetime
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
@@ -265,6 +274,40 @@ MIN_WAIT_PAGE_LOAD = 2.0          # seconds, min wait avant snapshot DOM (defaut
 MAX_WAIT_PAGE_LOAD = 15.0         # seconds, max wait avant timeout snapshot
 NETWORK_IDLE_WAIT = 3.0           # seconds, wait apres derniere requete reseau
 MAX_STEPS = 25                    # garde-fou anti-boucle infinie
+
+
+# ============================================================
+# CLASSIFIEUR DU VERDICT AGENT BU
+# ============================================================
+# BU peut retourner sa reponse sous des formes tres variees :
+#   - "SUCCESS: ..." (verdict en tete, ancien pattern)
+#   - "RECAPITULATIF...\n...\nretour SUCCESS" (verdict en queue, actuel)
+#   - "FAIL : ..." (echec en tete)
+#   - texte libre sans verdict (unknown)
+# On cherche donc un mot-cle isole (word-boundary) prioritairement en TETE
+# du texte, puis dans la QUEUE (derniers 3000 chars) qui contient
+# typiquement la conclusion de l'agent apres son recapitulatif.
+def _classify_agent_verdict(text: str | None) -> str:
+    """Retourne 'success' | 'fail' | 'interrupted' | 'unknown'."""
+    if not text:
+        return "unknown"
+    head_upper = str(text).lstrip().upper()
+    if head_upper.startswith("SUCCESS"):
+        return "success"
+    if head_upper.startswith(("FAIL", "ERROR")):
+        return "fail"
+    if head_upper.startswith(("INTERRUPT", "STOP")):
+        return "interrupted"
+    # Fallback : verdict dans la queue (recapitulatif conclut souvent
+    # par "retour SUCCESS." ou "-> FAIL: raison")
+    tail = str(text)[-3000:]
+    if re.search(r"\bSUCCESS\b", tail, re.IGNORECASE):
+        return "success"
+    if re.search(r"\b(?:FAIL|ERROR)\b", tail, re.IGNORECASE):
+        return "fail"
+    if re.search(r"\b(?:INTERRUPT|STOP)\b", tail, re.IGNORECASE):
+        return "interrupted"
+    return "unknown"
 
 # TASK par defaut (legacy, utilise si aucun JSON ni --task)
 DEFAULT_TASK = """
@@ -771,7 +814,25 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
     # _allocate_unique_cdp_ports (bind simultane des N sockets, aucun
     # worker ne fait sa propre recherche -> pas de TOCTOU entre workers).
     # Mode standalone : cdp_port passe en CLI (ex: 9222 pour Chrome dev).
-    chromium_args = [f"--remote-debugging-port={cdp_port}"]
+    # Locale Chromium alignee sur la langue systeme utilisateur (memes
+    # regles pour capture et replay). Sans ca, un CMP GDPR/Consent qui
+    # rend son bandeau selon Accept-Language peut renvoyer "Consent" en
+    # capture (default en-US) puis "Accepter" au replay (fr-FR) -> selecteur
+    # casse. On lit locale.getdefaultlocale() pour rester agnostique OS/user.
+    # Override possible via env var PW_LOCALE.
+    import locale as _locale
+    try:
+        _sys_loc, _ = _locale.getdefaultlocale()
+    except Exception:
+        _sys_loc = None
+    _bu_locale = os.getenv("PW_LOCALE") or (
+        _sys_loc.replace("_", "-") if _sys_loc else "en-US"
+    )
+    chromium_args = [
+        f"--remote-debugging-port={cdp_port}",
+        f"--lang={_bu_locale}",
+        f"--accept-lang={_bu_locale}",
+    ]
     if headless:
         # Optimisations RAM/CPU pour permettre N Chromiums en parallele
         chromium_args += [
@@ -1220,13 +1281,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             _agent_result_str = ""
             try:
                 _agent_result_str = str(result.final_result() or "")[:2000]
-                _verdict = _agent_result_str.lstrip().upper()
-                if _verdict.startswith("SUCCESS"):
-                    _agent_status = "success"
-                elif _verdict.startswith(("FAIL", "ERROR")):
-                    _agent_status = "fail"
-                elif _verdict.startswith(("INTERRUPT", "STOP")):
-                    _agent_status = "interrupted"
+                _agent_status = _classify_agent_verdict(_agent_result_str)
             except Exception:
                 pass
             _agent_done = {
@@ -1739,15 +1794,7 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
             #   reussi ? On est arrive jusqu'ici sans exception non-catche,
             #   donc "success" (les erreurs partielles sont dans warnings).
             # status : overall = worst(agent, pipeline)
-            agent_result_str = str(meta.get("agent_result") or "").lstrip().upper()
-            if agent_result_str.startswith("SUCCESS"):
-                agent_status = "success"
-            elif agent_result_str.startswith(("FAIL", "ERROR")):
-                agent_status = "fail"
-            elif agent_result_str.startswith(("INTERRUPT", "STOP")):
-                agent_status = "interrupted"
-            else:
-                agent_status = "unknown"
+            agent_status = _classify_agent_verdict(str(meta.get("agent_result") or ""))
             pipeline_status = "success"
             if agent_status == "fail":
                 overall = "failure"
