@@ -186,6 +186,75 @@ def test_verified_live_candidate_wins_and_unverified_id_is_only_a_hint():
     assert "non verifie unique" in anomalies[0]
 
 
+def test_structured_ancestor_text_candidate_survives_to_playwright(tmp_path):
+    step = Step(id="step-0001", action="click", description="Add Blue Top")
+    _apply_interacted_element(step, {
+        "attributes": {"data-product-id": "1"},
+        "selector_candidates": [{
+            "strategy": "ancestor-text-scope",
+            "selectorType": "playwright",
+            "ancestorSelector": "div.productinfo.text-center",
+            "hasText": "Blue Top",
+            "targetSelector": '[data-product-id="1"]',
+            "unique": True,
+            "matchCount": 1,
+            "verifiedAtCapture": True,
+            "stability": "medium",
+            "priority": 20,
+        }],
+    })
+
+    assert step.selectorType == "playwright"
+    assert step.selector.value is None
+    assert step.selector.ancestorSelector == "div.productinfo.text-center"
+    assert step.selector.hasText == "Blue Top"
+    assert step.selector.targetSelector == '[data-product-id="1"]'
+
+    classified, anomalies, _ = classify_steps([step])
+    assert classified[0].included_in_replay is True
+    assert anomalies == []
+
+    clean = CleanSteps(parcours="Blue Top", total_steps=1, steps=classified)
+    # Le locator structure doit survivre au vrai passage par clean_steps.json,
+    # pas seulement au transport en memoire vers le generateur.
+    clean = CleanSteps.model_validate_json(clean.model_dump_json())
+    generate_playwright_ts(clean, tmp_path / "blue-top.spec.ts")
+    body = (tmp_path / "blue-top.spec.ts").read_text(encoding="utf-8")
+    assert (
+        'page.locator("div.productinfo.text-center")'
+        '.filter({ hasText: "Blue Top" })'
+        '.locator("[data-product-id=\\"1\\"]").click();'
+    ) in body
+    assert ".first()" not in body
+
+
+def test_structured_ancestor_text_candidate_rejects_real_duplicate():
+    step = Step(id="step-0001", action="click", description="Add Blue Top")
+    _apply_interacted_element(step, {
+        "attributes": {"data-product-id": "1"},
+        "selector_candidates": [{
+            "strategy": "ancestor-text-scope",
+            "selectorType": "playwright",
+            "ancestorSelector": "div.productinfo.text-center",
+            "hasText": "Blue Top",
+            "targetSelector": '[data-product-id="1"]',
+            "unique": False,
+            "matchCount": 2,
+            "verifiedAtCapture": True,
+            "stability": "medium",
+            "priority": 20,
+        }],
+    })
+
+    # Le data-* reste seulement un indice non verifie : ni first(), ni nth().
+    assert step.selector.strategy == "bu-unverified-attr"
+    assert step.selector.verifiedAtCapture is False
+    classified, anomalies, _ = classify_steps([step])
+    assert classified[0].included_in_replay is False
+    assert classified[0].replay_blocking is True
+    assert "non verifie unique" in anomalies[0]
+
+
 def test_legacy_unique_flag_without_runtime_proof_is_rejected():
     legacy = Step(
         id="step-0001",
