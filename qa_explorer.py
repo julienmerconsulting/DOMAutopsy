@@ -54,6 +54,7 @@ import os
 import sys
 import argparse
 from datetime import datetime
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 
 # Modules refactor Aout 2026 : pipeline unifie autour de test_playwright.spec.ts
@@ -66,6 +67,10 @@ from playwright_generator import generate_playwright_ts
 from selector_enricher import (
     enrich_browser_use_history_selectors,
     enrich_browser_use_step_snapshot,
+)
+from browser_use_patches import (
+    SUPPORTED_BROWSER_USE_VERSION,
+    patch_transparent_form_control_visibility,
 )
 
 # Charger les variables du .env (OPENAI_API_KEY notamment)
@@ -88,7 +93,7 @@ except ImportError:
 # ============================================================
 
 def _patch_browser_use():
-    """Patch la methode buggee de browser-use pour survivre aux iframes detruites"""
+    """Applique les correctifs runtime bornes de Browser Use."""
     try:
         from browser_use.dom.service import DomService
 
@@ -112,10 +117,26 @@ def _patch_browser_use():
         DomService._get_ax_tree_for_all_frames = _patched_get_ax_tree
         print("  [PATCH] browser-use CDP frame crash patche")
 
+        try:
+            installed_version = package_version("browser-use")
+        except PackageNotFoundError:
+            installed_version = "inconnue"
+
+        if patch_transparent_form_control_visibility(DomService, installed_version):
+            print(
+                "  [PATCH] browser-use checkbox/radio transparents accessibles "
+                f"actifs ({installed_version})"
+            )
+        else:
+            print(
+                "  [PATCH] checkbox/radio transparents non applique : "
+                f"browser-use={installed_version}, attendu={SUPPORTED_BROWSER_USE_VERSION}"
+            )
+
     except ImportError:
         print("  [PATCH] browser-use pas installe, patch ignore")
-    except AttributeError:
-        print("  [PATCH] API browser-use modifiee, patch non applique")
+    except (AttributeError, TypeError) as exc:
+        print(f"  [PATCH] API browser-use modifiee, patch non applique : {exc}")
 
 
 # ============================================================
