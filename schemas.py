@@ -60,6 +60,13 @@ class Selector(BaseModel):
     shadowChain: Optional[list[dict[str, Any]]] = None
     playwrightSelector: Optional[str] = None
     jsSelector: Optional[str] = None
+    # Locator Playwright structure mesure live : un ancetre CSS est filtre
+    # par son texte visible, puis la cible CSS est cherchee dans cet ancetre.
+    # On conserve les trois composantes separement : ce n'est pas du CSS
+    # natif et ne doit jamais etre concatene en pseudo-selecteur invente.
+    ancestorSelector: Optional[str] = None
+    hasText: Optional[str] = None
+    targetSelector: Optional[str] = None
     verifiedAtCapture: Optional[bool] = None
     stability: Optional[Literal["high", "medium", "low"]] = None
     priority: Optional[int] = None
@@ -117,7 +124,7 @@ class Step(BaseModel):
 
     # Ciblage
     selector: Optional[Selector | str] = None
-    selectorType: Optional[Literal["css", "xpath", "text", "role", "window", "url", "other"]] = None
+    selectorType: Optional[Literal["css", "xpath", "text", "role", "playwright", "window", "url", "other"]] = None
     target: Optional[str] = None
     unique: Optional[bool] = None
     matchCount: Optional[int] = None

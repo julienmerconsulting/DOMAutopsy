@@ -491,9 +491,7 @@ def _step_from_bu_action(
     # Add to cart d'automationex n'a pas de DOM event capture (dom_listener
     # a rate), mais BU expose data-product-id="2" -> selecteur unique.
     if normalized in ("click", "input", "hover", "check", "uncheck"):
-        if step.selector is None or (
-            hasattr(step.selector, "value") and not getattr(step.selector, "value", None)
-        ):
+        if not _selector_has_locator(step.selector):
             _promote_from_bu_data_attrs(step, interacted_element)
     # Marquer les clicks ad-related pour skip du replay (pattern universel :
     # une pub apparait au capture, absente au replay -> click qui timeout).
@@ -586,11 +584,7 @@ def _step_from_bu_action(
         # included_in_replay=False + cleanup_reason quand aucun selecteur
         # n'a pu etre extrait (ni DOM ni interacted_element BU). Le TS
         # emit un commentaire SKIPPED, pas un throw fatal.
-        if normalized != "scroll" and (
-            step.selector is None or (
-                hasattr(step.selector, "value") and not step.selector.value
-            )
-        ):
+        if normalized != "scroll" and not _selector_has_locator(step.selector):
             step.included_in_replay = False
             step.replay_blocking = True
             step.cleanup_reason = (
@@ -614,6 +608,75 @@ def _css_attr_selector(name: str, value: str) -> str:
     return f"[{name}={json.dumps(str(value), ensure_ascii=False)}]"
 
 
+def _candidate_is_ancestor_text_scope(candidate: dict[str, Any]) -> bool:
+    return (
+        candidate.get("strategy") == "ancestor-text-scope"
+        and all(
+            isinstance(candidate.get(field), str) and bool(candidate[field].strip())
+            for field in ("ancestorSelector", "hasText", "targetSelector")
+        )
+    )
+
+
+def _selector_is_ancestor_text_scope(selector: Selector | str | None) -> bool:
+    return (
+        isinstance(selector, Selector)
+        and selector.strategy == "ancestor-text-scope"
+        and all(
+            isinstance(getattr(selector, field, None), str)
+            and bool(getattr(selector, field).strip())
+            for field in ("ancestorSelector", "hasText", "targetSelector")
+        )
+    )
+
+
+def _selector_has_locator(selector: Selector | str | None) -> bool:
+    if isinstance(selector, str):
+        return bool(selector)
+    if selector is None:
+        return False
+    return bool(selector.value or selector.playwrightSelector) or _selector_is_ancestor_text_scope(selector)
+
+
+def _candidate_locator_signature(candidate: dict[str, Any]) -> tuple[str, ...]:
+    if _candidate_is_ancestor_text_scope(candidate):
+        return (
+            "ancestor-text-scope",
+            candidate["ancestorSelector"],
+            candidate["hasText"],
+            candidate["targetSelector"],
+        )
+    value = candidate.get("value")
+    return ("value", value) if isinstance(value, str) and value else ()
+
+
+def _selector_locator_signature(selector: Selector | str | None) -> tuple[str, ...]:
+    if isinstance(selector, str):
+        return ("value", selector) if selector else ()
+    if _selector_is_ancestor_text_scope(selector):
+        return (
+            "ancestor-text-scope",
+            selector.ancestorSelector,
+            selector.hasText,
+            selector.targetSelector,
+        )
+    if selector is not None:
+        value = selector.value or selector.playwrightSelector
+        if value:
+            return ("value", value)
+    return ()
+
+
+def _selector_type_for(selector: Selector | str | None) -> str:
+    if _selector_is_ancestor_text_scope(selector):
+        return "playwright"
+    if isinstance(selector, Selector) and (
+        selector.strategy == "xpath" or (selector.value or "").startswith("//")
+    ):
+        return "xpath"
+    return "css"
+
+
 def _verified_selector_from_element(elem: dict[str, Any] | None) -> Selector | None:
     """Choisit le meilleur candidat *mesure* pendant la capture.
 
@@ -626,8 +689,7 @@ def _verified_selector_from_element(elem: dict[str, Any] | None) -> Selector | N
     valid = [
         candidate for candidate in candidates
         if isinstance(candidate, dict)
-        and isinstance(candidate.get("value"), str)
-        and candidate.get("value")
+        and bool(_candidate_locator_signature(candidate))
         and candidate.get("verifiedAtCapture") is True
         and candidate.get("unique") is True
         and candidate.get("matchCount") == 1
@@ -639,16 +701,19 @@ def _verified_selector_from_element(elem: dict[str, Any] | None) -> Selector | N
     valid.sort(key=lambda candidate: (
         stability_rank.get(candidate.get("stability"), 9),
         int(candidate.get("priority", 999)),
-        len(candidate["value"]),
+        sum(len(part) for part in _candidate_locator_signature(candidate)),
     ))
     candidate = valid[0]
     return Selector(
         strategy=candidate.get("strategy") or "browser-use-live",
-        value=candidate["value"],
+        value=candidate.get("value"),
         unique=True,
         matchCount=1,
         inShadowDOM=bool(candidate.get("inShadowDOM")),
         shadowChain=candidate.get("shadowChain"),
+        ancestorSelector=candidate.get("ancestorSelector"),
+        hasText=candidate.get("hasText"),
+        targetSelector=candidate.get("targetSelector"),
         verifiedAtCapture=True,
         stability=candidate.get("stability"),
         priority=candidate.get("priority"),
@@ -680,7 +745,8 @@ def _selector_rank(selector: Selector | str | None) -> tuple[int, int, int]:
         else:
             explicit = 2
     priority = selector.priority if selector.priority is not None else 999
-    return (explicit, priority, len(selector.value or ""))
+    locator_length = sum(len(part) for part in _selector_locator_signature(selector))
+    return (explicit, priority, locator_length)
 
 
 def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
@@ -704,9 +770,10 @@ def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
         step.selector = verified
         candidate = next(
             candidate for candidate in elem.get("selector_candidates", [])
-            if isinstance(candidate, dict) and candidate.get("value") == verified.value
+            if isinstance(candidate, dict)
+            and _candidate_locator_signature(candidate) == _selector_locator_signature(verified)
         )
-        step.selectorType = candidate.get("selectorType", "css")
+        step.selectorType = candidate.get("selectorType", _selector_type_for(verified))
     else:
         def _set_unverified(strategy: str, value: str, selector_type: str = "css") -> None:
             step.selector = Selector(
@@ -784,7 +851,7 @@ def _promote_from_bu_data_attrs(step: Step, elem: dict[str, Any] | None) -> bool
     if verified is None:
         return False
     step.selector = verified
-    step.selectorType = "xpath" if verified.strategy == "xpath" else "css"
+    step.selectorType = _selector_type_for(verified)  # type: ignore[assignment]
     return True
 
 
@@ -1127,7 +1194,7 @@ def build_pre_cleanup_steps(
                         or _selector_rank(live_selector) < _selector_rank(_saved_sel)
                     ):
                         step.selector = live_selector
-                        step.selectorType = "xpath" if live_selector.strategy == "xpath" else "css"
+                        step.selectorType = _selector_type_for(live_selector)  # type: ignore[assignment]
                     else:
                         step.selector = _saved_sel
                         step.selectorType = _saved_type
@@ -1570,7 +1637,7 @@ def _reconcile_bu_actions_with_dom_evidence(steps: list[Step]) -> None:
             or _selector_rank(live_selector) < _selector_rank(evidence.selector)
         ):
             evidence.selector = live_selector
-            evidence.selectorType = "xpath" if live_selector.strategy == "xpath" else "css"
+            evidence.selectorType = _selector_type_for(live_selector)  # type: ignore[assignment]
         if isinstance(interacted, dict):
             evidence_raw["interacted_element"] = interacted
 
@@ -1980,7 +2047,8 @@ def detect_and_flag_sensitive(steps: list[Step]) -> list[dict]:
                 if isinstance(s.selector, str):
                     sel_val = s.selector
                 else:
-                    sel_val = getattr(s.selector, "value", None)
+                    signature = _selector_locator_signature(s.selector)
+                    sel_val = " | ".join(signature[1:]) if signature else None
             env_vars.append({
                 "name": name,
                 "step": s.step,
@@ -2012,12 +2080,8 @@ def classify_steps(
     filtered_noise_counter: dict[str, int] = {}
 
     def _sel_value(s: Step) -> str | None:
-        sel = s.selector
-        if sel is None:
-            return None
-        if isinstance(sel, str):
-            return sel or None
-        return getattr(sel, "value", None) or None
+        signature = _selector_locator_signature(s.selector)
+        return " | ".join(signature) if signature else None
 
     def _click_target_context(s: Step) -> tuple[tuple[str, str], ...]:
         """Identite capturee qui discrimine deux matches d'un meme selector.

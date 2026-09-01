@@ -47,6 +47,7 @@ function(buXPath, expected) {
     || /^(?:css|sc|jsx)-[a-z0-9_-]{5,}$/i.test(value)
     || /^[a-f0-9]{8,}$/i.test(value);
   const rootFor = node => node.getRootNode && node.getRootNode() || document;
+  const normalizeText = value => String(value || '').replace(/\s+/g, ' ').trim();
 
   const addCss = (selector, strategy, stability, priority, root, target) => {
     if (!selector || seen.has('css:' + selector)) return;
@@ -96,6 +97,123 @@ function(buXPath, expected) {
       verifiedAtCapture: true,
       visibilityMeasured: true,
     });
+  };
+
+  // Un locator Playwright filtre par texte n'est PAS un selecteur CSS. On
+  // mesure donc sa semantique avec le DOM natif, puis on stocke ses trois
+  // composantes separement pour que le generateur emette une chaine Locator.
+  const addAncestorTextScope = (
+    ancestorSelector, hasText, targetSelector, stability, priority, target
+  ) => {
+    if (!ancestorSelector || !hasText || !targetSelector) return;
+    const key = 'ancestor-text:' + ancestorSelector + '|' + hasText + '|' + targetSelector;
+    if (seen.has(key)) return;
+    let ancestors;
+    try { ancestors = Array.from(document.querySelectorAll(ancestorSelector)); }
+    catch (_) { return; }
+
+    // Playwright filter({hasText: string}) fait une recherche normalisee et
+    // insensible a la casse. La preuve live reproduit cette semantique.
+    const needle = normalizeText(hasText).toLowerCase();
+    const filtered = ancestors.filter(ancestor =>
+      normalizeText(ancestor.textContent).toLowerCase().includes(needle)
+    );
+    const matches = [];
+    const matchSeen = new Set();
+    for (const ancestor of filtered) {
+      let scoped;
+      try { scoped = Array.from(ancestor.querySelectorAll(targetSelector)); }
+      catch (_) { return; }
+      for (const node of scoped) {
+        if (matchSeen.has(node)) continue;
+        matchSeen.add(node);
+        matches.push(node);
+      }
+    }
+    // Refus ferme : si deux cartes portent le meme texte et la meme cible,
+    // on n'invente ni nth() ni first(). La boucle des ancetres cherchera un
+    // scope superieur (par exemple la section Features Items).
+    if (matches.length !== 1 || matches[0] !== target) return;
+
+    seen.add(key);
+    out.push({
+      strategy: 'ancestor-text-scope',
+      selectorType: 'playwright',
+      ancestorSelector,
+      hasText: normalizeText(hasText),
+      targetSelector,
+      matchCount: 1,
+      unique: true,
+      stability,
+      priority,
+      verifiedAtCapture: true,
+      textMeasured: true,
+    });
+  };
+
+  const textCandidatesFor = (ancestor, target) => {
+    const texts = [];
+    const textSeen = new Set();
+    const targetText = normalizeText(target.textContent).toLowerCase();
+    const addText = value => {
+      const text = normalizeText(value);
+      const lower = text.toLowerCase();
+      if (!text || text.length < 2 || text.length > 80 || lower === targetText) return;
+      if (!/[A-Za-z\u00c0-\u024f]/.test(text) || textSeen.has(lower)) return;
+      textSeen.add(lower);
+      texts.push(text);
+    };
+
+    // Partir du voisinage immediat de la cible et remonter vers l'ancetre.
+    // Ainsi "Blue Top" gagne sur les dizaines d'autres noms presents dans
+    // la section Features Items, tout en restant une preuve mesuree.
+    let scope = target.parentElement;
+    while (scope && ancestor.contains(scope)) {
+      const labels = scope.querySelectorAll(
+        'p,h1,h2,h3,h4,h5,h6,label,[aria-label],[data-name]'
+      );
+      for (const label of Array.from(labels).slice(0, 80)) {
+        // Exclure la cible elle-meme et les gros noeuds qui l'englobent : ils
+        // portent generalement le libelle d'action ("Add to cart"), pas le
+        // nom metier qui discrimine la carte.
+        if (label === target || label.contains(target) || !isVisible(label)) continue;
+        addText(label.getAttribute('aria-label') || label.getAttribute('data-name') || label.textContent);
+        if (texts.length >= 12) break;
+      }
+      if (texts.length >= 12 || scope === ancestor) break;
+      scope = scope.parentElement;
+    }
+    return texts.slice(0, 8);
+  };
+
+  const extendRelativeTargets = (scopeNode, parentNode, candidates, target) => {
+    const expanded = candidates.slice();
+    const relativeSeen = new Set(candidates.map(candidate => candidate.selector));
+    const prefixes = localCandidates(scopeNode, document)
+      .filter(candidate => candidate.stability !== 'low')
+      .slice(0, 8);
+    for (const prefix of prefixes) {
+      for (const candidate of candidates) {
+        const selector = prefix.selector + ' ' + candidate.selector;
+        if (relativeSeen.has(selector)) continue;
+        let nodes;
+        try { nodes = Array.from(parentNode.querySelectorAll(selector)); }
+        catch (_) { continue; }
+        if (!nodes.includes(target)) continue;
+        relativeSeen.add(selector);
+        expanded.push({
+          selector,
+          stability: prefix.stability === 'high' && candidate.stability === 'high'
+            ? 'high' : 'medium',
+          priority: Math.min(prefix.priority, candidate.priority) + 2,
+          nesting: (candidate.nesting || 0) + 1,
+        });
+      }
+    }
+    return expanded
+      .sort((a, b) => (a.nesting || 0) - (b.nesting || 0)
+        || a.priority - b.priority || a.selector.length - b.selector.length)
+      .slice(0, 32);
   };
 
   const localCandidates = (node, root) => {
@@ -207,21 +325,54 @@ function(buXPath, expected) {
   if (title) addCss('[title=' + quoted(title) + ']', 'title', 'medium', 42, document, el);
 
   // Si le candidat local est ambigu, on le scope avec un ancetre mesurable.
-  const targetCandidates = out.filter(c => c.selectorType === 'css').map(c => c.value);
+  const targetCandidates = out
+    .filter(c => c.selectorType === 'css' && !c.visibilityMeasured
+      && c.stability !== 'low' && c.matchCount > 1)
+    .map(c => ({
+      selector: c.value,
+      stability: c.stability,
+      priority: c.priority,
+      nesting: 0,
+    }))
+    .slice(0, 8);
+  let relativeTargets = targetCandidates;
   let ancestor = el.parentElement;
   let depth = 0;
-  while (ancestor && ancestor !== document.body && depth < 6) {
+  while (ancestor && ancestor !== document.body && depth < 10) {
     const ancestorCandidates = localCandidates(ancestor, document)
       .filter(c => c.count >= 1 && c.stability !== 'low')
       .slice(0, 8);
+    const textCandidates = textCandidatesFor(ancestor, el);
     for (const ac of ancestorCandidates) {
-      for (const target of targetCandidates) {
-        addCss(ac.selector + ' ' + target, 'ancestor-scope',
+      for (const target of relativeTargets) {
+        addCss(ac.selector + ' ' + target.selector, 'ancestor-scope',
           ac.stability === 'high' ? 'high' : 'medium', 25 + depth,
           document, el);
+        for (const text of textCandidates) {
+          // A preuve egale, conserver la qualite du selecteur cible : un
+          // data-* metier doit gagner sur une simple classe d'action.
+          const targetBias = target.priority <= 35 ? 0 : target.priority <= 45 ? 1 : 2;
+          addAncestorTextScope(
+            ac.selector,
+            text,
+            target.selector,
+            ac.stability === 'high' && target.stability === 'high' ? 'high' : 'medium',
+            20 + depth + targetBias,
+            el
+          );
+        }
       }
     }
-    ancestor = ancestor.parentElement;
+    const parent = ancestor.parentElement;
+    if (parent && parent !== document.body) {
+      // Au niveau carte, [data-product-id="1"] peut encore viser le bouton
+      // normal ET son overlay. Pour le niveau superieur on transporte donc
+      // aussi un chemin relatif prouve, par exemple :
+      //   div.productinfo.text-center [data-product-id="1"]
+      // La section Features Items peut alors etre le scope texte unique.
+      relativeTargets = extendRelativeTargets(ancestor, parent, relativeTargets, el);
+    }
+    ancestor = parent;
     depth += 1;
   }
 
@@ -249,7 +400,11 @@ function(buXPath, expected) {
   };
   addXPath(buXPath);
 
-  return out.sort((a, b) => a.priority - b.priority || a.value.length - b.value.length);
+  const candidateLength = candidate => String(candidate.value || '').length
+    + String(candidate.ancestorSelector || '').length
+    + String(candidate.hasText || '').length
+    + String(candidate.targetSelector || '').length;
+  return out.sort((a, b) => a.priority - b.priority || candidateLength(a) - candidateLength(b));
 }
 """
 

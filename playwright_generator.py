@@ -105,6 +105,19 @@ def _locator_expr(step: Step) -> str:
     C'est la syntaxe supportee officiellement (doc Playwright "Locate in
     Shadow DOM"), pas de plugin, pas de piercing syntax exotique.
     """
+    sel = step.selector
+    if not isinstance(sel, str) and sel is not None:
+        if getattr(sel, "strategy", None) == "ancestor-text-scope":
+            ancestor = getattr(sel, "ancestorSelector", None)
+            has_text = getattr(sel, "hasText", None)
+            target = getattr(sel, "targetSelector", None)
+            if all(isinstance(value, str) and bool(value) for value in (ancestor, has_text, target)):
+                return (
+                    f"page.locator({_ts_string(ancestor)})"
+                    f".filter({{ hasText: {_ts_string(has_text)} }})"
+                    f".locator({_ts_string(target)})"
+                )
+
     value, sel_type = _selector_value_and_type(step)
     if not value:
         return ""
@@ -175,9 +188,10 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
         and raw.get("parentScopedMatchCount") == 1
     ):
         sel_v, _ = _selector_value_and_type(step)
-        pl = _ts_string(parent_label)
-        sv = _ts_string(sel_v or "")
-        return preamble + [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
+        if sel_v:
+            pl = _ts_string(parent_label)
+            sv = _ts_string(sel_v)
+            return preamble + [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
     # Click conditionnel : marque optional par clean_steps_builder pour les
     # cas ou l'element peut avoir disparu entre capture et replay (ex:
     # doublon submit apres evaluate qui a deja navigue). Pattern
