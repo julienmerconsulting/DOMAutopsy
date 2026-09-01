@@ -1103,6 +1103,24 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
         # Sans ca, on handicape l'agent vs le run officiel et on obtient
         # un taux de reussite artificiellement bas.
         bench_mode = bool((timing_opts or {}).get("bench_mode", False))
+        # Interdiction par defaut de l'action `evaluate` de BU : elle permet
+        # au LLM d'executer du JS arbitraire (`.value=`, `.click()`, etc.)
+        # qui contourne isTrusted, actionabilite et visibility, et ne peut
+        # pas etre canonicalise proprement en TS Playwright. On la retire
+        # du registre via Tools(exclude_actions=...) - BU ne la propose plus
+        # au LLM. Un flag ``allow_evaluate=True`` permet de la reactiver en
+        # mode diagnostic (replay marque non canonique dans ce cas).
+        # Doc BU : https://docs.browser-use.com/customize/tools/remove
+        allow_evaluate = bool((timing_opts or {}).get("allow_evaluate", False))
+        _bu_tools = None
+        if not allow_evaluate:
+            try:
+                from browser_use import Tools as _BUTools
+                _bu_tools = _BUTools(exclude_actions=["evaluate"])
+                print("  [BU] action `evaluate` retiree du registre (Tools.exclude_actions)")
+            except Exception as _e:
+                print(f"  [BU] Impossible de retirer `evaluate` (BU trop ancien ?): {_e}")
+                _bu_tools = None
         if bench_mode:
             from browser_use import Browser as _BUBrowser
             bench_browser = _BUBrowser(cdp_url=f"http://localhost:{cdp_port}")
@@ -1132,17 +1150,23 @@ async def run(task, model=LLM_MODEL, cdp_port=CDP_PORT, scenario_name="", scenar
                 agent_kwargs["step_timeout"] = int(step_timeout_override)
             if llm_timeout_override:
                 agent_kwargs["llm_timeout"] = int(llm_timeout_override)
+        if _bu_tools is not None:
+            agent_kwargs["tools"] = _bu_tools
         try:
             agent = Agent(**agent_kwargs)
         except TypeError:
-            # BU plus ancien : retire les overrides puis use_vision
+            # BU plus ancien : retire les overrides puis tools puis use_vision
             for k in ("step_timeout", "llm_timeout", "use_judge"):
                 agent_kwargs.pop(k, None)
             try:
                 agent = Agent(**agent_kwargs)
             except TypeError:
-                agent_kwargs.pop("use_vision", None)
-                agent = Agent(**agent_kwargs)
+                agent_kwargs.pop("tools", None)
+                try:
+                    agent = Agent(**agent_kwargs)
+                except TypeError:
+                    agent_kwargs.pop("use_vision", None)
+                    agent = Agent(**agent_kwargs)
 
         # -- Snapshot Performance AVANT le run (V3 phase 4) --
         perf_before = {}
