@@ -148,6 +148,26 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
     # 'Toggle Todo'] apparait 4 fois dans TodoMVC, mais un seul est dans
     # le <li> contenant 'Verifier les selecteurs').
     raw = step.raw_payload or {}
+    # Preamble semantic_effect : quand ce click est la canonicalisation
+    # d'un evaluate JS confirme par un change DOM (checkbox), on trace en
+    # commentaire l'etat final attendu observe a la capture. Pas de
+    # postcondition Playwright (fragile sur vue filtree ou l'element
+    # disparait apres action). Sert d'audit et de tracabilite intent/replay.
+    preamble: list[str] = []
+    if isinstance(raw, dict):
+        sem = raw.get("semantic_effect")
+        if isinstance(sem, dict):
+            checked = sem.get("checked")
+            state = None
+            if checked is True:
+                state = "checked=true"
+            elif checked is False:
+                state = "checked=false"
+            note = f"effet attendu : {state}" if state else f"effet attendu : {sem.get('action')}"
+            ref = sem.get("step_id")
+            preamble.append(
+                f"    // canonicalise depuis evaluate JS - {note} (voir semantic_effect {ref})"
+            )
     parent_label = raw.get("parentLabel") if isinstance(raw, dict) else None
     if (
         parent_label
@@ -157,7 +177,7 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
         sel_v, _ = _selector_value_and_type(step)
         pl = _ts_string(parent_label)
         sv = _ts_string(sel_v or "")
-        return [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
+        return preamble + [f"    await page.getByRole('listitem').filter({{ hasText: {pl} }}).locator({sv}).click();"]
     # Click conditionnel : marque optional par clean_steps_builder pour les
     # cas ou l'element peut avoir disparu entre capture et replay (ex:
     # doublon submit apres evaluate qui a deja navigue). Pattern
@@ -175,7 +195,7 @@ def _emit_click(step: Step, sensitive_vars: dict[str, str]) -> list[str]:
         ]
     # Playwright strict doit echouer si le DOM du replay rend le locator
     # ambigu. Aucun `.first()` ne choisit silencieusement un autre element.
-    return [f"    await {loc}.click();"]
+    return preamble + [f"    await {loc}.click();"]
 
 
 def _emit_input(step: Step, sensitive_vars: dict[str, str], index: int) -> list[str]:
