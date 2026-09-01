@@ -592,6 +592,45 @@ def generate_playwright_ts(
 
     steps = list(clean_steps.steps or [])
 
+    # Handlers globaux pour bandeaux consent CMP (GDPR / cookie banner).
+    # Un consent est un artefact du couple (navigateur, cookies stockes) qui
+    # varie entre capture et replay : parfois present, parfois absent, parfois
+    # tardif. Rejouer strictement le step consent casse le replay quand le
+    # bandeau n'apparait plus, OU laisse un overlay bloquant les clics
+    # suivants quand il apparait alors que non capture.
+    # Solution : page.addLocatorHandler() installe UNE FOIS au debut du test
+    # pour chaque selecteur consent unique detecte au capture. Playwright
+    # invoque le handler automatiquement des que l'element apparait et
+    # bloque un click canonique - le CMP est dismisse silencieusement, la
+    # timeline n'est pas polluee.
+    _consent_selectors: list[str] = []
+    _seen_consent: set[str] = set()
+    for _s in steps:
+        raw = _s.raw_payload
+        if not isinstance(raw, dict):
+            continue
+        sel = raw.get("consent_handler_selector")
+        if isinstance(sel, str) and sel and sel not in _seen_consent:
+            _seen_consent.add(sel)
+            _consent_selectors.append(sel)
+    if _consent_selectors:
+        body_lines.append(
+            f"  // Consent CMP handlers globaux : {len(_consent_selectors)} bandeau(x)"
+        )
+        body_lines.append(
+            "  //   detecte(s) au capture. Playwright dismiss automatiquement si"
+        )
+        body_lines.append(
+            "  //   l'element apparait au replay (aleatoire selon cookies stockes)."
+        )
+        for sel in _consent_selectors:
+            body_lines.append(
+                f"  await page.addLocatorHandler(page.locator({_ts_string(sel)}).first(), async (locator) => {{"
+            )
+            body_lines.append("    await locator.click().catch(() => {});")
+            body_lines.append("  });")
+        body_lines.append("")
+
     # Fallback : si aucun navigate initial mais on a une URL scenario, on injecte
     has_initial_navigate = any(
         s.action in ("navigate", "open_tab")
