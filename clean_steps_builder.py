@@ -2019,6 +2019,34 @@ def classify_steps(
             return sel or None
         return getattr(sel, "value", None) or None
 
+    def _click_target_context(s: Step) -> tuple[tuple[str, str], ...]:
+        """Identite capturee qui discrimine deux matches d'un meme selector.
+
+        Un selector volontairement generique (checkbox de ligne, bouton de
+        carte, etc.) ne suffit pas a prouver que deux clics visent le meme
+        element. Si une preuve contextuelle existe, elle fait donc partie de
+        la cle de deduplication. Une preuve absente d'un seul cote ne permet
+        pas non plus de supprimer l'action par supposition.
+        """
+        raw = s.raw_payload if isinstance(s.raw_payload, dict) else {}
+        context: list[tuple[str, str]] = []
+        for field in (
+            "parentLabel",
+            "backend_node_id",
+            "backendNodeId",
+            "stable_hash",
+            "stableHash",
+            "x_path",
+            "xpath",
+        ):
+            value = raw.get(field)
+            if value is None:
+                continue
+            normalized = str(value).strip()
+            if normalized:
+                context.append((field, normalized))
+        return tuple(context)
+
     interactive_actions = {
         "click", "input", "settext", "select", "hover",
         "check", "uncheck", "setchecked", "upload", "cookie",
@@ -2037,11 +2065,11 @@ def classify_steps(
 
         # R1 : clic consecutif identique
         if act == "click" and sel_val:
-            key = (s.page or "", sel_val)
+            key = (s.page or "", sel_val, _click_target_context(s))
             ts = s.timestamp
             if prev_click_key == key and ts and prev_click_ts and (ts - prev_click_ts) < 500:
                 s.included_in_replay = False
-                s.cleanup_reason = "clic consecutif redondant (<500ms sur meme selecteur)"
+                s.cleanup_reason = "clic consecutif redondant (<500ms sur meme cible)"
                 filtered_noise_counter[sel_val] = filtered_noise_counter.get(sel_val, 0) + 1
                 continue
             prev_click_key = key
