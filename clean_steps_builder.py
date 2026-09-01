@@ -497,6 +497,7 @@ def _step_from_bu_action(
     # une pub apparait au capture, absente au replay -> click qui timeout).
     if normalized == "click":
         _mark_ad_related(step, interacted_element)
+        _mark_consent_related(step, interacted_element)
 
     if normalized == "navigate":
         url = params.get("url") or params.get("website")
@@ -812,6 +813,60 @@ def _apply_interacted_element(step: Step, elem: dict[str, Any] | None) -> None:
 
 
 _AD_TOKEN_RE = re.compile(r"\bad\b", re.IGNORECASE)
+_CONSENT_TOKEN_RE = re.compile(
+    r"\b(consent|consentir|autoriser|accepter|accept all|allow all|"
+    r"agree|j'accepte|tout accepter|got it)\b",
+    re.IGNORECASE,
+)
+
+
+def _mark_consent_related(step: Step, elem: dict[str, Any] | None) -> None:
+    """Detecte les clicks sur bandeaux consent CMP (GDPR / cookie banner).
+
+    Un bandeau consent est un artefact du COUPLE (navigateur, cookies stockes)
+    qui varie entre capture et replay : parfois present, parfois absent,
+    parfois tardif. Le rejouer strictement casse le replay.
+
+    Marque le step included_in_replay=False + stocke le selecteur dans
+    raw_payload['consent_handler_selector']. Le generator peut alors emettre
+    un ``page.addLocatorHandler`` global qui dismiss automatiquement le
+    bandeau des qu'il apparait au replay, sans polluer la timeline.
+
+    Detection : token consent-lik e (consent, accepter, autoriser, agree, ...)
+    dans les attributs (aria-label, id, class, text) de l'element cliqué.
+    """
+    if not elem or not isinstance(elem, dict):
+        return
+    attrs = elem.get("attributes") or {}
+    if not isinstance(attrs, dict):
+        return
+    hit = False
+    for v in attrs.values():
+        if isinstance(v, str) and _CONSENT_TOKEN_RE.search(v):
+            hit = True
+            break
+    if not hit:
+        return
+    # Construit un sélecteur discriminant pour le handler global.
+    consent_sel = None
+    aria = attrs.get("aria-label")
+    eid = attrs.get("id")
+    if isinstance(aria, str) and aria:
+        escaped = aria.replace("\\", "\\\\").replace('"', '\\"')
+        consent_sel = f'[aria-label="{escaped}"]'
+    elif isinstance(eid, str) and eid:
+        consent_sel = f'#{eid}'
+    step.included_in_replay = False
+    step.cleanup_reason = (
+        "click consent CMP : gere par page.addLocatorHandler global au replay "
+        "(bandeau consent aleatoire selon cookies stockes)"
+    )
+    raw = step.raw_payload or {}
+    if not isinstance(raw, dict):
+        raw = {"legacy_raw": raw}
+    if consent_sel:
+        raw["consent_handler_selector"] = consent_sel
+    step.raw_payload = raw
 
 
 def _mark_ad_related(step: Step, elem: dict[str, Any] | None) -> None:
@@ -1199,6 +1254,7 @@ def build_pre_cleanup_steps(
                         step.selector = _saved_sel
                         step.selectorType = _saved_type
                     _mark_ad_related(step, per_action_element)
+                    _mark_consent_related(step, per_action_element)
                 else:
                     # Pas de correspondance DOM demontree - construit depuis
                     # BU + interacted_element de CETTE action. Regle cahier :
